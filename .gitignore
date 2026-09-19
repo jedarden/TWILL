@@ -1,0 +1,11 @@
+__pycache__/
+*.py[cod]
+.venv/
+.pytest_cache/
+.ruff_cache/
+
+# derived, disposable, and never committed — see docs/plan/plan.md §7.2
+*.db
+*.db-shm
+*.db-wal
+status.json
