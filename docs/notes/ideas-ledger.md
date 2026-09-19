@@ -170,20 +170,23 @@ C9 TWILL's own reliability · C10 source enrichment · C11 outputs beyond the di
 | 101 | **Environment changelog** — "this week the environment changed in these ways", derived from applied lessons | C11 | SURVIVES, not selected — objection: derivable from `twill lessons --state applied` on demand |
 | 102 | **"What I'd fix first" recommendation** with estimated hours saved | C4 | MERGED into #21 |
 
-### Finalists
+### Finalists and where they landed
 
-| # | Idea | Cluster | Complexity |
-|---|---|---|---|
-| 5 | Lesson backtest before acceptance | C1 | S |
-| 18 | Never-events lane | C2 | S |
-| 14 | Change-point detection on signature rates | C2 | M |
-| 16 | Poka-yoke guard generator | C3 | M |
-| 21 | Waste accounting → Pareto-ranked digest | C4 | M |
-| 2 | Rule earnings & decay report | C5 | M |
-| 43 | Reproduction-first digest with week diff | C6 | S |
-| 68 | Dead-man's switch + parser-drift alarm | C9 | S |
-| 3 | Friction receipt hook | C10 | M |
-| 81 | `twill brief <repo>` pull-only pre-flight | C8 | M |
+Operator decision, 2026-09-19: **all ten adopted**, nine into this plan and one routed to the repo
+that should own it. Integration bead: `twill-502355a3`.
+
+| # | Idea | Cluster | Cx | Destination |
+|---|---|---|---|---|
+| 5 | Lesson backtest before acceptance | C1 | S | plan Phase 4 + lesson `backtest` block (§7.1) |
+| 18 | Always/never event catalog | C2 | S | **ICG** — bead `irrevers-94a42e7f`; TWILL consumes it via `D-10` (gate gap) and keeps no copy (§2, §6.5, OQ 8) |
+| 14 | Change-point detection on signature rates | C2 | M | plan Phase 3 (`trend`, `cluster_week`), `twill trend` |
+| 16 | Poka-yoke guard generator | C3 | M | plan Phase 5 (`guards/<lesson-id>.*`, `apply --emit-guard`) |
+| 21 | Waste accounting → Pareto-ranked digest | C4 | M | plan Phase 1 (`session_usage`) + Phase 3 ranking |
+| 2 | Rule earnings & decay report | C5 | M | plan Phase 3 (`rulesreport`, `twill rules`) → Phase 6 retire |
+| 43 | Reproduction-first digest with week diff | C6 | S | plan Phase 2 digest shape |
+| 68 | Dead-man's switch + parser-drift alarm | C9 | S | plan Phase 1 (`parse_shape`) + Phase 2 `doctor`, §8.2, §13.3 |
+| 3 | Friction receipt hook | C10 | M | plan §6.5 optional input + Phase 2 read path; hook ownership is OQ 7 (outside TWILL's trees) |
+| 81 | `twill brief <repo>` pull-only pre-flight | C8 | M | plan Phase 6, `twill brief` |
 
 **Run stats:** 102 generated · 14 merged as duplicates · 21 cut at triage · 17 killed in
 the adversarial pass · 20 survived but were not selected · 10 finalists · 5 absorbed as

@@ -47,6 +47,14 @@ successfully` 10,930 times into every worker prompt.
 - **No model-based summarization of whole sessions.** The Explain step sees only ranked, redacted
   clusters. Feeding raw transcripts to a model is both the expensive option and the one that turns
   third-party text pasted into a session into instructions.
+- **No catalog of its own for always/never events.** The authoritative list of events that must
+  never happen — force-push, a mutating `kubectl` verb on a managed resource, a credential in argv —
+  belongs to **ICG** (`irreversible-command-gate`), which enforces it at the `PreToolUse` boundary.
+  TWILL consumes that catalog and reports where an event got through anyway (a gate gap); a second
+  copy of the list would drift from the one doing the enforcing.
+- **Delivery to agents is pull-only.** `twill brief <repo>` answers when asked. Nothing TWILL
+  produces is injected into a prompt, a rules file, or a system context by TWILL itself — that is
+  the Reflect failure mode, and it is what §2's no-auto-edit rule exists to prevent.
 - **No fleet-wide collection in v1.** codinghome only (`~/.claude/projects`, `~/.codex/sessions`).
   lab, bench, and agent-sandbox come in Phase 7 through TWILL's own pull, never through the
   archive's `mirror/`.
@@ -164,7 +172,7 @@ are binding; in lowercase prose they are descriptive.
 
 | Component | Single responsibility | Talks to |
 |---|---|---|
-| `reader` | Enumerate transcript files, decide which are settled, parse JSONL into normalized events. Owns nothing else. | filesystem (read-only), `cursor` |
+| `reader` | Enumerate transcript files, decide which are settled, parse JSONL into normalized events, per-message usage rows, and the record-type histogram that feeds the drift alarm. Also reads two optional external inputs if present: the `org-rule-guard` denial log and per-session **friction receipts** (§6.5). Owns nothing else. | filesystem (read-only), `cursor` |
 | `cursor` | Per-file identity + offset bookkeeping so appended files resume and rewritten files reparse. | `store` |
 | `redactor` | Replace credential-shaped values and apply content fences before anything is persisted. | called by `reader` before every write |
 | `store` | SQLite schema, transactions, migrations, retention. Single writer. | local state dir |
@@ -173,6 +181,10 @@ are binding; in lowercase prose they are descriptive.
 | `rulecorpus` | Index the *existing* rules (MEMORY.md + leaves, CLAUDE.md, repo `AGENTS.md`, skills) for coverage matching. Read-only. | filesystem (read-only), `store` |
 | `explainer` | Bounded, schema-validated LLM write-up of top clusters into draft lessons. | `claude` CLI (local), `store` |
 | `router` | Recommend a routing layer and emit the bead-create command for the owning repo. Emits text; never executes. | `store` |
+| `trend` | Per-signature weekly rates and change-point detection, so *new and accelerating* friction outranks chronic volume. | `store` |
+| `economics` | Attribute token/cost usage to clusters so the digest ranks by waste, not by count. | `store` |
+| `rulesreport` | Invert the pipeline: per existing rule, what it plausibly prevented, what never applied, what nobody read. | `rulecorpus`, `store` |
+| `briefer` | Answer `twill brief <repo>` from accepted lessons and open clusters. Pull-only; never pushes anywhere. | `store` |
 | `measurer` | Re-run each accepted lesson's detector, append counts, drive escalate/retire. | `store`, `detectors` |
 | `cli` | `twill <verb>`, human and `--json` surfaces, exit contract. | all of the above |
 
@@ -234,6 +246,26 @@ at a time and is the only step that leaves the machine.
   dependency moved is a distiller that stops producing lessons; this is the one place where
   boring wins outright.
 
+### 6.5 Optional external inputs (owned elsewhere, read here)
+
+Three inputs make detection cheaper and more reliable, and **none of them is TWILL's to install** —
+each lives outside TWILL's two trees, which TWILL may not write to (§3):
+
+- **`org-rule-guard` denial log.** The hook appends `{ts, rule, tool, session_id}` on every deny.
+  Without it, denials are unmeasurable: counting them from transcript text is polluted because
+  CLAUDE.md's own statement of the rules is itself indexed. Ownership is Open Question 1.
+- **Friction receipt.** A `SessionEnd` hook writes one small structured record per session — rules
+  consulted, denials, unresolved error signatures, whether the session ended mid-task — so TWILL
+  reads facts instead of inferring them from prose. Ownership is Open Question 7.
+- **The ICG always/never catalog.** `irreversible-command-gate` owns the authoritative list of
+  events that must never happen and enforces it at the `PreToolUse` boundary. TWILL reads the
+  exported catalog and runs one detector against it (`D-10`, gate gap): an event on that list that
+  nevertheless executed is a hole in the gate, and is reported as such rather than as a new lesson.
+  Export format is Open Question 8.
+
+All three are strictly optional: every detector degrades to transcript-only parsing when its input
+is absent, and `doctor` reports which inputs are live rather than failing without them.
+
 ## 7. Data Model
 
 ### 7.1 Core Entities
@@ -274,6 +306,24 @@ CREATE TABLE rule_doc(
   sha TEXT NOT NULL, indexed_at TEXT NOT NULL, last_read_by_agent TEXT);
 CREATE VIRTUAL TABLE rule_fts USING fts5(text, path UNINDEXED, tokenize='porter unicode61');
 
+-- per-session token/cost usage, extracted during ingest; feeds waste attribution
+CREATE TABLE session_usage(
+  session_id TEXT PRIMARY KEY, model TEXT,
+  input_tokens INTEGER, output_tokens INTEGER, cache_read_tokens INTEGER,
+  cost_usd REAL, wall_seconds INTEGER, messages INTEGER);
+
+-- weekly rate per signature; the series change-point detection runs over
+CREATE TABLE cluster_week(
+  detector_id TEXT NOT NULL, key TEXT NOT NULL, week TEXT NOT NULL,   -- ISO yyyy-Www
+  sessions INTEGER NOT NULL, events INTEGER NOT NULL,
+  est_waste_usd REAL,
+  PRIMARY KEY(detector_id, key, week));
+
+-- per-run record-type histogram per source; a shifted distribution is the drift alarm
+CREATE TABLE parse_shape(
+  run_at TEXT NOT NULL, source TEXT NOT NULL, record_type TEXT NOT NULL,
+  n INTEGER NOT NULL, PRIMARY KEY(run_at, source, record_type));
+
 -- one row per (lesson, measurement day); mirrored to measurements/<lesson>.jsonl for durability
 CREATE TABLE measurement(
   lesson_id TEXT NOT NULL, detector_id TEXT NOT NULL, measured_at TEXT NOT NULL,
@@ -290,7 +340,14 @@ detector: D-01
 key: "command-not-found:sqlite3"
 evidence: {sessions: 1096, events: 1529, first_seen: 2026-08-20, session_ids: [...]}  # ids only
 routing: {recommended: environment, applied: null, applied_at: null, bead: null}
+backtest: {window_days: 180, sessions: 1096, first_seen: 2026-06-14, weeks_present: 13}
+guard: {layer: hook, artifact: guards/L-3b02ce2a.hook.json, installed: false}
 ```
+
+`backtest` is populated before a lesson may be reviewed (§9 Phase 4): the same detector is replayed
+over the trailing 180 days, so a reviewer sees whether this is a standing problem or one bad week.
+`guard` points at the ready-to-install artifact the router generated (§9 Phase 5); TWILL never
+installs it.
 
 ### 7.2 Source of Truth & Storage
 
@@ -355,6 +412,7 @@ routing: {recommended: environment, applied: null, applied_at: null, bead: null}
 | Timer stopped / host rebooted | `status.json` age > 3× interval | `doctor` exits non-zero; systemd `Persistent=true` catches up | none needed — ingest is idempotent |
 | Upstream transcripts deleted early | `path_missing` cursor rows spike | nothing to recover; evidence already extracted | observations survive; lessons cite ids, not paths |
 | Redactor regression | fixture test in the stop-ship gate | revert; re-run `doctor --rescan-redaction` over stored excerpts | test blocks release before any commit |
+| **Parser silently stops extracting** (upstream transcript format changed) | dead-man's switch: zero observations in 24 h while transcript files are arriving; or `parse_shape` distribution shifts beyond tolerance vs the trailing median | `doctor` exits non-zero naming the source and the vanished/new record type; fixtures updated, parser fixed | no data loss — transcripts are re-readable, so a fixed parser backfills by resetting those cursors |
 
 ### 8.3 Invariants (Must Always Hold)
 
@@ -367,6 +425,8 @@ routing: {recommended: environment, applied: null, applied_at: null, bead: null}
 - Every lesson has ≥ 1 detector id and ≥ 1 evidence session id.
 - A lesson's state advances beyond `draft` only through an explicit operator command.
 - A measurement always records the detector *version* it ran.
+- A lesson cannot be reviewed without a populated `backtest` block.
+- TWILL never defines an always/never event of its own; `D-10` only reads ICG's exported catalog.
 
 ### 8.4 Rollback
 
@@ -389,7 +449,9 @@ observation from a real local session, and `sqlite3 ~/.local/state/twill/twill.d
 
 ### Phase 1: Reader, cursor, redactor, store
 **Delivers:** full enumeration of both sources, settle window, append/rewrite/truncate handling,
-redaction, schema + migrations, `twill status --json`.
+redaction, schema + migrations, `twill status --json`. Also the two extraction side-channels the
+later phases depend on: **per-message usage rows** (`session_usage`, for waste attribution) and the
+**record-type histogram** (`parse_shape`, for the drift alarm).
 **Completion criteria (same commit):** unit tests for parser/cursor/redactor; the idempotency
 property test; the secret-fixture test; `twill ingest` over the real local corpus completes within
 the §12 budget and `doctor` is clean.
@@ -397,8 +459,18 @@ the §12 budget and `doctor` is clean.
 
 ### Phase 2: Detectors + digest
 **Delivers:** `D-01` missing binary, `D-02` recurring error signature, `D-03` retry loop,
-`D-04` hook denial, `D-05` rejected tool call, `D-06` interrupt-then-correction; `twill detect`,
-`twill digest`; the `org-rule-guard` denial log wired as an input (log written by the hook, read by TWILL).
+`D-04` hook denial, `D-05` rejected tool call, `D-06` interrupt-then-correction, `D-10` ICG gate gap
+(an always/never event from ICG's catalog that executed anyway — reported as a hole in the gate, not
+as a TWILL lesson); `twill detect`, `twill digest`; the `org-rule-guard` denial log and, if present,
+friction receipts wired as inputs (both written by their owners, only read here — §6.5).
+
+**Digest shape, from the first version:** every line carries the exact command that re-derives it;
+the report is a week-over-week diff (new / worsening / improving / gone) rather than a standing top
+ten; and a clean week says so explicitly and lists the detectors that ran, so silence is never
+ambiguous between "nothing found" and "nothing ran".
+
+**Dead-man's switch:** `doctor` fails when 24 h pass with transcript files arriving and zero
+observations ingested, or when `parse_shape` drifts beyond tolerance against its trailing median.
 **Completion criteria:** each detector has a fixture-driven test with a known expected count; the
 digest for the last 30 days reproduces the three known-true findings from the 2026-09-19 probe
 (`sqlite3` 1,096 / `bf` 697 / `go` 632 sessions, ±5% for parser differences) — a real regression oracle.
@@ -407,7 +479,19 @@ digest for the last 30 days reproduces the three known-true findings from the 20
 ### Phase 3: Rule corpus + ranking + coverage
 **Delivers:** `rulecorpus` indexing of MEMORY.md + leaves, CLAUDE.md, repo `AGENTS.md`, skills;
 coverage matching; scoring; `D-07` rediscovery, `D-08` stale-rule (a rule naming a binary absent
-from PATH or a retired host), `D-09` unread rule docs.
+from PATH or a retired host), `D-09` unread rule docs. Plus three ranking inputs that decide what
+a human actually reads:
+
+- **Waste attribution** — `session_usage` joined to clusters, so the digest ranks by estimated
+  tokens and dollars burned rather than by raw count. Attribution across a session that hit several
+  frictions is proportional and is labelled an estimate wherever it is shown.
+- **Change-point detection** (`trend`) — weekly rates per signature in `cluster_week`, flagging new
+  and accelerating friction against its own trailing band. Chronic-but-flat problems stop crowding
+  out emerging ones. Needs ~6 weeks of history before it reports, and says so until then.
+- **Rule earnings & decay report** (`twill rules`) — the inverted view: per existing rule, the
+  clusters it covers, whether those recurrences went up or down, when it was last read, and a
+  deletion candidate list. This is the only output that *shrinks* the context budget, and it is why
+  `D-09` exists: 424 of 562 memory files went unread in the month before TWILL was planned.
 **Completion criteria:** `twill rank --json` marks a seeded cluster as covered by a seeded rule file
 and leaves an uncovered one open; `D-08` finds the known live contradiction (MEMORY.md still tells
 agents `bf`, never `br`, while CLAUDE.md made `bead` canonical on 2026-08-14).
@@ -415,7 +499,11 @@ agents `bf`, never `br`, while CLAUDE.md made `bead` canonical on 2026-08-14).
 
 ### Phase 4: Explain
 **Delivers:** bounded prompt builder, `claude -p` invocation with `CLAUDE_CODE_*` unset, strict JSON
-schema, validation, draft lesson files, `twill explain --dry-run` (prompt to stdout, no spawn).
+schema, validation, draft lesson files, `twill explain --dry-run` (prompt to stdout, no spawn), and
+a **backtest block on every draft** — the same detector replayed over the trailing 180 days, so a
+reviewer can tell a standing problem from one bad week before spending attention on it. A draft with
+no backtest cannot be reviewed; a backtest that finds nothing earlier is shown as such rather than
+blocking, because genuinely new friction has no history.
 **Completion criteria:** a golden-prompt test (prompt bytes stable for fixed input); schema-invalid
 output produces zero lessons and exit 4; `--dry-run` output contains no fixture secret; one real
 weekly run produces ≥ 1 reviewable draft lesson.
@@ -424,7 +512,11 @@ weekly run produces ≥ 1 reviewable draft lesson.
 ### Phase 5: Route + apply + review states
 **Delivers:** routing recommendation per lesson, `twill apply <id>` emitting the exact
 `bead create` command for the owning repo (never executing it), state transitions
-`accept`/`apply`/`dismiss`, `twill lessons` listing.
+`accept`/`apply`/`dismiss`, `twill lessons` listing, and the **guard generator**: each lesson ships
+the mechanical artifact that would stop it at its recommended layer — an `org-rule-guard`/ICG
+matcher fragment, a wrapper-script skeleton, a gate line, an `AGENTS.md` paragraph, or a memory leaf
+with frontmatter — written to `guards/<lesson-id>.*` inside TWILL and installed by nobody but a
+human. Prose describes a rule; an artifact is one someone can actually adopt in a minute.
 **Completion criteria:** state machine tests including the refusal to auto-accept; an applied lesson
 records layer + timestamp + bead id; the open-path test proves no write outside TWILL's two trees.
 **Does NOT include:** escalation logic.
@@ -432,8 +524,11 @@ records layer + timestamp + bead id; the open-path test proves no write outside 
 ### Phase 6: Measure, escalate, retire — and self-measurement
 **Delivers:** `twill measure` (daily), measurement mirror files, escalation rule (recurrence not down
 ≥ 50% after 21 days → propose the next-stronger layer), retirement rule (0 occurrences for 90 days
-*and* the rule doc unread for 90 days → propose retire), and the digest's own health line:
-lessons drafted / accepted / applied / resolved in the last 60 days.
+*and* the rule doc unread for 90 days → propose retire, fed by the Phase 3 rule-earnings report),
+and the digest's own health line: lessons drafted / accepted / applied / resolved in the last 60 days.
+Also **`twill brief <repo>`**: the pull-only pre-flight — what historically bites agents working in
+this repo or launch dir, from accepted lessons and open clusters, rendered as plain text a human or
+an agent can read on request. Pull, never push: nothing here is injected into a prompt by TWILL.
 **Completion criteria:** a simulated series drives escalate and retire deterministically in tests;
 the digest names its own zero-output state loudly if no lesson reached `applied` in 60 days.
 **Does NOT include:** other hosts, retrieval surface.
@@ -540,7 +635,10 @@ accepting that history before that point is simply out of scope.
 
 `twill doctor` is the single health entry point: DB integrity, schema version, stale timers
 (`status.json` age > 3× interval), cursor anomalies (`parse_errors`, `path_missing`), free disk,
-rule-corpus staleness, and detector self-test. Exit 0 healthy, 1 degraded, 2 broken. `status.json`
+rule-corpus staleness, detector self-test, which optional inputs of §6.5 are live, and the two
+silent-death alarms — the dead-man's switch (transcripts arriving, zero observations for 24 h) and
+`parse_shape` drift against its trailing median. Those two exist because a distiller that quietly
+stops extracting looks exactly like a quiet week, and that is how this class of pipeline dies. Exit 0 healthy, 1 degraded, 2 broken. `status.json`
 carries last-success timestamps per stage for the existing lab-health collector to pick up later
 (allowlisted numeric fields only). The weekly digest doubles as the human health signal: if it ever
 reports zero clusters *and* zero lessons for two consecutive weeks, TWILL itself is broken or the
@@ -555,7 +653,10 @@ twill rank     [--top 10] [--json]
 twill explain  [--top 10] [--dry-run] [--model MODEL] [--json]
 twill digest   [--week YYYY-Www] [--stdout]
 twill lessons  [--state draft|accepted|applied|resolved|escalated|retired] [--json]
-twill accept <id> | dismiss <id> --reason TEXT | apply <id> --layer LAYER [--bead ID]
+twill rules    [--unread-days 90] [--deletion-candidates] [--json]   # rule earnings & decay
+twill trend    [--detector D-02] [--weeks 12] [--new-only] [--json]  # change-point view
+twill brief    <repo|launch-dir> [--top 10] [--json]                 # pull-only pre-flight
+twill accept <id> | dismiss <id> --reason TEXT | apply <id> --layer LAYER [--bead ID] [--emit-guard]
 twill measure  [--lesson ID] [--json]
 twill prune    [--older-than 180d]
 twill status   [--json]
@@ -608,9 +709,18 @@ triage-only summarization while routing stays manual.
 6. **Should TWILL detect fabricated work** (a bead closed with no artifact, the "fake-done" taxonomy)?
    It is the highest-value detector class and the most likely to be wrong about a human's intent.
    Owner: operator. Resolve by: Phase 6. Impact if wrong: false accusations in a digest a human reads.
+7. **Who owns and installs the friction receipt hook**, and where does it write? It is a `SessionEnd`
+   hook outside TWILL's trees, so it needs a home (`utilities`, alongside `agent-secrets`, is the
+   obvious candidate). Owner: operator. Resolve by: Phase 2. Impact if wrong: detection stays
+   inference-based and `D-04`/`D-06` keep a blind spot.
+8. **In what form does ICG export its always/never catalog** for `D-10` to read — a versioned JSON
+   file in the ICG repo, a `icg catalog --json` command, or the rule packs parsed directly? Owner:
+   operator, with ICG. Resolve by: Phase 2. Impact if wrong: TWILL ends up parsing rule packs it
+   does not own, which breaks the moment ICG refactors them.
 
 ## 17. Revision History
 
 | Date | Change | Author |
 |---|---|---|
 | 2026-09-19 | Initial draft from brief; name, independence, and raw-transcript input decided in session. | plan-author |
+| 2026-09-19 | Adopted 9 of 10 `plan-idea-gen` finalists into the phases that own them (backtest P4, change-point + waste + rule-earnings P3, guard generator P5, reproduction-first digest + dead-man's switch P2, usage/shape extraction P1, `twill brief` P6, receipts as an optional input §6.5). The always/never event catalog was routed to **ICG** instead of being adopted here; `D-10` consumes it. Open Questions 7–8 added. | plan-idea-gen (bead twill-502355a3) |
