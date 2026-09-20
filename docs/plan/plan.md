@@ -176,7 +176,7 @@ are binding; in lowercase prose they are descriptive.
 | `cursor` | Per-file identity + offset bookkeeping so appended files resume and rewritten files reparse. | `store` |
 | `redactor` | Replace credential-shaped values and apply content fences before anything is persisted. | called by `reader` before every write |
 | `store` | SQLite schema, transactions, migrations, retention. Single writer. | local state dir |
-| `detectors` | Versioned SQL emitting findings from observations. | `store` |
+| `detectors` | Versioned SQL emitting findings from observations. Groups on a **normalized error signature**: paths, numbers, hexes and UUIDs are masked before hashing, which collapses one failure to one signature at the cost of a known limit — a differing context prefix can still split one failure across two signatures, so a count is a floor, not a total. | `store` |
 | `ranker` | Cluster, score, and check coverage against the rule corpus. | `store`, `rulecorpus` |
 | `rulecorpus` | Index the *existing* rules (MEMORY.md + leaves, CLAUDE.md, repo `AGENTS.md`, skills) for coverage matching. Read-only. | filesystem (read-only), `store` |
 | `explainer` | Bounded, schema-validated LLM write-up of top clusters into draft lessons. | `claude` CLI (local), `store` |
@@ -266,6 +266,18 @@ each lives outside TWILL's two trees, which TWILL may not write to (§3):
 All three are strictly optional: every detector degrades to transcript-only parsing when its input
 is absent, and `doctor` reports which inputs are live rather than failing without them.
 
+**Degrading at runtime and being buildable are different things, and the distinction decides the
+dependency graph.** At *runtime*, every reader degrades: an absent input is reported by `doctor`,
+never a failed run. At *build* time, a reader cannot be written before its input's format is
+settled — a parser for an undecided shape is not work, it is a guess. So each optional input's
+reader waits on the question that fixes its format (Open Questions 1, 7 and 8), and the detectors
+behind those readers inherit that wait.
+
+**Two detectors additionally cannot degrade even once built: `D-04` and `D-10`.** Denials exist
+nowhere else — counting them from transcript text is polluted because CLAUDE.md's own statement of
+the rules is itself indexed — and a gate gap is meaningless without the catalog that defines what
+must never happen. Every other detector runs on transcripts alone.
+
 ## 7. Data Model
 
 ### 7.1 Core Entities
@@ -282,13 +294,14 @@ CREATE TABLE cursor(
 
 -- the atom of evidence; text fields are POST-redaction and ≤240 chars
 CREATE TABLE observation(
-  obs_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL, ts TEXT NOT NULL,
+  obs_id INTEGER PRIMARY KEY, session_id TEXT NOT NULL,
+  ts_utc TEXT NOT NULL, ts_local TEXT NOT NULL,        -- EC-15: both, from the v1 DDL onward
   kind TEXT NOT NULL,                -- run_failed|tool_error|tool_rejected|interrupt|file_read|hook_denial
   program TEXT, command TEXT, signature TEXT, sig_hash TEXT,
   tool TEXT, path TEXT, rule TEXT, excerpt TEXT,
   launch_dir TEXT, cwd TEXT, host TEXT NOT NULL DEFAULT 'codinghome');
-CREATE INDEX obs_sig ON observation(sig_hash, ts);
-CREATE INDEX obs_kind_ts ON observation(kind, ts);
+CREATE INDEX obs_sig ON observation(sig_hash, ts_utc);
+CREATE INDEX obs_kind_ts ON observation(kind, ts_utc);
 CREATE INDEX obs_session ON observation(session_id);
 
 -- detector output, refreshed per run; (detector_id, key) is the cluster identity
@@ -324,7 +337,13 @@ CREATE TABLE parse_shape(
   run_at TEXT NOT NULL, source TEXT NOT NULL, record_type TEXT NOT NULL,
   n INTEGER NOT NULL, PRIMARY KEY(run_at, source, record_type));
 
+-- small key/value store for state that is not a series: the last-seen ICG catalog version,
+-- the schema version, the trailing medians the drift alarm compares against
+CREATE TABLE meta(key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
+
 -- one row per (lesson, measurement day); mirrored to measurements/<lesson>.jsonl for durability
+-- detector_id carries the version (`D-01@2`, per EC-12), which is how §8.3's
+-- "a measurement always records the detector version it ran" is satisfied
 CREATE TABLE measurement(
   lesson_id TEXT NOT NULL, detector_id TEXT NOT NULL, measured_at TEXT NOT NULL,
   window_days INTEGER NOT NULL, sessions INTEGER NOT NULL, events INTEGER NOT NULL,
@@ -335,6 +354,7 @@ A lesson is a file, not a table — `lessons/L-<8hex>.md` with YAML frontmatter:
 
 ```yaml
 id: L-3b02ce2a
+summary: "Two sentences, plain language: what goes wrong, and what to do instead."  # mandatory
 state: draft            # draft -> accepted -> applied:<layer> -> resolved | escalated | retired
 detector: D-01
 key: "command-not-found:sqlite3"
@@ -400,6 +420,12 @@ installs it.
   space first and refuses below 2 GB with exit 1; the DB is capped by retention; `doctor` warns below 5 GB.
 - **EC-14: no new sessions since last run.** Resolution: exit 0 with `no work`, `status.json` still
   updated — an unchanged `last_success` is what staleness monitoring keys on.
+- **EC-15: a detector's window spans hosts in different timezones.** Resolution: every observation
+  carries its timestamp in both UTC and local time, so a detector can be explicit about which it
+  means. This ships with the v1 schema, before any detector is written against a single column.
+- **EC-16: one pathological session dominates a cluster.** Resolution: cap the observations a single
+  session may contribute. A 500 MB transcript or a runaway retry loop otherwise outvotes a genuine
+  cross-session pattern purely on volume, and ranking is a count of *sessions* for exactly that reason.
 
 ### 8.2 Failure Modes & Recovery
 
@@ -486,8 +512,15 @@ a human actually reads:
   tokens and dollars burned rather than by raw count. Attribution across a session that hit several
   frictions is proportional and is labelled an estimate wherever it is shown.
 - **Change-point detection** (`trend`) — weekly rates per signature in `cluster_week`, flagging new
-  and accelerating friction against its own trailing band. Chronic-but-flat problems stop crowding
-  out emerging ones. Needs ~6 weeks of history before it reports, and says so until then.
+  and accelerating friction against its own trailing band. **EWMA, not CUSUM** — the decision is
+  made here so an implementer does not have to: CUSUM needs a tuned reference shift per signature,
+  and with weekly buckets over a corpus this size an exponentially-weighted mean plus a band is
+  both sufficient and inspectable. Chronic-but-flat problems stop crowding out emerging ones. Needs
+  ~6 weeks of history before it reports, and says so until then.
+  The Phase 2 digest already compares this week against last week; that stays a two-window
+  comparison computed at render time, while `cluster_week` is the durable series statistics run
+  over. The overlap is deliberate — the digest must work in week two, long before a trailing band
+  means anything.
 - **Rule earnings & decay report** (`twill rules`) — the inverted view: per existing rule, the
   clusters it covers, whether those recurrences went up or down, when it was last read, and a
   deletion candidate list. This is the only output that *shrinks* the context budget, and it is why
