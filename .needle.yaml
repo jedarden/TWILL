@@ -1,0 +1,6 @@
+strands:
+  pluck:
+    exclude_labels: ["cross-repo-gate"]
+    split_after_failures: 0
+bead_cli:
+  backend: bead-rs

@@ -4,8 +4,20 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 
-# derived, disposable, and never committed — see docs/plan/plan.md §7.2
+# derived, disposable, never committed — see docs/plan/plan.md §7.2
 *.db
 *.db-shm
 *.db-wal
 status.json
+
+# ── ARTIFACT CONTAINMENT ────────────────────────────────────────────────────
+# This repository is PUBLIC. What TWILL produces is NOT: lessons, digests,
+# measurements and guard artifacts are distilled from sessions across every
+# repo on the host, including private ones, and the redactor stops credentials,
+# not business context. They belong under `artifacts_root` — a separate private
+# repository (plan §2, §3, §7.2). These patterns are guard one of three; the
+# others are the open-path test harness and a twill-ci tree assertion (§10.2).
+lessons/
+digests/
+measurements/
+guards/

@@ -21,11 +21,11 @@ here: a one-off error is noise, the same one across six hundred sessions is a le
 
 ## What it is not
 
-- **Not a transcript archive.** `agent-transcript-archive` owns capture and durability
-  (ARMOR→B2, restic). TWILL copies and retains nothing.
+- **Not a transcript archive.** A separate pipeline owns capture and durability. TWILL copies and
+  retains nothing.
 - **Not part of that pipeline.** TWILL has its own repo, its own schedule, its own cursor and its
-  own state. Ingest never calls it, it never reads `graph.db`, and it keeps working when the
-  archive is stopped or deleted.
+  own state. Ingest never calls it, it never reads the archive's derived index, and it keeps working
+  when the archive is stopped or deleted.
 - **Not an unsupervised writer.** It never edits CLAUDE.md, memory, hooks, skills, or another
   repository. It proposes; a human accepts. (NEEDLE's Reflect strand is the cautionary precedent:
   left to write into prompts by itself, it reinforced `Read -> File read successfully` 10,930 times.)
@@ -36,16 +36,27 @@ here: a one-off error is noise, the same one across six hundred sessions is a le
 docs/notes/     design decisions, detector catalog, redaction policy
 docs/research/  prior art and source material
 docs/plan/      plan.md — the complete plan (start here)
-lessons/        the durable product: one reviewed lesson per file
-measurements/   per-lesson recurrence series, mirrored from the DB
-digests/        weekly reports
 systemd/        the three user timers (ingest hourly, measure daily, digest weekly)
 ```
 
-State lives outside the repo in `~/.local/state/twill/` (mode 600). The database is derived and
-disposable — it is never committed and never leaves the host, for the same reason `graph.db` is
-not committed: an index of transcript text is *designed* to be surfaced into future prompts, which
-makes a leaked secret in it worse than one sitting inert in a transcript.
+## This repo is the engine, not the output
+
+**Nothing TWILL produces lives here.** Lessons, digests, measurements and guard artifacts are
+distilled from sessions across every repository on the host — including private ones — and
+redaction stops credentials, not business context. A public repository that accumulated them would
+be a continuously-updating window into private work.
+
+They are written under `artifacts_root`, a **separate private repository**, which is also the
+transport the recall service pulls from. `artifacts_root` has no default: unset, or pointing inside
+this tree, is a startup error rather than a fallback. Three mechanical guards keep it that way —
+the `.gitignore` here, an open-path test that fails on an artifact write into this tree, and a CI
+assertion that the published tree contains no artifact. A convention alone lasts exactly as long as
+the first default-config run.
+
+Working state lives outside the repo in `~/.local/state/twill/` (mode 600). The database is derived
+and disposable — never committed, never off the host: an index of transcript text is *designed* to
+be surfaced into future prompts, which makes a leaked secret in it worse than one sitting inert in
+a transcript.
 
 ## Status
 

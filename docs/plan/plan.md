@@ -18,8 +18,8 @@ it, and then *observed to stop* by the same query that found it.
 
 **Background:** Agent sessions on this fleet already carry the whole record of what went wrong:
 failed commands, hook denials, rejected tool calls, interruptions, and the corrections that
-followed. Those transcripts are preserved by `agent-transcript-archive` (ARMOR/B2 + restic) and
-indexed structurally by its `graph.db`, but nothing converts them into changes to the environment.
+followed. Those transcripts are already preserved and structurally indexed by a separate archive
+pipeline on the same host, but nothing converts them into changes to the environment.
 Today every lesson is hand-written: an incident happens, a human notices, a memory file or a
 CLAUDE.md rule or an `org-rule-guard` clause gets written by hand. Measured on 2026-09-19 against
 the existing graph, `sqlite3: command not found` appeared in 1,096 distinct sessions since 08-20,
@@ -35,10 +35,10 @@ successfully` 10,930 times into every worker prompt.
 
 ## 2. Non-Goals (Explicit Scope Boundaries)
 
-- **Not a transcript archive.** TWILL copies, retains, and backs up nothing. `agent-transcript-archive`
-  (ARMOR→B2, restic on bench) owns durability; duplicating it would double both disk and the
-  blast radius of a secrets leak, for no gain.
-- **No integration with `agent-transcript-archive`, and no reads of `graph.db`.** Operator decision,
+- **Not a transcript archive.** TWILL copies, retains, and backs up nothing. A separate archive
+  pipeline owns durability; duplicating it would double both disk and the blast radius of a secrets
+  leak, for no gain.
+- **No integration with that archive, and no reads of its derived index.** Operator decision,
   2026-09-19. Ingest and learning have different cadences and failure modes; a distiller bug or a
   slow LLM pass must never stall capture, and learning must not fire per ingest event.
 - **No automatic edits to CLAUDE.md, memory files, hooks, skills, or any other repository.** The
@@ -60,13 +60,25 @@ successfully` 10,930 times into every worker prompt.
   archive's `mirror/`.
 - **Not a dashboard.** The deliverable is a markdown digest and a CLI. A web surface can be built
   later on the same store if the digest proves worth reading.
+- **This repository never holds a distilled artifact.** TWILL is public; what it produces is not.
+  Lessons, digests, measurements and guard artifacts are distilled from sessions across every
+  repository on the host — including deliberately private ones — and the redactor stops credentials,
+  not business context. A public repository that accumulated them would be a continuously-updating
+  window into private work. They live in a separate private repository (§7.2), and three mechanical
+  guards keep it that way (§10.2), because a convention here lasts exactly as long as the first
+  default-config run.
 
 ## 3. Hard Requirements (Non-Negotiable)
 
 - TWILL **MUST** run on its own schedule and its own cursor, and **MUST NOT** be invoked by, or
-  add any code, timer, hook, or configuration to, `agent-transcript-archive`.
-- TWILL **MUST** be read-only with respect to everything outside `~/TWILL` (its own repository) and
-  `~/.local/state/twill` (its state directory). Writes anywhere else are a bug, and are tested for.
+  add any code, timer, hook, or configuration to, the transcript archive pipeline.
+- TWILL **MUST** be read-only with respect to everything outside its own repository, its state
+  directory (`~/.local/state/twill`) and `artifacts_root`. Writes anywhere else are a bug, and are
+  tested for.
+- TWILL **MUST** write every distilled artifact under the configured `artifacts_root`, which
+  **MUST** resolve outside this repository's working tree. There is no working default: an unset or
+  in-tree `artifacts_root` is a startup error, not a fallback. This is the one setting that fails
+  loudly rather than defaulting, because the failure mode it prevents is publishing private work.
 - TWILL **MUST NOT** store, print, log, or commit a credential value. Any credential encountered in
   a transcript is redacted before it reaches the database, and a lesson records a *path*, never a value.
 - Every quoted fragment that reaches a committed artifact (lesson, digest) **MUST** pass the
@@ -79,7 +91,8 @@ successfully` 10,930 times into every worker prompt.
 - If TWILL is ever deployed to a cluster it **MUST** be a Deployment with an internal scheduling
   loop; `kind: Job` and `kind: CronJob` are forbidden org-wide. CI **MUST** be an Argo
   WorkflowTemplate in `iad-ci`; `.github/workflows/*` is forbidden org-wide.
-- **Forbidden dependencies/patterns:** no reads of `graph.db` or `episodes/`; no network calls
+- **Forbidden dependencies/patterns:** no reads of the archive's derived index or its materialized
+  episodes; no network calls
   except the local `claude` CLI invocation in the Explain step; no credential store access
   (TWILL needs none); no third-party Python packages in the core path beyond the standard library
   (see §6.4).
@@ -408,8 +421,13 @@ installs it.
   committed and never leaves the host — identical reasoning to `graph.db`: a queryable index of
   transcript text is *designed* to be surfaced into future prompts, which makes a leaked secret in
   it worse than one sitting inert in a transcript.
-- **`lessons/`, `measurements/`, `digests/` in the repository are the durable product**, committed to
-  Forgejo (private, no GitHub mirror), and rebuilt-from-nothing only by a human writing them again.
+- **The distilled artifacts are the durable product, and they live outside this repository.**
+  `artifacts_root` (default `~/TWILL-lessons`) is a **separate private git repository** — Forgejo
+  only, no GitHub mirror, never public — holding `lessons/`, `digests/`, `measurements/` and
+  `guards/`. It is git rather than a directory for three reasons the plan depends on: a lesson
+  survives a state-DB rebuild, a change to one is diffable and reviewable in a normal commit, and
+  it is the transport the cluster recall service pulls from (§6.6). This repository — the engine —
+  is public; that one is not, and nothing in the engine's tree is permitted to become an artifact.
 - **Retention:** observations older than 180 days are pruned by `twill prune` (daily); clusters are
   recomputed from surviving observations; measurements and lessons are kept forever.
 
@@ -484,6 +502,7 @@ installs it.
 - A measurement always records the detector *version* it ran.
 - A lesson cannot be reviewed without a populated `backtest` block.
 - TWILL never defines an always/never event of its own; `D-10` only reads ICG's exported catalog.
+- No lesson, digest, measurement or guard artifact is ever written inside this repository's tree.
 
 ### 8.4 Rollback
 
@@ -637,7 +656,13 @@ decided. Gated on Open Questions 3a (which cluster) and 3b (WARP ownership).
 - `pytest` green, `ruff` clean.
 - **Secret-fixture test is mandatory and non-skippable**; a skipped or xfail'd redaction test fails the build.
 - **Open-path test**: the whole test suite runs under an `open()`/`os.open` audit hook; any write
-  outside `~/TWILL` + state dir, or any read under `~/agent-transcript-archive`, fails the run.
+  outside this repository + the state dir + `artifacts_root`, or any read under the transcript
+  archive, fails the run.
+- **Artifact-containment gate** (three guards, because one is a promise and three are a mechanism):
+  the engine repository `.gitignore`s the four artifact paths; the open-path harness fails on an
+  artifact write *into* the repository tree; and `twill-ci` asserts the published tree contains no
+  lesson, digest, measurement or guard file. The third one is the backstop that catches a run
+  configured wrongly on a machine nobody is watching.
 - Idempotency property test green.
 - `twill doctor` exits 0 on the developer's own machine state before release.
 - CI runs as an Argo WorkflowTemplate in `iad-ci` (`twill-ci`); GitHub Actions are forbidden org-wide.
@@ -653,7 +678,7 @@ tool output) that an agent later read.
 | Credential promoted into a searchable, prompt-bound artifact | token pasted into a session, captured as an excerpt | redactor before persistence; excerpts ≤ 240 chars; DB never committed, never leaves the host | secret-fixture test across DB, digests, lessons, prompt (§5 Scenario 4) |
 | Prompt injection via transcript text | third-party text reaches the Explain prompt | clusters not sessions; excerpts framed as untrusted data; strict output schema; human acceptance gate | injection-bearing fixture asserts no schema deviation and no lesson auto-accepted |
 | Poisoned lesson reaching agent context | a wrong lesson routed to CLAUDE.md/memory | TWILL never writes those files; human applies; measurement catches a non-fix | state-machine test refusing auto-accept |
-| Content-fence breach | a lesson names a fenced entity (e.g. the options data vendor) | fence list checked in the redactor and again at lesson write | fence fixture test |
+| Content-fence breach | a lesson names a fenced entity (e.g. a third-party vendor feed under a licence that forbids naming it) | fence list checked in the redactor and again at lesson write | fence fixture test |
 | Privilege creep | TWILL gaining write access it does not need | no credentials at all; read-only everywhere but two trees | open-path audit test |
 
 **Secrets:** TWILL holds none — no OpenBao path, no token, no kubeconfig. It needs no credential to
@@ -693,7 +718,9 @@ from `systemd/`. No container, no cluster — the data is host-local and so is t
 | `twill-digest.timer` | weekly Mon 08:00 | `twill rank && twill explain && twill digest` |
 
 Config: `~/.config/twill/config.toml` (settle window, retention, top-K, source globs, fence list,
-model). Every value has a working default; a missing config file is not an error. Non-interactive by
+model). Every value has a working default and a missing config file is not an error — **with one
+exception: `artifacts_root`**, which has no default and must resolve outside this repository's tree
+(§3). An unset or in-tree value aborts at startup rather than writing a lesson somewhere publishable. Non-interactive by
 construction — all verbs are idempotent, `--json` everywhere, no prompts. If TWILL ever runs in a
 cluster it is a Deployment with an internal loop; `kind: Job`/`kind: CronJob` are forbidden.
 
