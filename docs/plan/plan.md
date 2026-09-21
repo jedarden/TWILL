@@ -278,6 +278,37 @@ nowhere else — counting them from transcript text is polluted because CLAUDE.m
 the rules is itself indexed — and a gate gap is meaningless without the catalog that defines what
 must never happen. Every other detector runs on transcripts alone.
 
+### 6.6 The serving layer runs on a cluster, not on this box
+
+**Decided 2026-09-21 (operator).** The distiller stays on codinghome because transcripts are local
+and must not be copied anywhere. The **agent-facing recall service does not** — it runs on a
+Kubernetes cluster, reached over the tailnet, so a roaming worker on lab, bench or agent-sandbox can
+ask the same question as one on codinghome.
+
+The shape, which follows `git-activity-exporter` on ardenone-cluster (a Deployment with an internal
+poll loop, a pinned semver image and a secret, cloning from `git.ardenone.com`):
+
+- **Transport is git.** codinghome commits accepted lessons to the private lessons repository; the
+  service polls that repository and rebuilds a **disposable** SQLite FTS projection from it. No
+  write credential ever points from codinghome at the cluster, nothing new has to be exposed here,
+  and the projection can be thrown away and rebuilt from the repo — the same
+  authoritative-journal / disposable-projection split WARP is built on.
+- **A Deployment with an internal scheduling loop**, never a `Job` or `CronJob` (forbidden
+  org-wide: ArgoCD cannot manage them idempotently and their pods are never pruned).
+- **Image** `ronaldraygun/twill-serve`, pinned to a semver tag from `containers/twill-serve/VERSION`
+  — never `:latest`, never a bare SHA.
+- **Exposure through the cluster's existing Traefik** as an IngressRoute on a tailnet-only
+  entrypoint, never a new `tailscale.com/expose` Service: the rule is exactly one Tailscale-exposed
+  Service per cluster. Bearer token for agents; forward-auth for a human opening it in a browser.
+- **Manifests live in `declarative-config`** under that cluster's directory and sync via ArgoCD. The
+  owning bead stays in this repository per the deployment-bead convention, and records the
+  declarative-config paths, the target ArgoCD Application and the deployment commit.
+- **Retrieval is reactive, not polled.** The service answers "what is known about this repo" and
+  "what is known about this error signature". NEEDLE queries it on a failure, the way its retry
+  prompts already query prior fixes; nothing polls on a timer, and nothing is injected by TWILL.
+- **The export stays WARP-compatible.** If WARP ever ships its recall surface (its F9), this service
+  is the thing that goes away, not a second store to reconcile.
+
 ## 7. Data Model
 
 ### 7.1 Core Entities
@@ -573,10 +604,18 @@ the archive's `mirror/`), host column populated, per-host coverage in `doctor`.
 degrade to "stale host", never to a failed run.
 **Does NOT include:** anything pushing to those hosts.
 
-### Phase 8 (optional): Retrieval handoff
-**Delivers:** export of accepted lessons in a schema WARP can ingest, and/or a NEEDLE PromptBuilder
-feed. Gated on Open Question 3.
-**Completion criteria:** export validates against the consuming schema; no automatic injection.
+### Phase 8: Cluster-hosted recall service
+**Delivers:** the read-only service of §6.6 — a Deployment with an internal poll loop that pulls the
+private lessons repository, rebuilds a disposable FTS projection, and answers two queries (by repo,
+by error signature) behind a bearer token on the cluster's existing Traefik. Plus the
+WARP-compatible export, and the NEEDLE-side call on failure.
+**Completion criteria (same commit):** a worker on a host other than codinghome gets an answer for a
+repo it has never touched; the projection rebuilds from an empty volume without manual steps; the
+image is a pinned semver tag from `containers/twill-serve/VERSION`; manifests are ArgoCD-synced and
+the deployment commit is recorded on the owning bead; no `Job`/`CronJob`, no new Tailscale-exposed
+Service, no injection anywhere.
+**Does NOT include:** ranking or distillation in the cluster — the service serves what codinghome
+decided. Gated on Open Questions 3a (which cluster) and 3b (WARP ownership).
 
 ## 10. Testing Strategy & Quality Gates
 
@@ -730,9 +769,14 @@ triage-only summarization while routing stays manual.
    Resolve by: Phase 2. Impact if wrong: a second migration of the log path and a gap in `D-04` history.
 2. **Which model and what weekly budget for Explain?** Owner: operator. Resolve by: Phase 4.
    Impact if wrong: either cost creep or lessons too thin to accept.
-3. **Do accepted lessons feed WARP and/or NEEDLE's PromptBuilder, and in whose schema?** Owner:
-   operator. Resolve by: Phase 8. Impact if wrong: duplicate lesson stores, or the same injection
-   failure mode Reflect had.
+3. **~~Do accepted lessons feed WARP and/or NEEDLE's PromptBuilder~~** — the serving half is
+   **decided (2026-09-21)**: a cluster-hosted read-only service, git as transport, WARP-compatible
+   export, reactive queries from NEEDLE (§6.6). Two sub-forks remain: **(3a) which cluster** —
+   ardenone-cluster is proposed, on the strength of the `git-activity-exporter` precedent, Traefik
+   with existing auth middleware, and `needle-dashboard` already living there; and **(3b) does WARP
+   subsume the service** once its recall surface exists, or does this stay TWILL's? Owner: operator.
+   Resolve by: Phase 8 start. Impact if wrong: a second lesson store to reconcile, or a service on a
+   cluster that cannot reach the lessons repository.
 4. **How are other hosts' transcripts pulled in Phase 7** — SSH pull by TWILL, or a host-local TWILL
    per box reporting up? Owner: operator. Resolve by: Phase 7. Impact if wrong: plaintext copies of
    other hosts' transcripts land on codinghome, which is exactly the exposure §7.2 is trying to bound.
