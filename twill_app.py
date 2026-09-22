@@ -2,8 +2,12 @@
 """Phase 0 implementation of the TWILL transcript-to-digest pipeline.
 
 The first version deliberately keeps the pipeline small and deterministic.  It
-does not retain raw transcript lines, and it has no cursor or artifact writer:
-reader -> redactor -> SQLite -> one activity detector -> digest.
+does not retain raw transcript lines and has no artifact writer:
+reader -> cursor -> redactor -> SQLite -> one activity detector -> digest.
+Ingest is cursor-bookkept (plan §6.2 steps 3-6, §8.1 EC-02..EC-05): appended
+files resume at ``last_offset``, rewritten or shrunk files reparse from zero,
+a torn final line is left for the next run, and a vanished file is flagged
+without losing its observations.
 """
 
 from __future__ import annotations
@@ -20,6 +24,7 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 import twill_schema
+import twill_cursor
 from twill_config import (
     ConfigError,
     TwillConfig,
@@ -183,42 +188,62 @@ def _source_kind(path: Path) -> str:
     return "jsonl"
 
 
-def read_session(path: Path) -> SessionData:
-    """Parse one JSONL session into normalized, still-unredacted events."""
+def parse_scan(
+    path: Path, scan: twill_cursor.LineScan, fallback_session_id: str
+) -> tuple[SessionData, int]:
+    """Parse one scanned region into normalized, still-unredacted events.
 
-    fallback_id = path.stem
+    Returns the session data and the number of complete, non-blank lines in
+    the region that did not yield a JSON object — one half of the cursor's
+    ``parse_errors`` input; the torn tail :class:`LineScan` already carries
+    is the other.  Parsing is stateless per line, so a resumed region's
+    events compose with the base parse's (the pairing state the detector
+    reader keeps lives in ``twill_reader`` and is not on this path).
+    """
+
     events: list[TranscriptEvent] = []
-    session_id = fallback_id
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for source_line, line in enumerate(handle, start=1):
-            try:
-                record = json.loads(line)
-            except json.JSONDecodeError:
-                # A partial final line is normal while a producer is closing a
-                # file.  Settled files should not have one, but it is safer to
-                # skip it than to lose all earlier evidence.
+    session_id = fallback_session_id
+    invalid_lines = 0
+    for source_line, line in scan.lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            # A newline-terminated line that is not valid JSON is a torn
+            # write the producer flushed but will never repair.  Count it and
+            # move past it — only an unterminated tail blocks the cursor.
+            invalid_lines += 1
+            continue
+        if not isinstance(record, dict):
+            invalid_lines += 1
+            continue
+        session_id = _session_id(record, session_id)
+        record_type = str(record.get("type") or "session_event")
+        cwd = record.get("cwd")
+        cwd_text = cwd if isinstance(cwd, str) else None
+        for event_index, text in enumerate(_event_texts(record)):
+            if not text.strip():
                 continue
-            if not isinstance(record, dict):
-                continue
-            session_id = _session_id(record, session_id)
-            record_type = str(record.get("type") or "session_event")
-            cwd = record.get("cwd")
-            cwd_text = cwd if isinstance(cwd, str) else None
-            for event_index, text in enumerate(_event_texts(record)):
-                if not text.strip():
-                    continue
-                events.append(
-                    TranscriptEvent(
-                        session_id=session_id,
-                        timestamp=_timestamp(record),
-                        kind=record_type,
-                        text=text,
-                        source_line=source_line,
-                        event_index=event_index,
-                        cwd=cwd_text,
-                    )
+            events.append(
+                TranscriptEvent(
+                    session_id=session_id,
+                    timestamp=_timestamp(record),
+                    kind=record_type,
+                    text=text,
+                    source_line=source_line,
+                    event_index=event_index,
+                    cwd=cwd_text,
                 )
-    return SessionData(path, session_id, _source_kind(path), tuple(events))
+            )
+    return SessionData(path, session_id, _source_kind(path), tuple(events)), invalid_lines
+
+
+def read_session(path: Path) -> SessionData:
+    """Parse one whole JSONL session into normalized, still-unredacted events."""
+
+    session, _ = parse_scan(path, twill_cursor.scan_lines(path, 0), path.stem)
+    return session
 
 
 def _parse_duration(value: str) -> float:
@@ -286,6 +311,15 @@ def _timestamp_pair(value: str) -> tuple[str, str]:
     return utc.isoformat(), utc.astimezone().isoformat()
 
 
+@dataclass(frozen=True)
+class CursorUpdate:
+    """The cursor-side half of one ingest span, written with its rows."""
+
+    facts: twill_cursor.FileFacts
+    last_offset: int
+    parse_errors: int
+
+
 class Store:
     def __init__(
         self,
@@ -304,7 +338,25 @@ class Store:
     def close(self) -> None:
         self.connection.close()
 
-    def ingest(self, session: SessionData) -> tuple[int, int]:
+    def _persist(
+        self,
+        session: SessionData,
+        *,
+        replace: bool,
+        stale_session_ids: Sequence[str] = (),
+        cursor_update: CursorUpdate | None = None,
+    ) -> int:
+        """Write one session's derived rows — and its cursor row — in one transaction.
+
+        ``replace`` re-ingests from scratch (the Phase 0 re-read semantic and
+        EC-03's reparse): every derived row tied to this file's session_key or
+        to a stale ``session_id`` is deleted first, so a rewritten file can
+        never leave its previous identity's observations behind.  Without it
+        (EC-02 resume) the stored base rows stay and only the new span's
+        events are appended; observations are still re-derived, from the full
+        stored event set.  A crash either lands both halves or neither
+        (plan §6.2 step 6).  Returns the session's observation count.
+        """
         key = _session_key(session.path)
         now = datetime.now(timezone.utc).isoformat()
         conn = self.connection
@@ -315,10 +367,18 @@ class Store:
         stored_source_path = self.redactor.redact_text(str(session.path))
         stored_source_kind = self.redactor.redact_text(session.source_kind)
         with conn:
-            # EC-03 semantics: a re-read replaces the derived rows of the
-            # session it parsed, identified by session_id in the v1 schema.
-            conn.execute("DELETE FROM observation WHERE session_id = ?", (stored_session_id,))
-            conn.execute("DELETE FROM transcript_event WHERE session_key = ?", (key,))
+            if replace:
+                for stale_id in dict.fromkeys((*stale_session_ids, stored_session_id)):
+                    conn.execute(
+                        "DELETE FROM observation WHERE session_id = ?", (stale_id,)
+                    )
+                conn.execute("DELETE FROM transcript_event WHERE session_key = ?", (key,))
+            else:
+                # Resume: the base events stay; observations are re-derived
+                # from the union below.
+                conn.execute(
+                    "DELETE FROM observation WHERE session_id = ?", (stored_session_id,)
+                )
             conn.execute(
                 "INSERT INTO session(session_key, session_id, source_path, source_kind, ingested_at) "
                 "VALUES (?, ?, ?, ?, ?) "
@@ -345,7 +405,97 @@ class Store:
                     ),
                 )
             observation_count = self._run_detector(conn, key, stored_session_id)
+            if cursor_update is not None:
+                twill_cursor.upsert_cursor(
+                    conn,
+                    path=stored_source_path,
+                    session_id=stored_session_id,
+                    source=stored_source_kind,
+                    facts=cursor_update.facts,
+                    last_offset=cursor_update.last_offset,
+                    parse_errors=cursor_update.parse_errors,
+                    now=now,
+                )
+        return observation_count
+
+    def ingest(self, session: SessionData) -> tuple[int, int]:
+        """Persist one whole in-memory session, replacing its derived rows."""
+
+        observation_count = self._persist(session, replace=True)
         return len(session.events), observation_count
+
+    def ingest_path(self, path: Path) -> dict[str, object]:
+        """Ingest one transcript file under cursor bookkeeping (§6.2 steps 3-6).
+
+        Returns a per-file summary: the action taken, the new event count and
+        the session's observation count after the write.
+        """
+        stored_path = self.redactor.redact_text(str(path))
+        row = twill_cursor.load_cursor(self.connection, stored_path)
+        facts = twill_cursor.file_facts(path)
+        plan = twill_cursor.plan_ingest(row, path, facts)
+        scan = twill_cursor.scan_lines(path, plan.start_offset)
+
+        if plan.action == twill_cursor.ACTION_RESUME and not scan.lines:
+            # Nothing new to parse — an unchanged file, or one whose only new
+            # bytes are the still-growing tail.  Derived rows are left alone
+            # (obs_ids stay put across idle passes), and only the cursor
+            # bookkeeping is refreshed; an empty region keeps the stored
+            # parse_errors sticky so doctor's consecutive-run signal can fire.
+            parse_errors = row.parse_errors if scan.region_empty else 1
+            now = datetime.now(timezone.utc).isoformat()
+            with self.connection:
+                twill_cursor.upsert_cursor(
+                    self.connection,
+                    path=stored_path,
+                    session_id=row.session_id,
+                    source=row.source,
+                    facts=facts,
+                    last_offset=scan.new_offset,
+                    parse_errors=parse_errors,
+                    now=now,
+                )
+            observations = self._count_observations(row.session_id)
+            return {
+                "path": str(path),
+                "session_id": row.session_id,
+                "action": plan.action,
+                "events": 0,
+                "observations": observations,
+            }
+
+        fallback_id = (
+            row.session_id if plan.action == twill_cursor.ACTION_RESUME else path.stem
+        )
+        session, invalid_lines = parse_scan(path, scan, fallback_id)
+        parse_errors = invalid_lines + (1 if scan.pending_tail else 0)
+        stale_ids = (row.session_id,) if row is not None else ()
+        observations = self._persist(
+            session,
+            replace=plan.replace_session,
+            stale_session_ids=stale_ids,
+            cursor_update=CursorUpdate(facts, scan.new_offset, parse_errors),
+        )
+        return {
+            "path": str(path),
+            "session_id": session.session_id,
+            "action": plan.action,
+            "events": len(session.events),
+            "observations": observations,
+        }
+
+    def mark_missing_paths(self) -> int:
+        """Sweep cursor rows for vanished files (EC-05); returns rows changed."""
+
+        with self.connection:
+            return twill_cursor.mark_missing(self.connection)
+
+    def _count_observations(self, stored_session_id: str) -> int:
+        row = self.connection.execute(
+            "SELECT count(*) FROM observation WHERE session_id = ?",
+            (stored_session_id,),
+        ).fetchone()
+        return int(row[0]) if row else 0
 
     @staticmethod
     def _run_detector(conn: sqlite3.Connection, session_key: str, session_id: str) -> int:
@@ -423,27 +573,22 @@ def ingest_command(args: argparse.Namespace) -> int:
         )
     except (OSError, ValueError) as exc:
         raise CliError(EXIT_RUNTIME_ERROR, str(exc), "check the transcript path and try again") from exc
-    if not files:
-        raise CliError(
-            EXIT_RUNTIME_ERROR,
-            "no settled JSONL sessions found",
-            "wait for the transcript settle window or use --settle 0 for a controlled fixture",
-        )
-
     store = Store(_state_dir(args.state_dir), content_fences=config.content_fences)
     try:
+        # EC-05: on every enumerated run, flag upstream files that vanished.
+        # The sweep runs before the no-settled-files error so a fully cleaned
+        # transcript tree still records its missing paths (evidence survives).
+        if args.file is None:
+            store.mark_missing_paths()
+        if not files:
+            raise CliError(
+                EXIT_RUNTIME_ERROR,
+                "no settled JSONL sessions found",
+                "wait for the transcript settle window or use --settle 0 for a controlled fixture",
+            )
         processed = []
         for path in files[: args.limit]:
-            session = read_session(path)
-            events, observations = store.ingest(session)
-            processed.append(
-                {
-                    "path": str(path),
-                    "session_id": session.session_id,
-                    "events": events,
-                    "observations": observations,
-                }
-            )
+            processed.append(store.ingest_path(path))
     finally:
         store.close()
 

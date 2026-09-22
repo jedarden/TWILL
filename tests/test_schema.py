@@ -47,6 +47,7 @@ COLUMN_CONTRACT = {
         ("parse_errors", "INTEGER", 1, "0", 0),
         ("first_seen", "TEXT", 1, None, 0),
         ("last_indexed_at", "TEXT", 1, None, 0),
+        ("path_missing", "INTEGER", 1, "0", 0),
     ],
     "observation": [
         ("obs_id", "INTEGER", 0, None, 1),
@@ -161,6 +162,49 @@ class SchemaContractTests(unittest.TestCase):
     def test_column_contract(self):
         for table, expected in COLUMN_CONTRACT.items():
             self.assertEqual(self.table_columns(table), expected, table)
+
+    def test_additive_column_migrates_a_pre_existing_cursor_table(self):
+        # A database created before cursor.path_missing shipped keeps its
+        # data and gains the column on the next writer open (plan §8.4:
+        # additive only; a fresh database gets it from the DDL directly).
+        self.connection.execute(
+            "INSERT INTO cursor(path, session_id, source, identity_sha, size, mtime_ns, "
+            "last_offset, first_seen, last_indexed_at) "
+            "VALUES ('/t/old.jsonl', 's1', 'claude', 'sha', 10, 1, 4, 'x', 'y')"
+        )
+        self.connection.commit()
+        self.connection.close()
+        legacy = sqlite3.connect(self.state_dir / "twill.db")
+        legacy.execute("CREATE TABLE cursor_backup AS SELECT * FROM cursor")
+        legacy.execute("DROP TABLE cursor")
+        # The pre-path_missing shape, column for column.
+        legacy.execute(
+            "CREATE TABLE cursor(path TEXT PRIMARY KEY, session_id TEXT NOT NULL, "
+            "source TEXT NOT NULL, identity_sha TEXT NOT NULL, size INTEGER NOT NULL, "
+            "mtime_ns INTEGER NOT NULL, last_offset INTEGER NOT NULL DEFAULT 0, "
+            "parse_errors INTEGER NOT NULL DEFAULT 0, first_seen TEXT NOT NULL, "
+            "last_indexed_at TEXT NOT NULL)"
+        )
+        legacy.execute(
+            "INSERT INTO cursor SELECT path, session_id, source, identity_sha, size, "
+            "mtime_ns, last_offset, parse_errors, first_seen, last_indexed_at FROM cursor_backup"
+        )
+        legacy.commit()
+        legacy.close()
+
+        migrated = twill_schema.connect(self.state_dir)
+        self.addCleanup(migrated.close)
+        columns = [row[1] for row in migrated.execute("PRAGMA table_info(cursor)")]
+        self.assertEqual(columns[-1], "path_missing")
+        row = migrated.execute(
+            "SELECT path, last_offset, path_missing FROM cursor"
+        ).fetchone()
+        self.assertEqual(row, ("/t/old.jsonl", 4, 0))
+        # The migrated shape matches a fresh one exactly.
+        fresh = twill_schema.connect(self.state_dir.parent / "fresh")
+        self.addCleanup(fresh.close)
+        fresh_columns = [row[1] for row in fresh.execute("PRAGMA table_info(cursor)")]
+        self.assertEqual(columns, fresh_columns)
 
     def test_meta_is_not_part_of_this_schema(self):
         # meta(key, value, updated_at) has its own bead; the v1 schema bead

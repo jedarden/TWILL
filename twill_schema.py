@@ -8,9 +8,13 @@ database file to mode 600, and ensures the v1 tables exist.  Read verbs use
 the only deviation is ``IF NOT EXISTS`` so repeated writer opens are idempotent.
 
 Two pieces of §7.1 deliberately live elsewhere: ``meta`` is added by its own
-bead, and additive migrations (plan §8.4) are a separate runner.  The interim
-Phase 0 working tables (``session``, ``transcript_event``) stay in
-``twill_app`` — they are pipeline scaffolding, not corpus schema.
+bead, and the versioned migration runner (plan §8.4) is a separate bead.  The
+one column added after the v1 DDL shipped — ``cursor.path_missing`` (EC-05) —
+is applied inline by :func:`_apply_additive_columns`, idempotently, so a
+database created before the column exists converges on the same shape a fresh
+one gets.  The interim Phase 0 working tables (``session``,
+``transcript_event``) stay in ``twill_app`` — they are pipeline scaffolding,
+not corpus schema.
 """
 
 from __future__ import annotations
@@ -49,6 +53,14 @@ EXPECTED_OBSERVATION_COLUMNS = (
     "host",
 )
 
+# Columns added after the v1 DDL shipped, applied to pre-existing tables by
+# _apply_additive_columns.  A fresh database gets them from the DDL itself.
+ADDITIVE_COLUMNS = (
+    # EC-05: a vanished upstream transcript is flagged, never avenged — its
+    # observations survive and `doctor` reports the spike.
+    ("cursor", "path_missing", "INTEGER NOT NULL DEFAULT 0"),
+)
+
 
 V1_SCHEMA = """
 -- identity + resume position for every transcript file ever seen
@@ -58,7 +70,8 @@ CREATE TABLE IF NOT EXISTS cursor(
   size INTEGER NOT NULL, mtime_ns INTEGER NOT NULL,
   last_offset INTEGER NOT NULL DEFAULT 0,
   parse_errors INTEGER NOT NULL DEFAULT 0,
-  first_seen TEXT NOT NULL, last_indexed_at TEXT NOT NULL);
+  first_seen TEXT NOT NULL, last_indexed_at TEXT NOT NULL,
+  path_missing INTEGER NOT NULL DEFAULT 0);   -- EC-05: vanished upstream, evidence kept
 
 -- the atom of evidence; text fields are POST-redaction and <=240 chars
 CREATE TABLE IF NOT EXISTS observation(
@@ -189,6 +202,22 @@ def connect_read_only(state_dir: Path) -> sqlite3.Connection:
     return connection
 
 
+def _apply_additive_columns(connection: sqlite3.Connection) -> None:
+    """Add columns introduced after the v1 DDL shipped (plan §8.4: additive only).
+
+    ``CREATE TABLE IF NOT EXISTS`` cannot extend a table that already exists,
+    so each additive column is checked against ``table_info`` and appended
+    with ``ALTER TABLE`` when missing.  Appending keeps fresh and migrated
+    databases in the same column order; a downgrade simply keeps the unknown
+    column, which is exactly §8.4's tolerance.
+    """
+
+    for table, column, definition in ADDITIVE_COLUMNS:
+        existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+        if column not in existing:
+            connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def connect(state_dir: Path, *, read_only: bool = False) -> sqlite3.Connection:
     """Open the state database as a writer, or explicitly read-only."""
 
@@ -209,6 +238,7 @@ def connect(state_dir: Path, *, read_only: bool = False) -> sqlite3.Connection:
         _pin_db_modes(db_path)
         _verify_observation_shape(connection, db_path)
         connection.executescript(V1_SCHEMA)
+        _apply_additive_columns(connection)
     except BaseException:
         connection.close()
         raise
