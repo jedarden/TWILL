@@ -3,10 +3,11 @@
 from __future__ import annotations
 
 import json
-import re
 import sys
 from datetime import datetime, timezone
 from typing import Any, TextIO
+
+from twill_redactor import redact_text
 
 
 SCHEMA_VERSION = 1
@@ -24,43 +25,6 @@ ERROR_CODES = frozenset(
         EXIT_LOCK_HELD,
         EXIT_VALIDATION_FAILURE,
     }
-)
-
-
-_CREDENTIAL_PATTERNS = (
-    (
-        re.compile(r"(?i)\bgh[pousr]_[A-Za-z0-9_-]{12,}"),
-        "<redacted:github-token>",
-    ),
-    (
-        re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-        "<redacted:aws-access-key>",
-    ),
-    (
-        re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-        "Bearer <redacted:bearer-token>",
-    ),
-    (
-        re.compile(r"(?i)\bsk-[A-Za-z0-9_-]{12,}"),
-        "<redacted:api-key>",
-    ),
-    (
-        re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
-        "<redacted:slack-token>",
-    ),
-    (
-        re.compile(
-            r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret|token)\s*[:=]\s*)(['\"]?)[^\s,'\"]+"
-        ),
-        r"\1\2<redacted:secret>",
-    ),
-    (
-        re.compile(
-            r"-----BEGIN [A-Z ]+ PRIVATE KEY-----.*?-----END [A-Z ]+ PRIVATE KEY-----",
-            re.DOTALL,
-        ),
-        "<redacted:private-key>",
-    ),
 )
 
 
@@ -107,10 +71,7 @@ class ValidationError(CliError):
 def _safe_text(value: object) -> str:
     """Make operator-facing text safe without exposing credential-shaped values."""
 
-    text = str(value).replace("\x00", "").strip()
-    for pattern, replacement in _CREDENTIAL_PATTERNS:
-        text = pattern.sub(replacement, text)
-    return text
+    return redact_text(value)
 
 
 def generated_at() -> str:

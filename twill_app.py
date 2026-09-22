@@ -12,7 +12,6 @@ import argparse
 import hashlib
 import json
 import os
-import re
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -37,6 +36,7 @@ from twill_contract import (
     emit_success,
 )
 from twill_lock import StateLock
+from twill_redactor import Redactor, redact as _redact
 
 
 MAX_EXCERPT_LENGTH = 240
@@ -89,41 +89,10 @@ class SessionData:
     events: tuple[TranscriptEvent, ...]
 
 
-_REDACTION_PATTERNS = (
-    (
-        re.compile(r"(?i)\bgh[pousr]_[A-Za-z0-9_\-]{12,}"),
-        "<redacted:github-token>",
-    ),
-    (
-        re.compile(r"\b(?:AKIA|ASIA)[0-9A-Z]{16}\b"),
-        "<redacted:aws-access-key>",
-    ),
-    (
-        re.compile(r"(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}"),
-        "Bearer <redacted:bearer-token>",
-    ),
-    (
-        re.compile(r"(?i)\bsk-[A-Za-z0-9_-]{12,}"),
-        "<redacted:api-key>",
-    ),
-    (
-        re.compile(
-            r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret|token)\s*[:=]\s*)(['\"]?)[^\s,'\"]+"
-        ),
-        r"\1\2<redacted:secret>",
-    ),
-)
+def redact(text: object | None, content_fences: Sequence[str] = ()) -> str:
+    """Compatibility export for the bounded persistence excerpt redactor."""
 
-
-def redact(text: str | None) -> str:
-    """Redact credential-shaped values and cap persisted excerpts."""
-
-    if not text:
-        return ""
-    redacted = str(text)
-    for pattern, replacement in _REDACTION_PATTERNS:
-        redacted = pattern.sub(replacement, redacted)
-    return redacted.strip()[:MAX_EXCERPT_LENGTH]
+    return _redact(text, content_fences)
 
 
 def _text_values(value: object) -> Iterator[str]:
@@ -318,9 +287,16 @@ def _timestamp_pair(value: str) -> tuple[str, str]:
 
 
 class Store:
-    def __init__(self, state_dir: Path, *, read_only: bool = False):
+    def __init__(
+        self,
+        state_dir: Path,
+        *,
+        read_only: bool = False,
+        content_fences: Sequence[str] = (),
+    ):
         self.state_dir = state_dir
         self.db_path = twill_schema.state_db_path(state_dir)
+        self.redactor = Redactor(content_fences)
         self.connection = twill_schema.connect(state_dir, read_only=read_only)
         if not read_only:
             self.connection.executescript(SCHEMA)
@@ -332,17 +308,23 @@ class Store:
         key = _session_key(session.path)
         now = datetime.now(timezone.utc).isoformat()
         conn = self.connection
+        # Sanitize every transcript-derived string before it can become a
+        # SQLite parameter. Excerpts use the bounded form; identifiers and
+        # paths use the same redaction pass without an artificial length cap.
+        stored_session_id = self.redactor.redact_text(session.session_id)
+        stored_source_path = self.redactor.redact_text(str(session.path))
+        stored_source_kind = self.redactor.redact_text(session.source_kind)
         with conn:
             # EC-03 semantics: a re-read replaces the derived rows of the
             # session it parsed, identified by session_id in the v1 schema.
-            conn.execute("DELETE FROM observation WHERE session_id = ?", (session.session_id,))
+            conn.execute("DELETE FROM observation WHERE session_id = ?", (stored_session_id,))
             conn.execute("DELETE FROM transcript_event WHERE session_key = ?", (key,))
             conn.execute(
                 "INSERT INTO session(session_key, session_id, source_path, source_kind, ingested_at) "
                 "VALUES (?, ?, ?, ?, ?) "
                 "ON CONFLICT(session_key) DO UPDATE SET session_id=excluded.session_id, "
                 "source_path=excluded.source_path, source_kind=excluded.source_kind, ingested_at=excluded.ingested_at",
-                (key, session.session_id, str(session.path), session.source_kind, now),
+                (key, stored_session_id, stored_source_path, stored_source_kind, now),
             )
             for event in session.events:
                 ts_utc, ts_local = _timestamp_pair(event.timestamp)
@@ -357,12 +339,12 @@ class Store:
                         event.event_index,
                         ts_utc,
                         ts_local,
-                        event.kind,
-                        redact(event.text),
-                        redact(event.cwd),
+                        self.redactor.redact_text(event.kind),
+                        self.redactor.redact_excerpt(event.text),
+                        self.redactor.redact_excerpt(event.cwd),
                     ),
                 )
-            observation_count = self._run_detector(conn, key, session.session_id)
+            observation_count = self._run_detector(conn, key, stored_session_id)
         return len(session.events), observation_count
 
     @staticmethod
@@ -448,7 +430,7 @@ def ingest_command(args: argparse.Namespace) -> int:
             "wait for the transcript settle window or use --settle 0 for a controlled fixture",
         )
 
-    store = Store(_state_dir(args.state_dir))
+    store = Store(_state_dir(args.state_dir), content_fences=config.content_fences)
     try:
         processed = []
         for path in files[: args.limit]:
