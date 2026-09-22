@@ -20,6 +20,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Sequence
 
+from twill_contract import (
+    EXIT_RUNTIME_ERROR,
+    EXIT_SUCCESS,
+    EXIT_USAGE_ERROR,
+    CliError,
+    UsageError,
+    emit_error,
+    emit_success,
+)
+
 
 DEFAULT_SETTLE_SECONDS = 2 * 60 * 60
 DEFAULT_SOURCE_ROOTS = (
@@ -412,11 +422,13 @@ def ingest_command(args: argparse.Namespace) -> int:
             Path(args.file) if args.file else None,
         )
     except (OSError, ValueError) as exc:
-        print(f"twill ingest: {exc}", file=sys.stderr)
-        return 1
+        raise CliError(EXIT_RUNTIME_ERROR, str(exc), "check the transcript path and try again") from exc
     if not files:
-        print("twill ingest: no settled JSONL sessions found", file=sys.stderr)
-        return 1
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            "no settled JSONL sessions found",
+            "wait for the transcript settle window or use --settle 0 for a controlled fixture",
+        )
 
     store = Store(_state_dir(args.state_dir))
     try:
@@ -443,13 +455,13 @@ def ingest_command(args: argparse.Namespace) -> int:
         "observations": total_observations,
     }
     if args.json:
-        print(json.dumps(result, sort_keys=True))
+        emit_success(result, json_mode=True)
     else:
         print(
             f"ingested {len(processed)} session(s); "
             f"stored {total_events} event(s); detector emitted {total_observations} observation(s)"
         )
-    return 0
+    return EXIT_SUCCESS
 
 
 def digest_command(args: argparse.Namespace) -> int:
@@ -459,24 +471,22 @@ def digest_command(args: argparse.Namespace) -> int:
     finally:
         store.close()
     if args.json:
-        print(
-            json.dumps(
-                {
-                    "observations": total,
-                    "detectors": ["D-00@1"],
-                    "rows": [dict(row) for row in rows],
-                },
-                sort_keys=True,
-            )
+        emit_success(
+            {
+                "observations": total,
+                "detectors": ["D-00@1"],
+                "rows": [dict(row) for row in rows],
+            },
+            json_mode=True,
         )
-        return 0
+        return EXIT_SUCCESS
 
     print("TWILL digest")
     print(f"observations: {total}")
     print("detectors: D-00@1 (session activity)")
     if not rows:
         print("no observations")
-        return 0
+        return EXIT_SUCCESS
     for row in rows:
         print(
             f"- observation #{row['obs_id']} [{row['detector_id']}] "
@@ -485,9 +495,18 @@ def digest_command(args: argparse.Namespace) -> int:
     return 0
 
 
+class _ArgumentParser(argparse.ArgumentParser):
+    """Raise a contract error instead of letting argparse print unstructured prose."""
+
+    def error(self, message: str) -> None:
+        raise UsageError(message)
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = argparse.ArgumentParser(prog="twill")
-    subparsers = parser.add_subparsers(dest="command", required=True)
+    parser = _ArgumentParser(prog="twill")
+    subparsers = parser.add_subparsers(
+        dest="command", required=True, parser_class=_ArgumentParser
+    )
 
     ingest = subparsers.add_parser("ingest", help="read settled local JSONL sessions")
     ingest.add_argument("--limit", type=int, default=1)
@@ -507,11 +526,25 @@ def build_parser() -> argparse.ArgumentParser:
 
 
 def main(argv: Sequence[str] | None = None) -> int:
+    actual_argv = list(sys.argv[1:] if argv is None else argv)
+    json_mode = "--json" in actual_argv
     parser = build_parser()
-    args = parser.parse_args(argv)
-    if getattr(args, "limit", 1) < 1:
-        parser.error("--limit must be at least 1")
-    return int(args.handler(args))
+    try:
+        args = parser.parse_args(actual_argv)
+        if getattr(args, "limit", 1) < 1:
+            raise CliError(EXIT_USAGE_ERROR, "--limit must be at least 1")
+        return int(args.handler(args))
+    except CliError as exc:
+        emit_error(exc.code, exc.message, exc.hint, json_mode=json_mode)
+        return exc.code
+    except Exception as exc:  # pragma: no cover - exercised by integration failures
+        emit_error(
+            EXIT_RUNTIME_ERROR,
+            str(exc) or "unexpected runtime error",
+            "check the state directory and try again",
+            json_mode=json_mode,
+        )
+        return EXIT_RUNTIME_ERROR
 
 
 if __name__ == "__main__":

@@ -74,3 +74,23 @@ Use `--settle 0` for a deliberately controlled fixture, `--file PATH` to select 
 `--state-dir PATH` and `--source PATH` for an isolated run. This walking skeleton intentionally
 does not implement appended-file cursors, ranking, coverage, LLM explanation, measurement, or
 timers.
+
+## CLI output contract
+
+Read verbs accept `--json` and write one JSON object to stdout. Successful commands use this
+envelope:
+
+```json
+{"schema_version": 1, "generated_at": "2026-09-22T12:00:00Z", "data": {}, "warnings": []}
+```
+
+Failures use the same machine-readable surface regardless of whether the failure came from
+argument parsing or command execution:
+
+```json
+{"error": {"code": 1, "message": "...", "hint": "..."}}
+```
+
+Exit codes are `0` success, `1` runtime error, `2` usage error, `3` lock held, and `4` validation
+failure. JSON failures are written to stdout with no prose on stderr. Human-readable failures are
+written to stderr, and credential-shaped values are redacted in both modes.
