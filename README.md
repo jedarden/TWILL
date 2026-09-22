@@ -58,7 +58,19 @@ and disposable — never committed, never off the host: an index of transcript t
 be surfaced into future prompts, which makes a leaked secret in it worse than one sitting inert in
 a transcript.
 
-## Status
+## Phase 0 walking skeleton
 
-Plan complete (`docs/plan/plan.md`, 36/36 on the completeness bar). No code yet — Phase 0 is a
-walking skeleton: one settled session through reader → redactor → store → detector → digest.
+The first executable slice reads one settled JSONL session from either local transcript source,
+redacts credential-shaped values before persistence, stores normalized events in
+`~/.local/state/twill/twill.db`, runs the trivial `D-00@1` activity detector, and renders the
+result without writing an artifact into this public repository:
+
+```sh
+twill ingest --limit 1
+twill digest --stdout
+```
+
+Use `--settle 0` for a deliberately controlled fixture, `--file PATH` to select one session, or
+`--state-dir PATH` and `--source PATH` for an isolated run. This walking skeleton intentionally
+does not implement appended-file cursors, ranking, coverage, LLM explanation, measurement, or
+timers.
