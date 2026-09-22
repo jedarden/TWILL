@@ -531,6 +531,19 @@ class Store:
 def settled_files(
     roots: Sequence[Path], settle_seconds: float, explicit_file: Path | None = None
 ) -> list[Path]:
+    """Enumerate transcript files old enough to parse: the EC-01 settle gate.
+
+    A file is eligible when ``now - mtime >= settle_seconds`` -- the boundary
+    is inclusive, so a file exactly one window old may parse.  The gate runs
+    here, at enumeration, before any byte of the file is read: a younger file
+    is skipped whole, never parsed partially, and leaves no cursor row.  An
+    explicitly named file crosses the same gate (``--settle 0`` is the
+    controlled-fixture escape hatch), and a future mtime is never eligible --
+    a negative age is less than any window, literally -- so a clock-skewed
+    file waits until the clock reaches its mtime.  Newest first, because
+    ``--limit`` takes the freshest settled sessions.
+    """
+
     now = datetime.now(timezone.utc).timestamp()
     if explicit_file is not None:
         path = explicit_file.expanduser().resolve()
