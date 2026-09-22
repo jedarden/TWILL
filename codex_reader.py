@@ -1,0 +1,695 @@
+#!/usr/bin/env python3
+"""Parse Codex rollout JSONL into source-independent observations.
+
+Codex rollouts are not shaped like Claude Code transcripts.  User prompts are
+``response_item`` records with ``role=user``; shell calls are usually
+``custom_tool_call`` records named ``exec``; and token counts arrive in
+``event_msg`` records as cumulative snapshots.  This module translates those
+records to the same six event kinds and fields used by the Claude reader.
+
+The parser deliberately consumes complete lines only.  A caller may feed it a
+file while Codex is still appending to it, then call :meth:`finish` to flush a
+run whose result has not arrived yet.  Token snapshots are exposed separately
+as :class:`TokenUsage` rows because they are accounting data, not detector
+events; each row contains the delta since the previous cumulative snapshot.
+"""
+
+from __future__ import annotations
+
+import json
+import re
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Iterator
+
+
+KIND_RUN = "run"
+KIND_TOOL_ERROR = "tool_error"
+KIND_TOOL_REJECTED = "tool_rejected"
+KIND_INTERRUPT = "interrupt"
+KIND_FILE_READ = "file_read"
+KIND_USER_TURN_AFTER_CORRECTION = "user_turn_after_correction"
+
+ALL_EVENT_KINDS = (
+    KIND_RUN,
+    KIND_TOOL_ERROR,
+    KIND_TOOL_REJECTED,
+    KIND_INTERRUPT,
+    KIND_FILE_READ,
+    KIND_USER_TURN_AFTER_CORRECTION,
+)
+
+_INTERRUPT_SENTINEL = "[Request interrupted by user]"
+
+# Codex has used both the Claude-compatible wording and shorter approval
+# wording in tool output.  These are intentionally bounded sentinels rather
+# than a broad ``denied`` match: a command's ordinary stderr may say
+# "permission denied" and should remain a failed run.
+_REJECTION_SENTINELS = (
+    "[Request interrupted by user for tool use]",
+    "The user doesn't want to proceed with this tool use",
+    "The user doesn't want to take this action",
+    "tool call was rejected",
+    "tool call rejected",
+    "command was rejected",
+    "approval denied",
+    "user denied",
+    "rejected by user",
+)
+
+_EXIT_CODE_PATTERNS = (
+    re.compile(r"(?im)\bProcess exited with code\s*[:=]?\s*(-?\d+)"),
+    re.compile(r"(?im)\bCommand exited with code\s*[:=]?\s*(-?\d+)"),
+    re.compile(r"(?im)\bExit code\s*[:=]?\s*(-?\d+)"),
+    re.compile(r"(?im)\bexit code\s*[:=]?\s*(-?\d+)"),
+    re.compile(r"(?im)\breturned non[- ]zero exit status\s+(-?\d+)"),
+)
+
+_EXEC_NAMES = frozenset({"exec", "exec_command", "shell", "bash", "run"})
+_READ_NAMES = frozenset({"read", "read_file", "readfile", "cat"})
+_CALL_TYPES = frozenset({"custom_tool_call", "function_call"})
+_OUTPUT_TYPES = frozenset({"custom_tool_call_output", "function_call_output"})
+_REJECTION_EVENT_TYPES = frozenset(
+    {"tool_call_rejected", "tool_rejected", "approval_rejected"}
+)
+
+
+@dataclass(frozen=True)
+class NormalizedEvent:
+    """One detector-facing event.
+
+    The field names and semantics intentionally mirror the Claude parser.  In
+    particular, ``exit_code`` is ``None`` if the rollout does not state an
+    exit status, not an implicit success value.
+    """
+
+    kind: str
+    source_line: int
+    event_index: int
+    timestamp: str | None = None
+    session_id: str | None = None
+    cwd: str | None = None
+    sidechain: bool = False
+    text: str = ""
+    tool_name: str | None = None
+    command: str | None = None
+    exit_code: int | None = None
+    error_excerpt: str | None = None
+    file_path: str | None = None
+
+
+@dataclass(frozen=True)
+class TokenUsage:
+    """A positive delta derived from one cumulative Codex token snapshot."""
+
+    source_line: int
+    event_index: int
+    timestamp: str | None = None
+    session_id: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    total_tokens: int = 0
+    model_context_window: int | None = None
+
+
+@dataclass(frozen=True)
+class ParseResult:
+    """All normalized output from one rollout file."""
+
+    session_id: str | None
+    events: tuple[NormalizedEvent, ...]
+    usage: tuple[TokenUsage, ...]
+
+
+@dataclass(frozen=True)
+class _PendingCall:
+    name: str
+    kind: str
+    command: str | None
+    source_line: int
+    timestamp: str | None
+    session_id: str | None
+    cwd: str | None
+    sidechain: bool
+
+
+class CodexRolloutLineParser:
+    """Parse complete Codex rollout records one line at a time."""
+
+    def __init__(self) -> None:
+        self.session_id: str | None = None
+        self.cwd: str | None = None
+        self._pending: dict[str, _PendingCall] = {}
+        self._pending_order: list[str] = []
+        self._awaiting_correction = False
+        self._last_usage: dict[str, int] = {}
+        self._usage: list[TokenUsage] = []
+
+    @property
+    def usage(self) -> tuple[TokenUsage, ...]:
+        """Usage deltas observed so far."""
+
+        return tuple(self._usage)
+
+    # ``usage_deltas`` is a descriptive alias useful to callers that also
+    # retain raw snapshots elsewhere.
+    @property
+    def usage_deltas(self) -> tuple[TokenUsage, ...]:
+        return self.usage
+
+    def parse_line(self, line: str, source_line: int) -> list[NormalizedEvent]:
+        """Parse one complete JSONL line, returning zero or more events."""
+
+        stripped = line.strip()
+        if not stripped:
+            return []
+        try:
+            record = json.loads(stripped)
+        except json.JSONDecodeError:
+            # A producer commonly leaves an incomplete final line while the
+            # rollout is being written.  Complete earlier lines remain useful.
+            return []
+        if not isinstance(record, dict):
+            return []
+
+        payload = record.get("payload")
+        payload_dict = payload if isinstance(payload, dict) else {}
+        self._update_context(record, payload_dict)
+        context = self._context(record, payload_dict)
+        record_type = record.get("type")
+
+        if record_type == "response_item":
+            return self._parse_response_item(payload_dict, source_line, context)
+        if record_type == "event_msg":
+            return self._parse_event_message(payload_dict, source_line, context)
+        if record_type == "token_usage_record":
+            self._consume_usage_snapshot(
+                payload_dict.get("thread_token_usage")
+                or payload_dict.get("usage"),
+                payload_dict.get("model_context_window"),
+                source_line,
+                context,
+            )
+        return []
+
+    def finish(self) -> list[NormalizedEvent]:
+        """Flush unresolved shell calls with an unknown exit status."""
+
+        events: list[NormalizedEvent] = []
+        for call_id in self._pending_order:
+            pending = self._pending[call_id]
+            if pending.kind == KIND_RUN and pending.command is not None:
+                events.append(self._run_event(pending, None, None, len(events)))
+        self._pending.clear()
+        self._pending_order.clear()
+        return events
+
+    def _update_context(self, record: dict[str, object], payload: dict[str, object]) -> None:
+        session_id = _first_string(
+            record.get("sessionId"),
+            record.get("session_id"),
+            payload.get("session_id"),
+        )
+        if session_id:
+            self.session_id = session_id
+
+        cwd = _first_string(record.get("cwd"), payload.get("cwd"))
+        if cwd:
+            self.cwd = cwd
+
+    def _context(
+        self, record: dict[str, object], payload: dict[str, object]
+    ) -> dict[str, object]:
+        timestamp = _first_string(record.get("timestamp"), payload.get("timestamp"))
+        sidechain = (
+            record.get("isSidechain") is True
+            or record.get("sidechain") is True
+            or payload.get("is_sidechain") is True
+            or payload.get("sidechain") is True
+        )
+        return {
+            "timestamp": timestamp,
+            "session_id": self.session_id,
+            "cwd": self.cwd,
+            "sidechain": sidechain,
+        }
+
+    def _parse_response_item(
+        self,
+        payload: dict[str, object],
+        source_line: int,
+        context: dict[str, object],
+    ) -> list[NormalizedEvent]:
+        payload_type = payload.get("type")
+        if payload_type in _CALL_TYPES:
+            return self._register_call(payload, source_line, context)
+        if payload_type in _OUTPUT_TYPES:
+            return self._consume_call_output(payload, source_line, context)
+
+        role = payload.get("role")
+        if role == "user":
+            return self._consume_user_prompt(_content_texts(payload.get("content")), source_line, context)
+        if role == "assistant":
+            # A response item is an assistant event even when it is prose.
+            # This is what makes "assistant spoke, then user spoke" distinct
+            # from an actual correction after an interruption.
+            self._awaiting_correction = False
+        return []
+
+    def _parse_event_message(
+        self,
+        payload: dict[str, object],
+        source_line: int,
+        context: dict[str, object],
+    ) -> list[NormalizedEvent]:
+        payload_type = payload.get("type")
+        if payload_type == "token_count":
+            info = payload.get("info")
+            info_dict = info if isinstance(info, dict) else {}
+            total = info_dict.get("total_token_usage")
+            self._consume_usage_snapshot(
+                total,
+                info_dict.get("model_context_window"),
+                source_line,
+                context,
+            )
+            return []
+
+        if payload_type == "turn_aborted":
+            self._awaiting_correction = True
+            return [self._interrupt_event(source_line, context)]
+
+        if payload_type in _REJECTION_EVENT_TYPES:
+            text = _text_from_value(
+                payload.get("message")
+                or payload.get("reason")
+                or payload.get("text")
+                or payload.get("output")
+            )
+            return [
+                NormalizedEvent(
+                    kind=KIND_TOOL_REJECTED,
+                    source_line=source_line,
+                    event_index=0,
+                    text=text,
+                    tool_name=payload.get("name")
+                    if isinstance(payload.get("name"), str)
+                    else None,
+                    **context,
+                )
+            ]
+
+        # Current Codex writes the prompt as response_item/role=user.  Older
+        # event_msg/user_message records are deliberately not treated as a
+        # second prompt, but an exact interrupt sentinel is still meaningful.
+        if payload_type == "user_message":
+            text = _text_from_value(payload.get("message"))
+            if text.strip() == _INTERRUPT_SENTINEL:
+                self._awaiting_correction = True
+                return [self._interrupt_event(source_line, context)]
+        return []
+
+    def _register_call(
+        self,
+        payload: dict[str, object],
+        source_line: int,
+        context: dict[str, object],
+    ) -> list[NormalizedEvent]:
+        name = payload.get("name") if isinstance(payload.get("name"), str) else ""
+        raw_input = payload.get("input")
+        if raw_input is None:
+            raw_input = payload.get("arguments")
+        kind, command = _call_kind_and_command(name, raw_input)
+        call = _PendingCall(
+            name=name,
+            kind=kind,
+            command=command,
+            source_line=source_line,
+            timestamp=context["timestamp"],  # type: ignore[arg-type]
+            session_id=context["session_id"],  # type: ignore[arg-type]
+            cwd=context["cwd"],  # type: ignore[arg-type]
+            sidechain=context["sidechain"] is True,
+        )
+        call_id = _first_string(payload.get("call_id"), payload.get("id"))
+        events: list[NormalizedEvent] = []
+        if kind == KIND_FILE_READ:
+            file_path = command or ""
+            events.append(
+                NormalizedEvent(
+                    kind=KIND_FILE_READ,
+                    source_line=source_line,
+                    event_index=0,
+                    text=file_path,
+                    tool_name=name,
+                    file_path=file_path or None,
+                    **context,
+                )
+            )
+
+        if call_id:
+            self._pending[call_id] = call
+            self._pending_order.append(call_id)
+        elif kind == KIND_RUN and command is not None:
+            # Without a call id no later output can be paired, so preserve the
+            # same unknown-exit behavior as the Claude parser immediately.
+            events.append(self._run_event(call, None, None, len(events)))
+        self._awaiting_correction = False
+        return events
+
+    def _consume_call_output(
+        self,
+        payload: dict[str, object],
+        source_line: int,
+        context: dict[str, object],
+    ) -> list[NormalizedEvent]:
+        text = _text_from_value(payload.get("output"))
+        call_id = _first_string(payload.get("call_id"), payload.get("id"))
+        pending = self._remove_pending(call_id)
+
+        if _matches_rejection(text):
+            return [
+                NormalizedEvent(
+                    kind=KIND_TOOL_REJECTED,
+                    source_line=source_line,
+                    event_index=0,
+                    text=text,
+                    tool_name=pending.name if pending else None,
+                    **context,
+                )
+            ]
+
+        if pending is not None and pending.kind == KIND_RUN:
+            exit_code, error_excerpt = _split_exit_code(text)
+            if exit_code is None and _looks_like_error(text):
+                error_excerpt = text or None
+            return [
+                self._run_event(pending, exit_code, error_excerpt, 0)
+            ]
+
+        if _looks_like_error(text):
+            return [
+                NormalizedEvent(
+                    kind=KIND_TOOL_ERROR,
+                    source_line=source_line,
+                    event_index=0,
+                    text=text,
+                    tool_name=pending.name if pending else None,
+                    **context,
+                )
+            ]
+        return []
+
+    def _consume_user_prompt(
+        self,
+        texts: list[str],
+        source_line: int,
+        context: dict[str, object],
+    ) -> list[NormalizedEvent]:
+        events: list[NormalizedEvent] = []
+        for text in texts:
+            stripped = text.strip()
+            if not stripped:
+                continue
+            if stripped == _INTERRUPT_SENTINEL:
+                self._awaiting_correction = True
+                events.append(self._interrupt_event(source_line, context, len(events)))
+                continue
+            if self._awaiting_correction:
+                self._awaiting_correction = False
+                events.append(
+                    NormalizedEvent(
+                        kind=KIND_USER_TURN_AFTER_CORRECTION,
+                        source_line=source_line,
+                        event_index=len(events),
+                        text=text,
+                        **context,
+                    )
+                )
+                # One response_item is one prompt.  Ignore any additional
+                # content blocks rather than creating duplicate corrections.
+                break
+        return events
+
+    def _consume_usage_snapshot(
+        self,
+        snapshot: object,
+        model_context_window: object,
+        source_line: int,
+        context: dict[str, object],
+    ) -> None:
+        if not isinstance(snapshot, dict):
+            return
+        current = _usage_counters(snapshot)
+        if not current:
+            return
+
+        deltas: dict[str, int] = {}
+        for key, value in current.items():
+            previous = self._last_usage.get(key)
+            deltas[key] = value if previous is None or value < previous else value - previous
+        self._last_usage.update(current)
+        if not any(deltas.values()):
+            return
+
+        window = model_context_window
+        if not isinstance(window, int):
+            window = None
+        self._usage.append(
+            TokenUsage(
+                source_line=source_line,
+                event_index=0,
+                timestamp=context["timestamp"],  # type: ignore[arg-type]
+                session_id=context["session_id"],  # type: ignore[arg-type]
+                input_tokens=deltas.get("input_tokens", 0),
+                output_tokens=deltas.get("output_tokens", 0),
+                cache_read_tokens=deltas.get("cache_read_tokens", 0),
+                cache_write_tokens=deltas.get("cache_write_tokens", 0),
+                reasoning_output_tokens=deltas.get("reasoning_output_tokens", 0),
+                total_tokens=deltas.get("total_tokens", 0),
+                model_context_window=window,
+            )
+        )
+
+    def _remove_pending(self, call_id: str | None) -> _PendingCall | None:
+        if call_id is None:
+            return None
+        pending = self._pending.pop(call_id, None)
+        if pending is not None:
+            self._pending_order.remove(call_id)
+        return pending
+
+    @staticmethod
+    def _run_event(
+        pending: _PendingCall,
+        exit_code: int | None,
+        error_excerpt: str | None,
+        index: int,
+    ) -> NormalizedEvent:
+        return NormalizedEvent(
+            kind=KIND_RUN,
+            source_line=pending.source_line,
+            event_index=index,
+            timestamp=pending.timestamp,
+            session_id=pending.session_id,
+            cwd=pending.cwd,
+            sidechain=pending.sidechain,
+            text=pending.command or "",
+            tool_name=pending.name,
+            command=pending.command,
+            exit_code=exit_code,
+            error_excerpt=error_excerpt,
+        )
+
+    @staticmethod
+    def _interrupt_event(
+        source_line: int,
+        context: dict[str, object],
+        index: int = 0,
+    ) -> NormalizedEvent:
+        return NormalizedEvent(
+            kind=KIND_INTERRUPT,
+            source_line=source_line,
+            event_index=index,
+            text=_INTERRUPT_SENTINEL,
+            **context,
+        )
+
+
+# Short alias for callers that use the Claude parser's ``*LineParser`` naming
+# convention without including the rollout format in the class name.
+CodexLineParser = CodexRolloutLineParser
+
+
+def _first_string(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _content_texts(value: object) -> list[str]:
+    if isinstance(value, str):
+        return [value]
+    if not isinstance(value, list):
+        return []
+    texts: list[str] = []
+    for block in value:
+        if not isinstance(block, dict):
+            continue
+        if block.get("type") in {"input_text", "output_text", "text"}:
+            text = block.get("text")
+            if isinstance(text, str):
+                texts.append(text)
+    return texts
+
+
+def _text_from_value(value: object) -> str:
+    if isinstance(value, str):
+        return value
+    if isinstance(value, list):
+        return "\n".join(
+            text
+            for item in value
+            for text in [_text_from_value(item)]
+            if text
+        )
+    if isinstance(value, dict):
+        if isinstance(value.get("text"), str):
+            return value["text"]
+        for key in ("content", "output", "message"):
+            if key in value:
+                text = _text_from_value(value[key])
+                if text:
+                    return text
+    return ""
+
+
+def _call_kind_and_command(name: str, raw_input: object) -> tuple[str, str | None]:
+    name_lower = name.casefold()
+    parsed = raw_input
+    if isinstance(raw_input, str):
+        try:
+            parsed_json = json.loads(raw_input)
+        except (TypeError, json.JSONDecodeError):
+            parsed_json = None
+        if isinstance(parsed_json, dict):
+            parsed = parsed_json
+
+    if name_lower in _EXEC_NAMES:
+        if isinstance(parsed, dict):
+            command = _first_string(parsed.get("cmd"), parsed.get("command"))
+        elif isinstance(parsed, str):
+            command = parsed
+        else:
+            command = None
+        return KIND_RUN, command
+
+    if name_lower in _READ_NAMES:
+        if isinstance(parsed, dict):
+            path = _first_string(
+                parsed.get("file_path"), parsed.get("path"), parsed.get("file")
+            )
+        elif isinstance(parsed, str):
+            path = parsed
+        else:
+            path = None
+        return KIND_FILE_READ, path
+
+    return "tool", None
+
+
+def _split_exit_code(text: str) -> tuple[int | None, str | None]:
+    for pattern in _EXIT_CODE_PATTERNS:
+        match = pattern.search(text)
+        if match is None:
+            continue
+        exit_code = int(match.group(1))
+        if exit_code == 0:
+            return exit_code, None
+        excerpt = text[match.end() :].lstrip(" \t\r\n:-").strip()
+        return exit_code, (excerpt or text.strip() or None)
+    return None, None
+
+
+def _matches_rejection(text: str) -> bool:
+    folded = text.casefold()
+    return any(sentinel.casefold() in folded for sentinel in _REJECTION_SENTINELS)
+
+
+def _looks_like_error(text: str) -> bool:
+    if not text:
+        return False
+    if _matches_rejection(text):
+        return False
+    folded = text.casefold()
+    return any(
+        marker in folded
+        for marker in (
+            "<tool_use_error>",
+            "tool call failed",
+            "tool execution failed",
+            "command failed",
+            "permission denied",
+            "error:",
+            "error ",
+            "\nerror:",
+            "\nerror ",
+        )
+    )
+
+
+def _usage_counters(snapshot: dict[str, object]) -> dict[str, int]:
+    aliases = {
+        "input_tokens": ("input_tokens",),
+        "output_tokens": ("output_tokens",),
+        "cache_read_tokens": ("cache_read_tokens", "cached_input_tokens"),
+        "cache_write_tokens": ("cache_write_tokens", "cache_write_input_tokens"),
+        "reasoning_output_tokens": ("reasoning_output_tokens",),
+        "total_tokens": ("total_tokens",),
+    }
+    counters: dict[str, int] = {}
+    for normalized, keys in aliases.items():
+        for key in keys:
+            value = snapshot.get(key)
+            if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+                counters[normalized] = value
+                break
+    return counters
+
+
+def _parse_file(path: Path) -> tuple[CodexRolloutLineParser, list[NormalizedEvent]]:
+    parser = CodexRolloutLineParser()
+    events: list[NormalizedEvent] = []
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for source_line, line in enumerate(handle, start=1):
+            events.extend(parser.parse_line(line, source_line))
+    events.extend(parser.finish())
+    return parser, events
+
+
+def parse_rollout(path: Path) -> ParseResult:
+    """Parse one rollout into normalized events and usage deltas."""
+
+    parser, events = _parse_file(path)
+    return ParseResult(parser.session_id, tuple(events), parser.usage)
+
+
+def iter_events(path: Path) -> Iterator[NormalizedEvent]:
+    """Yield normalized detector events from a Codex rollout."""
+
+    _parser, events = _parse_file(path)
+    yield from events
+
+
+def iter_usage(path: Path) -> Iterator[TokenUsage]:
+    """Yield positive token deltas from cumulative rollout snapshots."""
+
+    parser, _events = _parse_file(path)
+    yield from parser.usage
+
+
+if __name__ == "__main__":  # pragma: no cover
+    raise SystemExit("module is library-only; import codex_reader")
