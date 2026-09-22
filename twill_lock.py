@@ -122,6 +122,17 @@ class StateLock:
         self.owner = None
 
 
+def _proc_device_string(device_stat: os.stat_result) -> str:
+    """Render a device the way ``/proc/locks`` prints it: ``%02x:%02x``.
+
+    The kernel formats both numbers as lowercase hex padded to at least two
+    digits (fs/locks.c), so a stat device of 259:4 must be matched as
+    ``103:04`` — a decimal rendering matches nothing on major > 9.
+    """
+
+    return f"{os.major(device_stat.st_dev):02x}:{os.minor(device_stat.st_dev):02x}"
+
+
 def _proc_lock_owner(lock_path: Path) -> LockOwner | None:
     """Recover the pid during the tiny metadata-write race after flock.
 
@@ -133,7 +144,7 @@ def _proc_lock_owner(lock_path: Path) -> LockOwner | None:
 
     try:
         stat = lock_path.stat()
-        device = f"{os.major(stat.st_dev)}:{os.minor(stat.st_dev):02d}"
+        device = _proc_device_string(stat)
         inode = str(stat.st_ino)
         lines = Path("/proc/locks").read_text(encoding="utf-8").splitlines()
     except (OSError, ValueError):

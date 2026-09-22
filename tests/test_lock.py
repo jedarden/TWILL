@@ -1,3 +1,4 @@
+import fcntl
 import json
 import os
 import subprocess
@@ -11,7 +12,7 @@ CLI = ROOT / "twill"
 sys.path.insert(0, str(ROOT))
 
 import twill_schema  # noqa: E402
-from twill_lock import StateLock  # noqa: E402
+from twill_lock import StateLock, _proc_lock_owner  # noqa: E402
 
 
 class StateLockTests(unittest.TestCase):
@@ -89,6 +90,22 @@ class StateLockTests(unittest.TestCase):
             )
             self.assertEqual(result.returncode, 0, result.stderr)
             self.assertFalse(state.exists())
+
+    def test_proc_lock_owner_fallback_recovers_holding_pid(self):
+        # /proc/locks prints the device as hex (%02x:%02x, fs/locks.c); a
+        # decimal rendering matches nothing on devices with major > 9 and
+        # would turn the EC-10 fallback into an opaque runtime error.
+        with tempfile.TemporaryDirectory() as directory:
+            lock_path = Path(directory) / "lock"
+            fd = os.open(lock_path, os.O_CREAT | os.O_RDWR, 0o600)
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                owner = _proc_lock_owner(lock_path)
+            finally:
+                os.close(fd)
+            self.assertIsNotNone(owner, "own flock not recovered from /proc/locks")
+            self.assertEqual(owner.pid, os.getpid())
+            self.assertTrue(owner.since)
 
 
 if __name__ == "__main__":
