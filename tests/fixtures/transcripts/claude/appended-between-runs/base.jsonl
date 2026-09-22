@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"claude-append-001","timestamp":"2026-09-20T13:00:00Z","cwd":"/workspace/demo","message":{"role":"user","content":"Run the focused parser test."}}
+{"type":"assistant","sessionId":"claude-append-001","timestamp":"2026-09-20T13:00:01Z","cwd":"/workspace/demo","message":{"role":"assistant","content":[{"type":"text","text":"The focused parser test passed before the session was appended."}]}}

@@ -1,0 +1,2 @@
+{"type":"event_msg","payload":{"session_id":"codex-append-001","timestamp":"2026-09-20T13:00:03Z","message":{"type":"user_message","text":"Now run the redaction test as well."}}}
+{"type":"response_item","payload":{"session_id":"codex-append-001","timestamp":"2026-09-20T13:00:04Z","role":"assistant","content":[{"type":"output_text","text":"The redaction test passed after the append."}]}}

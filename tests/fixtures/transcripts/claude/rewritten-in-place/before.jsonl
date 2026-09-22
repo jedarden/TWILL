@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"claude-rewrite-001","timestamp":"2026-09-20T15:00:00Z","cwd":"/workspace/demo","message":{"role":"user","content":"Inspect the original source snapshot."}}
+{"type":"assistant","sessionId":"claude-rewrite-001","timestamp":"2026-09-20T15:00:01Z","cwd":"/workspace/demo","message":{"role":"assistant","content":[{"type":"text","text":"Original snapshot: parser branch A reported the old result."}]}}

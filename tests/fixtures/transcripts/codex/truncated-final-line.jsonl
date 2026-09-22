@@ -1,0 +1,4 @@
+{"type":"session_meta","payload":{"session_id":"codex-truncated-001","cwd":"/workspace/demo","timestamp":"2026-09-20T14:00:00Z","model":"fixture-model"}}
+{"type":"event_msg","payload":{"session_id":"codex-truncated-001","timestamp":"2026-09-20T14:00:01Z","message":{"type":"task_started","text":"Read the fixture before processing it."}}}
+{"type":"response_item","payload":{"session_id":"codex-truncated-001","timestamp":"2026-09-20T14:00:02Z","role":"assistant","content":[{"type":"output_text","text":"The complete line is available."}]}}
+{"type":"response_item","payload":{"session_id":"codex-truncated-001","timestamp":"2026-09-20T14:00:03Z","role":"assistant","content":[{"type":"output_text","text":"This final record is only half-written

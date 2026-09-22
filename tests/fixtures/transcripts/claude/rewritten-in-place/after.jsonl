@@ -1,0 +1,2 @@
+{"type":"user","sessionId":"claude-rewrite-001","timestamp":"2026-09-20T15:05:00Z","cwd":"/workspace/demo","message":{"role":"user","content":"Inspect the replacement source snapshot."}}
+{"type":"assistant","sessionId":"claude-rewrite-001","timestamp":"2026-09-20T15:05:01Z","cwd":"/workspace/demo","message":{"role":"assistant","content":[{"type":"text","text":"Replacement snapshot: parser branch B reported the new result."}]}}

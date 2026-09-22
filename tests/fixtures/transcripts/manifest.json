@@ -1,0 +1,76 @@
+{
+  "schema_version": 1,
+  "root": "tests/fixtures/transcripts",
+  "sources": {
+    "claude": {
+      "directory": "claude",
+      "cases": {
+        "clean": {
+          "operation": "single-file",
+          "files": ["claude/clean.jsonl"]
+        },
+        "appended-between-runs": {
+          "operation": "append",
+          "files": [
+            "claude/appended-between-runs/base.jsonl",
+            "claude/appended-between-runs/append.jsonl"
+          ]
+        },
+        "truncated-final-line": {
+          "operation": "skip-incomplete-final-line",
+          "files": ["claude/truncated-final-line.jsonl"]
+        },
+        "rewritten-in-place": {
+          "operation": "replace-at-same-path",
+          "files": [
+            "claude/rewritten-in-place/before.jsonl",
+            "claude/rewritten-in-place/after.jsonl"
+          ]
+        },
+        "secret-bearing": {
+          "operation": "redact-before-persist",
+          "files": ["claude/secret-bearing.jsonl"]
+        },
+        "injection-bearing": {
+          "operation": "treat-as-untrusted-data",
+          "files": ["claude/injection-bearing.jsonl"]
+        }
+      }
+    },
+    "codex": {
+      "directory": "codex",
+      "cases": {
+        "clean": {
+          "operation": "single-file",
+          "files": ["codex/clean.jsonl"]
+        },
+        "appended-between-runs": {
+          "operation": "append",
+          "files": [
+            "codex/appended-between-runs/base.jsonl",
+            "codex/appended-between-runs/append.jsonl"
+          ]
+        },
+        "truncated-final-line": {
+          "operation": "skip-incomplete-final-line",
+          "files": ["codex/truncated-final-line.jsonl"]
+        },
+        "rewritten-in-place": {
+          "operation": "replace-at-same-path",
+          "files": [
+            "codex/rewritten-in-place/before.jsonl",
+            "codex/rewritten-in-place/after.jsonl"
+          ]
+        },
+        "secret-bearing": {
+          "operation": "redact-before-persist",
+          "files": ["codex/secret-bearing.jsonl"]
+        },
+        "injection-bearing": {
+          "operation": "treat-as-untrusted-data",
+          "files": ["codex/injection-bearing.jsonl"]
+        }
+      }
+    }
+  }
+}
