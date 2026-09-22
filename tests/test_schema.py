@@ -7,14 +7,19 @@ the mode 600/700 permissions of plan §7.2.
 
 import os
 import sqlite3
+import sys
 import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
 
-import twill_app
-import twill_schema
-from twill_contract import EXIT_RUNTIME_ERROR, CliError
+
+ROOT = Path(__file__).resolve().parents[1]
+sys.path.insert(0, str(ROOT))
+
+import twill_app  # noqa: E402
+import twill_schema  # noqa: E402
+from twill_contract import EXIT_RUNTIME_ERROR, CliError  # noqa: E402
 
 
 V1_TABLES = (
