@@ -1,0 +1,1 @@
+{"type": "assistant", "sessionId": "parser-fixture-session", "cwd": "/home/coding/TWILL", "timestamp": "2026-09-22T09:00:00.000Z", "message": {"role": "assistant", "content": [{"type": "tool_use", "id": "toolu_1", "name": "Bash", "input": {"command": "make build", "description": "Build the project"}}]}}

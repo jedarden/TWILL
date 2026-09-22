@@ -1,0 +1,63 @@
+{
+  "schema_version": 1,
+  "source": "claude",
+  "parser": "twill_reader.ClaudeCodeLineParser",
+  "purpose": "Fixture-driven cases for the normalized-event parser (plan 6.2 step 4). Complements, and does not replace, the shared transcript corpus in tests/fixtures/transcripts.",
+  "cases": {
+    "run-failed": {
+      "file": "run-failed.jsonl",
+      "event_kinds": ["run"],
+      "expectation": "command, exit code, and error excerpt from a failed Bash result"
+    },
+    "run-succeeded": {
+      "file": "run-succeeded.jsonl",
+      "event_kinds": ["run"],
+      "expectation": "a successful run carries no exit code because the transcript records none"
+    },
+    "tool-error-edit": {
+      "file": "tool-error-edit.jsonl",
+      "event_kinds": ["tool_error"],
+      "expectation": "a failing non-Bash tool result is a tool_error, never a run"
+    },
+    "tool-rejected": {
+      "file": "tool-rejected.jsonl",
+      "event_kinds": ["tool_rejected", "user_turn_after_correction"],
+      "expectation": "the interrupt-during-tool-use sentinel is a rejection whose next user turn is the correction"
+    },
+    "tool-rejected-permission": {
+      "file": "tool-rejected-permission.jsonl",
+      "event_kinds": ["tool_rejected", "user_turn_after_correction"],
+      "expectation": "both permission-denial sentinels reject; a rejected Bash is not a run"
+    },
+    "interrupt-then-correction": {
+      "file": "interrupt-then-correction.jsonl",
+      "event_kinds": ["interrupt", "user_turn_after_correction"],
+      "expectation": "the interrupt sentinel, the correction that follows, and a later turn that is not a correction"
+    },
+    "interrupt-assistant-resumes": {
+      "file": "interrupt-assistant-resumes.jsonl",
+      "event_kinds": ["interrupt", "run"],
+      "expectation": "once the agent completes an action the correction window is closed"
+    },
+    "file-read": {
+      "file": "file-read.jsonl",
+      "event_kinds": ["file_read", "run"],
+      "expectation": "two tool_use blocks on one line: file_read at the call line, run at its result line"
+    },
+    "truncated-final-line": {
+      "file": "truncated-final-line.jsonl",
+      "event_kinds": ["run"],
+      "expectation": "an incomplete final line is skipped; earlier complete lines still parse"
+    },
+    "unresolved-run": {
+      "file": "unresolved-run.jsonl",
+      "event_kinds": ["run"],
+      "expectation": "a run whose result never arrives is flushed at end of file with an unknown exit"
+    },
+    "plain-turns": {
+      "file": "plain-turns.jsonl",
+      "event_kinds": [],
+      "expectation": "prose, ordinary turns, and successful non-Bash results are not events; the interrupt sentinel must match exactly"
+    }
+  }
+}

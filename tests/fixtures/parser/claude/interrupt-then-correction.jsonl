@@ -1,0 +1,5 @@
+{"type": "assistant", "sessionId": "parser-fixture-session", "cwd": "/home/coding/TWILL", "timestamp": "2026-09-22T09:00:00.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Let me run the deploy script now."}]}}
+{"type": "user", "sessionId": "parser-fixture-session", "cwd": "/home/coding/TWILL", "timestamp": "2026-09-22T09:00:00.000Z", "message": {"role": "user", "content": [{"type": "text", "text": "[Request interrupted by user]"}]}}
+{"type": "user", "sessionId": "parser-fixture-session", "cwd": "/home/coding/TWILL", "timestamp": "2026-09-22T09:00:00.000Z", "message": {"role": "user", "content": "don't deploy, run the dry-run first"}}
+{"type": "assistant", "sessionId": "parser-fixture-session", "cwd": "/home/coding/TWILL", "timestamp": "2026-09-22T09:00:00.000Z", "message": {"role": "assistant", "content": [{"type": "text", "text": "Understood, using the dry-run."}]}}
+{"type": "user", "sessionId": "parser-fixture-session", "cwd": "/home/coding/TWILL", "timestamp": "2026-09-22T09:00:00.000Z", "message": {"role": "user", "content": "ok, go ahead"}}
