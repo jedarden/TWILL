@@ -21,6 +21,12 @@ from pathlib import Path
 from typing import Iterator, Sequence
 
 import twill_schema
+from twill_config import (
+    ConfigError,
+    TwillConfig,
+    load_config,
+    parse_duration,
+)
 from twill_contract import (
     EXIT_RUNTIME_ERROR,
     EXIT_SUCCESS,
@@ -33,11 +39,6 @@ from twill_contract import (
 from twill_lock import StateLock
 
 
-DEFAULT_SETTLE_SECONDS = 2 * 60 * 60
-DEFAULT_SOURCE_ROOTS = (
-    Path.home() / ".claude" / "projects",
-    Path.home() / ".codex" / "sessions",
-)
 MAX_EXCERPT_LENGTH = 240
 MUTATING_VERBS = frozenset({"ingest"})
 
@@ -252,14 +253,10 @@ def read_session(path: Path) -> SessionData:
 
 
 def _parse_duration(value: str) -> float:
-    if value.isdigit():
-        return float(value)
-    match = re.fullmatch(r"(?i)([0-9]+(?:\.[0-9]+)?)([smhd])", value.strip())
-    if not match:
-        raise argparse.ArgumentTypeError("duration must be seconds or a value such as 2h, 30m, or 0")
-    number = float(match.group(1))
-    multiplier = {"s": 1, "m": 60, "h": 3600, "d": 86400}[match.group(2).lower()]
-    return number * multiplier
+    try:
+        return parse_duration(value)
+    except ConfigError as exc:
+        raise argparse.ArgumentTypeError(exc.message) from exc
 
 
 def _state_dir(value: str | None) -> Path:
@@ -269,13 +266,36 @@ def _state_dir(value: str | None) -> Path:
     return Path.home() / ".local" / "state" / "twill"
 
 
-def _source_roots(values: Sequence[str] | None) -> tuple[Path, ...]:
+def _glob_roots(patterns: Sequence[str]) -> tuple[Path, ...]:
+    """Map configured source globs onto directory roots for the Phase 0 walker.
+
+    Production enumeration (plan §6.2 step 2) expands the globs itself; until
+    that lands, the walker treats a glob's literal prefix as a root and rglobs
+    ``*.jsonl`` beneath it — exact for the default globs.
+    """
+
+    roots: list[Path] = []
+    for pattern in patterns:
+        literal: list[str] = []
+        for part in Path(pattern).expanduser().parts:
+            if any(marker in part for marker in "*?["):
+                break
+            literal.append(part)
+        root = Path(*literal)
+        if root not in roots:
+            roots.append(root)
+    return tuple(roots)
+
+
+def _source_roots(values: Sequence[str] | None, config: TwillConfig) -> tuple[Path, ...]:
+    """Resolve transcript roots: CLI flag, then env override, then config."""
+
     if values:
         return tuple(Path(value).expanduser() for value in values)
     configured = os.environ.get("TWILL_SOURCE_ROOTS")
     if configured:
         return tuple(Path(value).expanduser() for value in configured.split(os.pathsep) if value)
-    return DEFAULT_SOURCE_ROOTS
+    return _glob_roots(config.source_globs)
 
 
 def _session_key(path: Path) -> str:
@@ -409,10 +429,14 @@ def settled_files(
 
 
 def ingest_command(args: argparse.Namespace) -> int:
+    # Loaded before anything is read or written so a wrong config fails fast
+    # (plan §3: bad config is a startup error, never a convenient fallback).
+    config = load_config()
+    settle = args.settle if args.settle is not None else config.settle_window
     try:
         files = settled_files(
-            _source_roots(args.source),
-            args.settle,
+            _source_roots(args.source, config),
+            settle,
             Path(args.file) if args.file else None,
         )
     except (OSError, ValueError) as exc:
@@ -513,7 +537,12 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--limit", type=int, default=1)
     ingest.add_argument("--file", help="read one explicit JSONL session")
     ingest.add_argument("--source", action="append", help="transcript root; may be repeated")
-    ingest.add_argument("--settle", type=_parse_duration, default=DEFAULT_SETTLE_SECONDS)
+    ingest.add_argument(
+        "--settle",
+        type=_parse_duration,
+        default=None,
+        help="seconds or a form such as 2h; default comes from config.toml (2h)",
+    )
     ingest.add_argument("--state-dir")
     ingest.add_argument("--json", action="store_true")
     ingest.set_defaults(handler=ingest_command)
@@ -541,6 +570,11 @@ def main(argv: Sequence[str] | None = None) -> int:
     except CliError as exc:
         emit_error(exc.code, exc.message, exc.hint, json_mode=json_mode)
         return exc.code
+    except ConfigError as exc:
+        # Runtime error (contract code 1): the config is operator state that
+        # turned out to be wrong, not a misuse of a verb's flags.
+        emit_error(EXIT_RUNTIME_ERROR, exc.message, exc.hint, json_mode=json_mode)
+        return EXIT_RUNTIME_ERROR
     except Exception as exc:  # pragma: no cover - exercised by integration failures
         emit_error(
             EXIT_RUNTIME_ERROR,
