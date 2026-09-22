@@ -13,6 +13,7 @@ without losing its observations.
 from __future__ import annotations
 
 import argparse
+import glob
 import hashlib
 import json
 import os
@@ -261,11 +262,11 @@ def _state_dir(value: str | None) -> Path:
 
 
 def _glob_roots(patterns: Sequence[str]) -> tuple[Path, ...]:
-    """Map configured source globs onto directory roots for the Phase 0 walker.
+    """Return the literal directory prefix of each configured glob.
 
-    Production enumeration (plan §6.2 step 2) expands the globs itself; until
-    that lands, the walker treats a glob's literal prefix as a root and rglobs
-    ``*.jsonl`` beneath it — exact for the default globs.
+    This helper remains for callers that need to display or inspect a source
+    tree.  Ingest does *not* use it to enumerate files: broadening a glob to
+    its prefix loses the operator's matching rules.
     """
 
     roots: list[Path] = []
@@ -290,6 +291,25 @@ def _source_roots(values: Sequence[str] | None, config: TwillConfig) -> tuple[Pa
     if configured:
         return tuple(Path(value).expanduser() for value in configured.split(os.pathsep) if value)
     return _glob_roots(config.source_globs)
+
+
+def _source_patterns(
+    values: Sequence[str] | None, config: TwillConfig
+) -> tuple[Path | str, ...]:
+    """Resolve the inputs that the enumerator should expand.
+
+    ``--source`` and ``TWILL_SOURCE_ROOTS`` are the backwards-compatible root
+    interfaces from the walking skeleton.  Configured ``source_globs`` must
+    remain patterns all the way to enumeration so a pattern such as
+    ``projects/*/*.jsonl`` cannot accidentally become ``projects/**/*.jsonl``.
+    """
+
+    if values:
+        return _source_roots(values, config)
+    configured = os.environ.get("TWILL_SOURCE_ROOTS")
+    if configured:
+        return _source_roots(None, config)
+    return tuple(config.source_globs)
 
 
 def _session_key(path: Path) -> str:
@@ -528,20 +548,50 @@ class Store:
         return int(total), rows
 
 
-def settled_files(
-    roots: Sequence[Path], settle_seconds: float, explicit_file: Path | None = None
-) -> list[Path]:
-    """Enumerate transcript files old enough to parse: the EC-01 settle gate.
+def _candidate_paths(pattern: Path | str) -> Iterator[Path]:
+    """Yield regular JSONL files matched by one source pattern.
 
-    A file is eligible when ``now - mtime >= settle_seconds`` -- the boundary
-    is inclusive, so a file exactly one window old may parse.  The gate runs
-    here, at enumeration, before any byte of the file is read: a younger file
-    is skipped whole, never parsed partially, and leaves no cursor row.  An
-    explicitly named file crosses the same gate (``--settle 0`` is the
-    controlled-fixture escape hatch), and a future mtime is never eligible --
-    a negative age is less than any window, literally -- so a clock-skewed
-    file waits until the clock reaches its mtime.  Newest first, because
-    ``--limit`` takes the freshest settled sessions.
+    A directory is accepted for the legacy ``--source`` and environment-root
+    interfaces and means ``**/*.jsonl``.  A configured pattern is otherwise
+    expanded literally with recursive glob support.  Matching is performed
+    before the settle gate and before any transcript bytes are opened.
+    """
+
+    expanded = Path(pattern).expanduser()
+    if expanded.is_dir():
+        yield from expanded.rglob("*.jsonl")
+        return
+    if expanded.is_file():
+        if expanded.suffix == ".jsonl":
+            yield expanded
+        return
+    pattern_text = str(expanded)
+    if not glob.has_magic(pattern_text):
+        return
+    for match in glob.iglob(pattern_text, recursive=True):
+        path = Path(match)
+        if path.is_file() and path.suffix == ".jsonl":
+            yield path
+
+
+def settled_files(
+    roots: Sequence[Path | str], settle_seconds: float, explicit_file: Path | None = None
+) -> list[Path]:
+    """Expand sources and return transcript files old enough to parse.
+
+    Configured glob patterns are expanded exactly, with duplicate paths
+    removed before the settle gate.  Directory inputs retain the walking
+    skeleton's ``**/*.jsonl`` compatibility behavior for ``--source`` and
+    ``TWILL_SOURCE_ROOTS``.  A file is eligible when ``now - mtime >=
+    settle_seconds`` -- the boundary is inclusive, so a file exactly one
+    window old may parse.  The gate runs here, at enumeration, before any byte
+    of the file is read: a younger file is skipped whole, never parsed
+    partially, and leaves no cursor row.  An explicitly named file crosses the
+    same gate (``--settle 0`` is the controlled-fixture escape hatch), and a
+    future mtime is never eligible -- a negative age is less than any window,
+    literally -- so a clock-skewed file waits until the clock reaches its
+    mtime.  Newest first, because ``--limit`` takes the freshest settled
+    sessions.
     """
 
     now = datetime.now(timezone.utc).timestamp()
@@ -553,15 +603,8 @@ def settled_files(
     else:
         candidates = []
         seen: set[Path] = set()
-        for root in roots:
-            root = root.expanduser()
-            if root.is_file():
-                paths = (root,)
-            elif root.is_dir():
-                paths = root.rglob("*.jsonl")
-            else:
-                continue
-            for path in paths:
+        for pattern in roots:
+            for path in _candidate_paths(pattern):
                 path = path.resolve()
                 if path not in seen and path.is_file():
                     seen.add(path)
@@ -580,7 +623,7 @@ def ingest_command(args: argparse.Namespace) -> int:
     settle = args.settle if args.settle is not None else config.settle_window
     try:
         files = settled_files(
-            _source_roots(args.source, config),
+            _source_patterns(args.source, config),
             settle,
             Path(args.file) if args.file else None,
         )
