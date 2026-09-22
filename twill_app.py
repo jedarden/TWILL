@@ -30,6 +30,7 @@ from twill_contract import (
     emit_error,
     emit_success,
 )
+from twill_lock import StateLock
 
 
 DEFAULT_SETTLE_SECONDS = 2 * 60 * 60
@@ -38,6 +39,7 @@ DEFAULT_SOURCE_ROOTS = (
     Path.home() / ".codex" / "sessions",
 )
 MAX_EXCERPT_LENGTH = 240
+MUTATING_VERBS = frozenset({"ingest"})
 
 
 # Interim Phase 0 working tables.  The v1 corpus schema (cursor, observation,
@@ -296,11 +298,12 @@ def _timestamp_pair(value: str) -> tuple[str, str]:
 
 
 class Store:
-    def __init__(self, state_dir: Path):
+    def __init__(self, state_dir: Path, *, read_only: bool = False):
         self.state_dir = state_dir
         self.db_path = twill_schema.state_db_path(state_dir)
-        self.connection = twill_schema.connect(state_dir)
-        self.connection.executescript(SCHEMA)
+        self.connection = twill_schema.connect(state_dir, read_only=read_only)
+        if not read_only:
+            self.connection.executescript(SCHEMA)
 
     def close(self) -> None:
         self.connection.close()
@@ -456,11 +459,18 @@ def ingest_command(args: argparse.Namespace) -> int:
 
 
 def digest_command(args: argparse.Namespace) -> int:
-    store = Store(_state_dir(args.state_dir))
-    try:
-        total, rows = store.digest_rows()
-    finally:
-        store.close()
+    state_dir = _state_dir(args.state_dir)
+    # A read verb must not bootstrap the state directory or database.  An
+    # absent derived database is simply an empty first-run digest; an existing
+    # database is always opened through SQLite's URI mode=ro path.
+    if twill_schema.state_db_path(state_dir).is_file():
+        store = Store(state_dir, read_only=True)
+        try:
+            total, rows = store.digest_rows()
+        finally:
+            store.close()
+    else:
+        total, rows = 0, []
     if args.json:
         emit_success(
             {
@@ -524,6 +534,9 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = parser.parse_args(actual_argv)
         if getattr(args, "limit", 1) < 1:
             raise CliError(EXIT_USAGE_ERROR, "--limit must be at least 1")
+        if args.command in MUTATING_VERBS:
+            with StateLock(_state_dir(args.state_dir)):
+                return int(args.handler(args))
         return int(args.handler(args))
     except CliError as exc:
         emit_error(exc.code, exc.message, exc.hint, json_mode=json_mode)

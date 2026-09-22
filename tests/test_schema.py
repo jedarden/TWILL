@@ -264,6 +264,24 @@ class StateStoreModeTests(unittest.TestCase):
             twill_schema.state_db_path(self.state_dir).stat().st_mode & 0o777, 0o600
         )
 
+    def test_read_only_connection_uses_wal_without_permitting_writes(self):
+        writer = twill_schema.connect(self.state_dir)
+        writer.execute(
+            "INSERT INTO parse_shape(run_at, source, record_type, n) VALUES ('r', 'claude', 'user', 1)"
+        )
+        writer.commit()
+        writer.close()
+
+        reader = twill_schema.connect_read_only(self.state_dir)
+        self.addCleanup(reader.close)
+        self.assertEqual(reader.execute("PRAGMA journal_mode").fetchone()[0], "wal")
+        self.assertEqual(reader.execute("PRAGMA query_only").fetchone()[0], 1)
+        self.assertEqual(reader.execute("SELECT n FROM parse_shape").fetchone()[0], 1)
+        with self.assertRaises(sqlite3.OperationalError):
+            reader.execute(
+                "INSERT INTO parse_shape(run_at, source, record_type, n) VALUES ('x', 'x', 'x', 1)"
+            )
+
     def test_reconnect_is_idempotent_and_keeps_data(self):
         first = twill_schema.connect(self.state_dir)
         first.execute(

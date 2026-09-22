@@ -1,10 +1,11 @@
 """The v1 corpus schema, WAL journal and mode-600 state directory (plan §7.1, §7.2).
 
-Every connection to ``~/.local/state/twill/twill.db`` is opened through
+Writer connections to ``~/.local/state/twill/twill.db`` are opened through
 :func:`connect`, which prepares the state directory, turns on WAL, pins the
-database file to mode 600, and ensures the v1 tables exist.  The DDL below is
-the plan's §7.1 schema; the only deviation is ``IF NOT EXISTS`` so repeated
-opens are idempotent.
+database file to mode 600, and ensures the v1 tables exist.  Read verbs use
+:func:`connect_read_only`, which opens an existing database with SQLite URI
+``mode=ro`` and never runs the DDL.  The DDL below is the plan's §7.1 schema;
+the only deviation is ``IF NOT EXISTS`` so repeated writer opens are idempotent.
 
 Two pieces of §7.1 deliberately live elsewhere: ``meta`` is added by its own
 bead, and additive migrations (plan §8.4) are a separate runner.  The interim
@@ -16,6 +17,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+from urllib.parse import quote
 from pathlib import Path
 
 from twill_contract import EXIT_RUNTIME_ERROR, CliError
@@ -163,8 +165,35 @@ def _verify_observation_shape(connection: sqlite3.Connection, db_path: Path) -> 
         )
 
 
-def connect(state_dir: Path) -> sqlite3.Connection:
-    """Open the state database: mode-600 directory and file, WAL, v1 schema."""
+def connect_read_only(state_dir: Path) -> sqlite3.Connection:
+    """Open an existing state database read-only without creating any files."""
+
+    db_path = state_db_path(state_dir)
+    if not db_path.is_file():
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            f"state database does not exist: {db_path}",
+            "run a mutating verb such as 'twill ingest' first",
+        )
+    # URI mode=ro prevents SQLite from creating or modifying the database;
+    # WAL lets this connection read a consistent snapshot alongside a writer.
+    uri = f"file:{quote(str(db_path), safe='/')}?mode=ro"
+    connection = sqlite3.connect(uri, uri=True)
+    try:
+        connection.execute("PRAGMA query_only = ON")
+        connection.execute("PRAGMA foreign_keys = ON")
+        _verify_observation_shape(connection, db_path)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def connect(state_dir: Path, *, read_only: bool = False) -> sqlite3.Connection:
+    """Open the state database as a writer, or explicitly read-only."""
+
+    if read_only:
+        return connect_read_only(state_dir)
 
     db_path = state_db_path(prepare_state_dir(state_dir))
     # Create the file at mode 600 before SQLite ever touches it.  os.open's
