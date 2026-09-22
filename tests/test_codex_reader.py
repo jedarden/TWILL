@@ -8,7 +8,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
-from codex_reader import (
+from codex_reader import (  # noqa: E402
     KIND_FILE_READ,
     KIND_INTERRUPT,
     KIND_RUN,
