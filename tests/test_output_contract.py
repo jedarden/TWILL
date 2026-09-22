@@ -10,6 +10,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "twill"
+sys.path.insert(0, str(ROOT))
 
 
 class OutputContractTests(unittest.TestCase):
