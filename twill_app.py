@@ -20,6 +20,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Sequence
 
+import twill_schema
 from twill_contract import (
     EXIT_RUNTIME_ERROR,
     EXIT_SUCCESS,
@@ -39,6 +40,9 @@ DEFAULT_SOURCE_ROOTS = (
 MAX_EXCERPT_LENGTH = 240
 
 
+# Interim Phase 0 working tables.  The v1 corpus schema (cursor, observation,
+# cluster, ...) lives in twill_schema and is applied to every connection this
+# Store opens; observation in particular is now the v1 shape.
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS session (
     session_key TEXT PRIMARY KEY,
@@ -60,22 +64,6 @@ CREATE TABLE IF NOT EXISTS transcript_event (
     cwd TEXT,
     UNIQUE(session_key, source_line, event_index)
 );
-
-CREATE TABLE IF NOT EXISTS observation (
-    obs_id INTEGER PRIMARY KEY,
-    session_key TEXT NOT NULL REFERENCES session(session_key),
-    session_id TEXT NOT NULL,
-    event_id INTEGER NOT NULL REFERENCES transcript_event(event_id),
-    detector_id TEXT NOT NULL,
-    ts_utc TEXT NOT NULL,
-    ts_local TEXT NOT NULL,
-    kind TEXT NOT NULL,
-    excerpt TEXT NOT NULL,
-    UNIQUE(detector_id, event_id)
-);
-
-CREATE INDEX IF NOT EXISTS observation_session ON observation(session_id);
-CREATE INDEX IF NOT EXISTS observation_detector ON observation(detector_id, ts_utc);
 """
 
 
@@ -310,10 +298,8 @@ def _timestamp_pair(value: str) -> tuple[str, str]:
 class Store:
     def __init__(self, state_dir: Path):
         self.state_dir = state_dir
-        self.db_path = state_dir / "twill.db"
-        state_dir.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.db_path)
-        self.connection.execute("PRAGMA foreign_keys = ON")
+        self.db_path = twill_schema.state_db_path(state_dir)
+        self.connection = twill_schema.connect(state_dir)
         self.connection.executescript(SCHEMA)
 
     def close(self) -> None:
@@ -324,7 +310,9 @@ class Store:
         now = datetime.now(timezone.utc).isoformat()
         conn = self.connection
         with conn:
-            conn.execute("DELETE FROM observation WHERE session_key = ?", (key,))
+            # EC-03 semantics: a re-read replaces the derived rows of the
+            # session it parsed, identified by session_id in the v1 schema.
+            conn.execute("DELETE FROM observation WHERE session_id = ?", (session.session_id,))
             conn.execute("DELETE FROM transcript_event WHERE session_key = ?", (key,))
             conn.execute(
                 "INSERT INTO session(session_key, session_id, source_path, source_kind, ingested_at) "
@@ -358,16 +346,19 @@ class Store:
     def _run_detector(conn: sqlite3.Connection, session_key: str, session_id: str) -> int:
         """D-00@1: a minimal detector proving stored events become observations."""
 
+        # The v1 observation table carries no detector_id (cluster and
+        # measurement attribute detectors); D-00@1 events are recognisable by
+        # their kind until Phase 2 replaces this detector.
         conn.execute(
-            "INSERT INTO observation(session_key, session_id, event_id, detector_id, ts_utc, ts_local, kind, excerpt) "
-            "SELECT e.session_key, ?, e.event_id, 'D-00@1', e.ts_utc, e.ts_local, 'session_activity', e.text "
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, excerpt, cwd) "
+            "SELECT ?, e.ts_utc, e.ts_local, 'session_activity', e.text, e.cwd "
             "FROM transcript_event AS e "
             "WHERE e.session_key = ? AND trim(e.text) <> ''",
             (session_id, session_key),
         )
         row = conn.execute(
-            "SELECT count(*) FROM observation WHERE session_key = ? AND detector_id = 'D-00@1'",
-            (session_key,),
+            "SELECT count(*) FROM observation WHERE session_id = ? AND kind = 'session_activity'",
+            (session_id,),
         ).fetchone()
         return int(row[0]) if row else 0
 
@@ -375,7 +366,7 @@ class Store:
         self.connection.row_factory = sqlite3.Row
         total = self.connection.execute("SELECT count(*) FROM observation").fetchone()[0]
         rows = self.connection.execute(
-            "SELECT obs_id, session_id, detector_id, kind, excerpt, ts_utc "
+            "SELECT obs_id, session_id, 'D-00@1' AS detector_id, kind, excerpt, ts_utc "
             "FROM observation ORDER BY obs_id LIMIT ?",
             (limit,),
         ).fetchall()
