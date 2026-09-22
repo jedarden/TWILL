@@ -38,9 +38,13 @@ def missing_path(directory: Path) -> Path:
 
 
 class DefaultValueTests(unittest.TestCase):
-    def test_missing_config_file_is_not_an_error_and_yields_working_defaults(self):
+    def test_every_key_but_artifacts_root_defaults_when_the_file_omits_it(self):
         with tempfile.TemporaryDirectory() as directory:
-            config = load_config(missing_path(Path(directory)), repo_root=Path(directory))
+            artifacts = Path(directory) / "artifacts"
+            config = load_config(
+                write_config(Path(directory), f'artifacts_root = "{artifacts}"\n'),
+                repo_root=Path(directory) / "repo",
+            )
             self.assertEqual(config.settle_window, DEFAULT_SETTLE_WINDOW_SECONDS)
             self.assertEqual(config.settle_window, 7200.0)
             self.assertEqual(config.retention, DEFAULT_RETENTION_SECONDS)
@@ -59,16 +63,41 @@ class DefaultValueTests(unittest.TestCase):
             self.assertEqual(config.content_fences, ())
             self.assertEqual(config.model, DEFAULT_MODEL)
             self.assertEqual(config.model, "claude-haiku-4-5")
-            self.assertIsNone(config.artifacts_root)
+            self.assertEqual(config.artifacts_root, artifacts.resolve())
 
-    def test_unset_artifacts_root_has_no_default_and_requirement_raises(self):
+
+class UnsetArtifactsRootTests(unittest.TestCase):
+    """Unset is the same startup error as in-tree (plan §3, §13.1)."""
+
+    def test_missing_config_file_is_a_load_error_because_artifacts_root_has_no_default(self):
         with tempfile.TemporaryDirectory() as directory:
             # Explicit missing path: the suite must not read a real
             # ~/.config/twill/config.toml if the host happens to have one.
-            config = load_config(missing_path(Path(directory)), repo_root=Path(directory))
             with self.assertRaises(ConfigError) as caught:
-                config.require_artifacts_root(Path(directory))
+                load_config(missing_path(Path(directory)), repo_root=Path(directory))
+            self.assertIn("artifacts_root", caught.exception.message)
             self.assertIn("no default", caught.exception.message)
+            self.assertTrue(caught.exception.hint)
+
+    def test_present_config_omitting_artifacts_root_is_a_load_error(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ConfigError) as caught:
+                load_config(
+                    write_config(Path(directory), 'settle_window = "30m"\n'),
+                    repo_root=Path(directory),
+                )
+            self.assertIn("artifacts_root", caught.exception.message)
+            self.assertIn("no default", caught.exception.message)
+            self.assertTrue(caught.exception.hint)
+
+    def test_config_built_in_code_without_a_destination_is_refused_at_the_gate(self):
+        # The field is required and typed Path, so None can only arrive by
+        # constructing the dataclass directly; the writer gate still refuses
+        # it rather than picking a destination of its own.
+        config = TwillConfig(artifacts_root=None)
+        with self.assertRaises(ConfigError) as caught:
+            config.require_artifacts_root(Path("/repo"))
+        self.assertIn("no default", caught.exception.message)
 
 
 class LoadedValueTests(unittest.TestCase):
@@ -107,9 +136,10 @@ class LoadedValueTests(unittest.TestCase):
             config = load_config(
                 write_config(
                     Path(directory),
-                    "settle_window = 7200\nretention = 15552000\n",
+                    "settle_window = 7200\nretention = 15552000\n"
+                    f'artifacts_root = "{Path(directory) / "artifacts"}"\n',
                 ),
-                repo_root=Path(directory),
+                repo_root=Path(directory) / "repo",
             )
             self.assertEqual(config.settle_window, 7200.0)
             self.assertEqual(config.retention, 15552000.0)
@@ -224,8 +254,12 @@ class RejectionTests(unittest.TestCase):
         # reports "no settled sessions" rather than failing to load.
         with tempfile.TemporaryDirectory() as directory:
             config = load_config(
-                write_config(Path(directory), "source_globs = []\n"),
-                repo_root=Path(directory),
+                write_config(
+                    Path(directory),
+                    "source_globs = []\n"
+                    f'artifacts_root = "{Path(directory) / "artifacts"}"\n',
+                ),
+                repo_root=Path(directory) / "repo",
             )
             self.assertEqual(config.source_globs, ())
 
@@ -245,12 +279,10 @@ class RejectionTests(unittest.TestCase):
                     load_config(write_config(Path(directory), body), repo_root=Path(directory))
 
     def test_artifacts_root_must_be_a_path_string(self):
-        with tempfile.TemporaryDirectory() as directory:
-            with self.assertRaises(ConfigError):
-                load_config(
-                    write_config(Path(directory), "artifacts_root = 5\n"),
-                    repo_root=Path(directory),
-                )
+        for body in ("artifacts_root = 5\n", 'artifacts_root = ""\n'):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(ConfigError):
+                    load_config(write_config(Path(directory), body), repo_root=Path(directory))
 
 
 class ParseDurationTests(unittest.TestCase):
@@ -283,14 +315,20 @@ class ResolutionOrderTests(unittest.TestCase):
         with mock.patch.dict(os.environ, {"TWILL_SOURCE_ROOTS": "/env/first"}):
             from twill_app import _source_roots
 
-            config = TwillConfig(source_globs=("/config/second/**/*.jsonl",))
+            config = TwillConfig(
+                artifacts_root=Path("/elsewhere/twill-lessons"),
+                source_globs=("/config/second/**/*.jsonl",),
+            )
             self.assertEqual(_source_roots(None, config), (Path("/env/first"),))
 
     def test_cli_flag_wins_over_env_and_config(self):
         with mock.patch.dict(os.environ, {"TWILL_SOURCE_ROOTS": "/env/first"}):
             from twill_app import _source_roots
 
-            config = TwillConfig(source_globs=("/config/second/**/*.jsonl",))
+            config = TwillConfig(
+                artifacts_root=Path("/elsewhere/twill-lessons"),
+                source_globs=("/config/second/**/*.jsonl",),
+            )
             roots = _source_roots(["/cli/flag"], config)
             self.assertEqual(roots, (Path("/cli/flag"),))
 
@@ -347,7 +385,14 @@ class CliWiringTests(unittest.TestCase):
             self.write_fixture(source_dir)
             write_config(
                 home,
-                f'settle_window = "0"\nsource_globs = ["{source_dir}/**/*.jsonl"]\n',
+                "\n".join(
+                    [
+                        'settle_window = "0"',
+                        f'source_globs = ["{source_dir}/**/*.jsonl"]',
+                        f'artifacts_root = "{root / "artifacts"}"',
+                    ]
+                )
+                + "\n",
             )
             result = self.run_cli(
                 "ingest", "--json", "--limit", "1", "--state-dir", str(root / "state"),
@@ -364,7 +409,10 @@ class CliWiringTests(unittest.TestCase):
             home = root / "home"
             source_dir = root / "sources"
             self.write_fixture(source_dir)  # freshly written: unsettled under 2h
-            write_config(home, "settle_window = \"2h\"\n")
+            write_config(
+                home,
+                f'settle_window = "2h"\nartifacts_root = "{root / "artifacts"}"\n',
+            )
             result = self.run_cli(
                 "ingest", "--json", "--settle", "0", "--limit", "1",
                 "--source", str(source_dir), "--state-dir", str(root / "state"),
@@ -401,6 +449,34 @@ class CliWiringTests(unittest.TestCase):
             error = json.loads(result.stdout)["error"]
             self.assertEqual(error["code"], 1)
             self.assertIn("artifacts_root", error["message"])
+
+    def test_unset_artifacts_root_fails_ingest_at_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            write_config(home, 'settle_window = "0"\n')
+            result = self.run_cli(
+                "ingest", "--json", "--state-dir", str(root / "state"),
+                home=home,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            error = json.loads(result.stdout)["error"]
+            self.assertEqual(error["code"], 1)
+            self.assertIn("artifacts_root", error["message"])
+            self.assertIn("no default", error["message"])
+            self.assertTrue(error["hint"])
+
+    def test_missing_config_file_fails_ingest_at_startup(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            result = self.run_cli(
+                "ingest", "--json", "--state-dir", str(root / "state"),
+                home=root,
+            )
+            self.assertEqual(result.returncode, 1, result.stderr)
+            error = json.loads(result.stdout)["error"]
+            self.assertIn("artifacts_root", error["message"])
+            self.assertIn("no default", error["message"])
 
     def test_bad_settle_flag_is_still_a_usage_error(self):
         with tempfile.TemporaryDirectory() as directory:

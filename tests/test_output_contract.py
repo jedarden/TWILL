@@ -1,5 +1,6 @@
 import io
 import json
+import os
 import subprocess
 import sys
 import tempfile
@@ -14,10 +15,28 @@ sys.path.insert(0, str(ROOT))
 
 
 class OutputContractTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        # ingest loads config at startup and artifacts_root is the one key
+        # with no default (plan §13.1): every CLI run in this suite needs a
+        # config that sets it to a directory outside the repository tree.
+        cls._config_home = tempfile.TemporaryDirectory()
+        home = Path(cls._config_home.name)
+        config_dir = home / ".config" / "twill"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.toml").write_text(
+            f'artifacts_root = "{home / "artifacts"}"\n'
+        )
+
+    @classmethod
+    def tearDownClass(cls):
+        cls._config_home.cleanup()
+
     def run_cli(self, *args):
         return subprocess.run(
             [sys.executable, str(CLI), *args],
             cwd=ROOT,
+            env={**os.environ, "HOME": str(Path(self._config_home.name))},
             check=False,
             text=True,
             capture_output=True,

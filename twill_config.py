@@ -2,16 +2,16 @@
 
 TWILL reads ``~/.config/twill/config.toml`` for its settle window, retention,
 top-K, source globs, content fences and Explain model.  Every key has a
-working default, so a missing config file is not an error — the first-run
-``twill ingest`` with no config at all is the supported path.  The one
-exception is ``artifacts_root`` (plan §3): it has no default, and a value that
-resolves inside the repository tree is a load-time error even for verbs that
-never write artifacts.  An *unset* ``artifacts_root`` only fails when an
-artifact-writing verb asks for it through
-:func:`TwillConfig.require_artifacts_root`.
+working default except ``artifacts_root`` (plan §3, §7.2): it has none, and
+:func:`load_config` raises when it is unset or resolves inside this
+repository's working tree — a startup error, before any verb opens a file,
+because the failure mode it prevents is publishing private work in a public
+repository.  A missing config file is the same error: it leaves
+``artifacts_root`` unset.  Unset and in-tree fail identically at load;
+neither is deferred to the verb that would have written the artifact.
 
 Config that is present but wrong — unparsable TOML, an unknown key, a bad
-duration — is also a loud error, never a silent fallback to the default:
+duration — is likewise a loud error, never a silent fallback to the default:
 a default exists for *absence*, not to paper over a typo.
 
 Key → consumer, for the keys no verb reads yet (plan §14):
@@ -21,6 +21,9 @@ Key → consumer, for the keys no verb reads yet (plan §14):
 - ``content_fences`` — the redactor, and again at lesson write (§11)
 - ``model`` — ``twill explain`` (Phase 4); the operator's final choice is
   Open Question 2, this default is only §13.1's working value
+
+``artifacts_root`` is consumed the moment config loads, and again by every
+artifact writer through :meth:`TwillConfig.require_artifacts_root`.
 """
 
 from __future__ import annotations
@@ -109,25 +112,35 @@ DEFAULT_RETENTION_SECONDS = parse_duration(DEFAULT_RETENTION)
 
 @dataclass(frozen=True)
 class TwillConfig:
-    """The effective configuration: every key resolved to a working value."""
+    """The effective configuration: every key resolved to a working value.
 
+    ``artifacts_root`` is the one setting with no default (plan §3): a
+    config cannot exist without naming where distilled artifacts go, so a
+    direct construction states its destination as deliberately as a file
+    does.
+    """
+
+    artifacts_root: Path
     settle_window: float = DEFAULT_SETTLE_WINDOW_SECONDS
     retention: float = DEFAULT_RETENTION_SECONDS
     top_k: int = DEFAULT_TOP_K
     source_globs: tuple[str, ...] = DEFAULT_SOURCE_GLOBS
     content_fences: tuple[str, ...] = DEFAULT_CONTENT_FENCES
     model: str = DEFAULT_MODEL
-    artifacts_root: Path | None = None
 
     def require_artifacts_root(self, repo_root: Path | None = None) -> Path:
-        """Return ``artifacts_root``, or raise: it has no default (plan §3).
+        """Return ``artifacts_root``: the gate every artifact writer uses.
 
-        Every verb that writes a distilled artifact must go through here, so
-        an unset value aborts instead of picking a convenient fallback that
-        could end up public.
+        :func:`load_config` already refused an unset or in-tree value at
+        startup; this re-checks a configuration built in code rather than
+        loaded, so no writer can inherit a destination that was never
+        validated (plan §3, §7.2).
         """
 
         if self.artifacts_root is None:
+            # The field is typed Path and load_config never leaves it unset;
+            # this guards a TwillConfig built in code with the destination
+            # missing, which has no default to fall back to.
             raise ConfigError(
                 "artifacts_root is not set and it has no default",
                 "set artifacts_root in the TWILL config file to a directory "
@@ -140,10 +153,11 @@ class TwillConfig:
 def load_config(path: Path | None = None, repo_root: Path | None = None) -> TwillConfig:
     """Load the config file, defaulting every key it does not set.
 
-    A missing file is the normal first-run case and yields the defaults.  A
-    file that cannot be parsed, names an unknown key, or assigns a bad value
-    raises :class:`ConfigError`.  ``artifacts_root`` set inside the repository
-    tree is rejected here, at startup, before any verb opens a file.
+    A file that cannot be parsed, names an unknown key, or assigns a bad
+    value raises :class:`ConfigError`, and so does an ``artifacts_root`` that
+    is unset — including when the whole file is missing — or that resolves
+    inside the repository tree (plan §3, §13.1): all of them are startup
+    errors raised before any verb opens a file.
     """
 
     config_path = Path(path).expanduser() if path is not None else CONFIG_PATH.expanduser()
@@ -214,10 +228,16 @@ def _non_empty_string(key: str, values: dict[str, object], config_path: Path) ->
 
 def _artifacts_root(
     key: str, values: dict[str, object], config_path: Path, repo: Path
-) -> Path | None:
+) -> Path:
     value = values.get(key)
     if value is None:
-        return None
+        # A missing file and a file that omits the key are the same error:
+        # there is no working default to fall back to (plan §3, §13.1).
+        raise ConfigError(
+            f"{config_path}: {key} is not set and it has no default",
+            f"set {key} in the TWILL config file to a directory outside "
+            "the TWILL repository tree",
+        )
     if not isinstance(value, str) or not value.strip():
         raise ConfigError(f"{config_path}: {key} must be a path string")
     root = Path(value).expanduser().resolve()
