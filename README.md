@@ -33,10 +33,12 @@ here: a one-off error is noise, the same one across six hundred sessions is a le
 ## Layout
 
 ```
-docs/notes/     design decisions, detector catalog, redaction policy
-docs/research/  prior art and source material
-docs/plan/      plan.md — the complete plan (start here)
-systemd/        the three user timers (ingest hourly, measure daily, digest weekly)
+docs/notes/        design decisions, detector catalog, redaction policy
+docs/research/     prior art and source material
+docs/plan/         plan.md — the complete plan (start here)
+systemd/           the three user timers (ingest hourly, measure daily, digest weekly)
+Makefile           `make install` — CLI symlink + config skeleton (§13.1)
+config.toml.skeleton  the operator config `make install` lays down on first install
 ```
 
 ## This repo is the engine, not the output
@@ -57,6 +59,25 @@ Working state lives outside the repo in `~/.local/state/twill/` (mode 600). The 
 and disposable — never committed, never off the host: an index of transcript text is *designed* to
 be surfaced into future prompts, which makes a leaked secret in it worse than one sitting inert in
 a transcript.
+
+## Install
+
+```sh
+make install
+```
+
+Links `twill` into `~/.local/bin` and, on first install, lays the config
+skeleton down at `~/.config/twill/config.toml` (mode 600). Both steps are
+idempotent and never overwrite operator state: an existing config is kept, and
+a non-symlink file already sitting at `~/.local/bin/twill` is a loud refusal
+rather than a clobber.
+
+`artifacts_root` is the one setting the skeleton deliberately does not provide
+— it has no default (see above), so edit the laid-down config and point it at
+the private artifacts repository before the first run; `twill` aborts at
+startup until it is set. The three systemd `--user` timers install from
+`systemd/` (§13.1) as their own slices land, each being a unit that invokes
+verbs from a different phase.
 
 ## Phase 0 walking skeleton
 

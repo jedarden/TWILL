@@ -1,0 +1,50 @@
+# TWILL operator config skeleton — installed to ~/.config/twill/config.toml
+# by `make install` (plan §13.1).  `make install` never overwrites this file
+# once it exists; the defaults below are already in effect for every key you
+# leave commented out, so a line is only worth uncommenting to change one.
+#
+# ── REQUIRED ────────────────────────────────────────────────────────────────
+# artifacts_root is the one key with NO default (plan §3): TWILL refuses to
+# start until it names a directory outside this repository's tree.  This
+# repository is public; the lessons, digests, measurements and guards distilled
+# from private sessions on this host belong in their own private one.  Uncomment
+# and point it somewhere real before the first run:
+#
+# artifacts_root = "~/TWILL-lessons"
+
+# ── Working defaults (plan §13.1) ───────────────────────────────────────────
+# How long a transcript must sit unmodified before it is settled enough to
+# ingest.  Seconds or a form like 30m / 2h / 180d.
+# settle_window = "2h"
+
+# How long derived data is kept before `twill prune` drops it.
+# retention = "180d"
+
+# How many clusters `twill rank` and `twill explain` keep.
+# top_k = 10
+
+# Where transcripts come from.  Each entry is a glob; a bare directory means
+# **/*.jsonl under it.
+# source_globs = [
+#     "~/.claude/projects/**/*.jsonl",
+#     "~/.codex/sessions/**/*.jsonl",
+# ]
+
+# The rule corpus the ranker's coverage matching reads, one "<layer>:<glob>"
+# per entry.  Layers: memory, claude_md, agents_md, skill.
+# rule_globs = [
+#     "memory:~/.claude/projects/*/memory/MEMORY.md",
+#     "memory:~/.claude/projects/*/memory/*.md",
+#     "claude_md:~/CLAUDE.md",
+#     "agents_md:~/*/AGENTS.md",
+#     "skill:~/.claude/skills/*/SKILL.md",
+#     "skill:~/*/.claude/skills/*/SKILL.md",
+# ]
+
+# Strings that must never reach a stored artifact — checked by the redactor at
+# the persistence boundary and again when a lesson is written (plan §11).
+# content_fences = []
+
+# The model `twill explain` drafts lessons with.  One weekly, cost-capped
+# summarization pass; the operator's final choice is plan §16 Open Question 2.
+# model = "claude-haiku-4-5"
