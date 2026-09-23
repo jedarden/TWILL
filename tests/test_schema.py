@@ -12,6 +12,7 @@ import tempfile
 import unittest
 from datetime import datetime, timezone
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -252,11 +253,14 @@ class SchemaContractTests(unittest.TestCase):
         )
 
     def test_meta_enforces_key_value_state_contract(self):
+        # The migration runner already stamped schema_version at writer open,
+        # so the seeds below avoid it and the first conflict below proves the
+        # key is unique — the runner's stamp cannot be shadowed by a second row.
         self.connection.executemany(
             "INSERT INTO meta(key, value, updated_at) VALUES (?, ?, ?)",
             (
-                ("schema_version", "1", "2026-09-23T00:00:00+00:00"),
                 ("trailing_medians", "{}", "2026-09-23T00:00:00+00:00"),
+                ("digest_cursor", "2026-09-19", "2026-09-23T00:00:00+00:00"),
             ),
         )
         with self.assertRaises(sqlite3.IntegrityError):
@@ -270,7 +274,7 @@ class SchemaContractTests(unittest.TestCase):
                 ("icg_catalog_version", "2026-09-24T00:00:00+00:00"),
             )
         self.assertEqual(
-            self.connection.execute("SELECT count(*) FROM meta").fetchone()[0], 2
+            self.connection.execute("SELECT count(*) FROM meta").fetchone()[0], 3
         )
 
     def test_index_contract(self):
@@ -325,6 +329,246 @@ class SchemaContractTests(unittest.TestCase):
             "SELECT path FROM rule_fts WHERE rule_fts MATCH '\"never-employed\"'"
         ).fetchall()
         self.assertEqual(misses, [])
+
+
+class MigrationRunnerTests(unittest.TestCase):
+    """Plan §8.4: additive-only, version-stamped, downgrade-tolerant migrations.
+
+    The shipped registry is empty — the v1 tables are the baseline, and the
+    runner's consumers are later-phase schema additions — so the apply path is
+    exercised by registering the kind of migrations those phases will add.
+    """
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+
+    def _connect(self, migrations=tuple()):
+        with mock.patch.object(twill_schema, "MIGRATIONS", migrations):
+            return twill_schema.connect(self.state_dir)
+
+    def stamped_version(self, connection):
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchone()
+        self.assertIsNotNone(row)
+        return row[0]
+
+    def test_shipped_registry_is_empty_and_fresh_databases_stamp_the_baseline(self):
+        # The v1 tables ship unmigrated; later phases append here.
+        self.assertEqual(twill_schema.MIGRATIONS, ())
+        connection = self._connect()
+        self.addCleanup(connection.close)
+        self.assertEqual(self.stamped_version(connection), "1")
+        # Reopening neither duplicates nor bumps the stamp.
+        connection.close()
+        reopened = self._connect()
+        self.addCleanup(reopened.close)
+        rows = reopened.execute(
+            "SELECT value FROM meta WHERE key = 'schema_version'"
+        ).fetchall()
+        self.assertEqual(rows, [("1",)])
+
+    def test_registered_migrations_apply_in_order_and_stamp_the_version(self):
+        registry = (
+            twill_schema.Migration(
+                2,
+                "phase4_table",
+                ("CREATE TABLE IF NOT EXISTS phase4(id INTEGER PRIMARY KEY, note TEXT)",),
+            ),
+            twill_schema.Migration(
+                3,
+                "phase4_observation_note",
+                ("ALTER TABLE observation ADD COLUMN phase4_note TEXT",),
+            ),
+        )
+        connection = self._connect(registry)
+        self.addCleanup(connection.close)
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        self.assertIn("phase4", tables)
+        # An appended column trails the v1 shape; the prefix is untouched.
+        columns = [row[1] for row in connection.execute("PRAGMA table_info(observation)")]
+        self.assertEqual(
+            columns[: len(twill_schema.EXPECTED_OBSERVATION_COLUMNS)],
+            list(twill_schema.EXPECTED_OBSERVATION_COLUMNS),
+        )
+        self.assertEqual(columns[-1], "phase4_note")
+        self.assertEqual(self.stamped_version(connection), "3")
+        # Reopening with the same registry applies nothing twice.
+        connection.close()
+        reopened = self._connect(registry)
+        self.addCleanup(reopened.close)
+        self.assertEqual(self.stamped_version(reopened), "3")
+        reopened.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, phase4_note) "
+            "VALUES ('s1', 't', 't', 'run_failed', 'kept')"
+        )
+        self.assertEqual(
+            reopened.execute("SELECT phase4_note FROM observation").fetchone()[0],
+            "kept",
+        )
+
+    def test_a_failed_migration_rolls_back_the_whole_run(self):
+        registry = (
+            twill_schema.Migration(
+                2,
+                "phase4_table",
+                ("CREATE TABLE IF NOT EXISTS phase4(id INTEGER PRIMARY KEY)",),
+            ),
+            # Validates as additive, but names a table that does not exist.
+            twill_schema.Migration(
+                3, "phase4_bad", ("ALTER TABLE no_such_table ADD COLUMN c TEXT",)
+            ),
+        )
+        with self.assertRaises(sqlite3.OperationalError):
+            self._connect(registry)
+        # The run was one transaction: the version stamp and migration 2's
+        # table are both absent, so the next open retries from the baseline
+        # instead of straddling a half-applied shape.
+        raw = sqlite3.connect(twill_schema.state_db_path(self.state_dir))
+        self.addCleanup(raw.close)
+        self.assertEqual(
+            raw.execute(
+                "SELECT count(*) FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0],
+            0,
+        )
+        tables = {
+            row[0]
+            for row in raw.execute("SELECT name FROM sqlite_master WHERE type = 'table'")
+        }
+        self.assertNotIn("phase4", tables)
+
+    def test_rolled_back_release_reads_a_newer_database(self):
+        # §8.4's tolerance: this release (empty registry, the shipped shape)
+        # opens a database a newer release migrated to version 3 — no error,
+        # no downgrade, unknown columns kept, stamp left where it was.
+        newer = (
+            twill_schema.Migration(
+                2,
+                "phase4_table",
+                ("CREATE TABLE IF NOT EXISTS phase4(id INTEGER PRIMARY KEY, note TEXT)",),
+            ),
+            twill_schema.Migration(
+                3,
+                "phase4_observation_note",
+                ("ALTER TABLE observation ADD COLUMN phase4_note TEXT",),
+            ),
+        )
+        writer = self._connect(newer)
+        writer.execute(
+            "INSERT INTO phase4(id, note) VALUES (1, 'from the future release')"
+        )
+        writer.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, phase4_note) "
+            "VALUES ('s1', 't', 't', 'run_failed', 'newer shape')"
+        )
+        writer.commit()
+        writer.close()
+
+        older = twill_schema.connect(self.state_dir)
+        self.addCleanup(older.close)
+        self.assertEqual(self.stamped_version(older), "3")
+        columns = [row[1] for row in older.execute("PRAGMA table_info(observation)")]
+        self.assertEqual(columns[-1], "phase4_note")
+        self.assertEqual(
+            older.execute("SELECT note FROM phase4").fetchone()[0],
+            "from the future release",
+        )
+        # The older release can still write with named columns.
+        older.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind) "
+            "VALUES ('s2', 't', 't', 'tool_error')"
+        )
+        older.commit()
+        self.assertEqual(
+            older.execute("SELECT count(*) FROM observation").fetchone()[0], 2
+        )
+        # And the read-only verb opens the newer shape too.
+        reader = twill_schema.connect_read_only(self.state_dir)
+        self.addCleanup(reader.close)
+        self.assertEqual(
+            reader.execute("SELECT count(*) FROM observation").fetchone()[0], 2
+        )
+
+    def test_read_only_open_never_stamps_or_migrates(self):
+        writer = self._connect()
+        writer.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind) "
+            "VALUES ('s1', 't', 't', 'run_failed')"
+        )
+        writer.commit()
+        writer.close()
+        # Simulate a database that predates the runner: no stamp at all.
+        raw = sqlite3.connect(twill_schema.state_db_path(self.state_dir))
+        raw.execute("DELETE FROM meta WHERE key = 'schema_version'")
+        raw.commit()
+        raw.close()
+
+        reader = twill_schema.connect_read_only(self.state_dir)
+        self.addCleanup(reader.close)
+        self.assertEqual(reader.execute("SELECT count(*) FROM observation").fetchone()[0], 1)
+        raw = sqlite3.connect(twill_schema.state_db_path(self.state_dir))
+        self.addCleanup(raw.close)
+        self.assertEqual(
+            raw.execute(
+                "SELECT count(*) FROM meta WHERE key = 'schema_version'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_registry_rejects_non_additive_statements(self):
+        bad = (
+            "DROP TABLE observation",
+            "ALTER TABLE cursor DROP COLUMN path_missing",
+            "ALTER TABLE cursor RENAME COLUMN path TO transcript_path",
+            "CREATE TABLE phase4(id INTEGER PRIMARY KEY)",
+            "CREATE INDEX phase4_kind ON observation(kind)",
+            "DELETE FROM observation",
+            "UPDATE meta SET value = '99'",
+            "CREATE TABLE a(x); CREATE INDEX b ON a(x)",
+        )
+        for statement in bad:
+            with self.subTest(statement=statement):
+                with self.assertRaises(ValueError):
+                    twill_schema._validated(
+                        (twill_schema.Migration(2, "bad", (statement,)),)
+                    )
+        ok = (
+            "CREATE TABLE IF NOT EXISTS phase4(id INTEGER PRIMARY KEY)",
+            "CREATE UNIQUE INDEX IF NOT EXISTS phase4_id ON phase4(id)",
+            "CREATE VIRTUAL TABLE IF NOT EXISTS phase4_fts USING fts5(text)",
+            "CREATE VIEW IF NOT EXISTS phase4_open AS SELECT * FROM phase4",
+            "ALTER TABLE phase4 ADD COLUMN note TEXT NOT NULL DEFAULT ''",
+            "  ALTER TABLE phase4 ADD COLUMN trailing TEXT ;  ",  # padding + semicolon
+        )
+        twill_schema._validated((twill_schema.Migration(2, "ok", ok),))
+
+    def test_registry_rejects_non_contiguous_or_renamed_versions(self):
+        def create(name):
+            return (f"CREATE TABLE IF NOT EXISTS {name}(x)",)
+        cases = (
+            (twill_schema.Migration(3, "skipped_two", create("t")),),
+            (
+                twill_schema.Migration(2, "first", create("t")),
+                twill_schema.Migration(4, "gap", create("u")),
+            ),
+            (
+                twill_schema.Migration(2, "same", create("t")),
+                twill_schema.Migration(3, "same", create("u")),
+            ),
+            (twill_schema.Migration(2, "", create("t")),),
+        )
+        for registry in cases:
+            with self.subTest(registry=registry):
+                with self.assertRaises(ValueError):
+                    twill_schema._validated(registry)
 
 
 class StateStoreModeTests(unittest.TestCase):

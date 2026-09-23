@@ -7,19 +7,29 @@ database file to mode 600, and ensures the v1 tables exist.  Read verbs use
 ``mode=ro`` and never runs the DDL.  The DDL below is the plan's §7.1 schema;
 the only deviation is ``IF NOT EXISTS`` so repeated writer opens are idempotent.
 
-The versioned migration runner (plan §8.4) is a separate bead.  The columns
-added after the v1 DDL shipped — ``cursor.path_missing`` (EC-05) and
-``rule_doc.stale`` (EC-11) — are applied inline by
-:func:`_apply_additive_columns`, idempotently, so a database created before
-they exist converges on the same shape a fresh one gets.  The interim Phase 0
-working tables (``session``, ``transcript_event``) stay in ``twill_app`` —
-they are pipeline scaffolding, not corpus schema.
+The versioned migration runner (plan §8.4) ships for later-phase schema
+additions: append a :class:`Migration` to :data:`MIGRATIONS`.  Every accepted
+statement is additive — ``CREATE ... IF NOT EXISTS`` or ``ALTER TABLE ... ADD
+COLUMN``, enforced at registration — one transaction applies a whole run and
+stamps ``meta.schema_version``, and a database stamped above this release's
+newest migration is opened untouched (the stamp is never lowered, unknown
+columns are kept), which is what lets a rolled-back release still read a newer
+database.  The v1 tables are not migration consumers: they come from
+``V1_SCHEMA`` directly, and the columns added after the v1 DDL shipped —
+``cursor.path_missing`` (EC-05) and ``rule_doc.stale`` (EC-11) — remain inline
+baseline convergence via :func:`_apply_additive_columns`, idempotently, so a
+database created before they exist converges on the same shape a fresh one
+gets.  The interim Phase 0 working tables (``session``, ``transcript_event``)
+stay in ``twill_app`` — they are pipeline scaffolding, not corpus schema.
 """
 
 from __future__ import annotations
 
+import dataclasses
 import os
+import re
 import sqlite3
+from datetime import datetime, timezone
 from urllib.parse import quote
 from pathlib import Path
 
@@ -170,13 +180,17 @@ def _verify_observation_shape(connection: sqlite3.Connection, db_path: Path) -> 
 
     Checked before ``executescript`` because ``obs_sig`` indexes a column the
     legacy Phase 0 shape does not have — without this guard the failure would
-    be an opaque ``no such column`` instead of the rebuild instruction.
+    be an opaque ``no such column`` instead of the rebuild instruction.  The
+    expected columns only have to be a *prefix*: additive migrations append,
+    so extra trailing columns are a newer schema this release can still read
+    (plan §8.4), not a rejectable shape.
     """
 
     columns = tuple(
         row[1] for row in connection.execute("PRAGMA table_info(observation)")
     )
-    if columns and columns != EXPECTED_OBSERVATION_COLUMNS:
+    prefix = columns[: len(EXPECTED_OBSERVATION_COLUMNS)]
+    if columns and prefix != EXPECTED_OBSERVATION_COLUMNS:
         raise CliError(
             EXIT_RUNTIME_ERROR,
             f"{db_path} holds a pre-v1 observation table that does not match the v1 schema",
@@ -225,6 +239,189 @@ def _apply_additive_columns(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+# --- versioned migrations (plan §8.4) -------------------------------------
+
+SCHEMA_VERSION_KEY = "schema_version"
+# The shape ``V1_SCHEMA`` + ``_apply_additive_columns`` produce.  An unstamped
+# database is assumed to be at the baseline: every release that ships the
+# runner stamps on first writer open, so an unstamped database predates it.
+BASELINE_VERSION = 1
+
+# One statement per entry, additive only.  The two shapes the runner accepts:
+# ``IF NOT EXISTS`` keeps a CREATE idempotent, and ALTER entries are routed
+# through the same add-if-missing check ``_apply_additive_columns`` uses so a
+# re-run against an already-migrated database is a no-op.  Triggers are not
+# accepted because their ``BEGIN ... END`` body needs embedded semicolons,
+# which the one-statement rule exists to forbid.
+_CREATE_IF_NOT_EXISTS = re.compile(
+    r"CREATE\s+(?:UNIQUE\s+)?(?:VIRTUAL\s+)?(?:TABLE|INDEX|VIEW)\s+IF\s+NOT\s+EXISTS",
+    re.IGNORECASE,
+)
+_ADD_COLUMN = re.compile(
+    r"ALTER\s+TABLE\s+(?P<table>[A-Za-z_][A-Za-z0-9_]*)\s+ADD\s+COLUMN\s+"
+    r"(?P<column>[A-Za-z_][A-Za-z0-9_]*)\s+(?P<definition>.+)$",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+@dataclasses.dataclass(frozen=True)
+class Migration:
+    """One additive schema step applied after the v1 baseline (plan §8.4).
+
+    ``version`` must continue :data:`BASELINE_VERSION` contiguously and every
+    statement must be additive-only DDL — the registry is validated at import,
+    so an illegal migration kills the process at startup instead of
+    half-applying at the next writer open.
+    """
+
+    version: int
+    name: str
+    statements: tuple[str, ...]
+
+
+def _validated(migrations: tuple[Migration, ...]) -> tuple[Migration, ...]:
+    """Check the registry is contiguous and additive-only before anything runs."""
+
+    expected_version = BASELINE_VERSION
+    names: set[str] = set()
+    for migration in migrations:
+        expected_version += 1
+        if migration.version != expected_version:
+            raise ValueError(
+                "migration versions must be contiguous integers continuing "
+                f"{BASELINE_VERSION}: got {migration.version} ({migration.name}) "
+                f"where {expected_version} was expected"
+            )
+        if not migration.name:
+            raise ValueError(f"migration {migration.version} has an empty name")
+        if migration.name in names:
+            raise ValueError(
+                f"migration {migration.version} reuses the name {migration.name!r}"
+            )
+        names.add(migration.name)
+        for statement in migration.statements:
+            _validate_statement(migration, statement)
+    return migrations
+
+
+def _validate_statement(migration: Migration, statement: str) -> None:
+    """Reject any statement that is not additive-only DDL (plan §8.4)."""
+
+    text = statement.strip().rstrip(";").strip()
+    if ";" in text:
+        raise ValueError(
+            f"migration {migration.version} ({migration.name}) must carry one "
+            f"statement per entry: {statement!r}"
+        )
+    if not (_CREATE_IF_NOT_EXISTS.match(text) or _ADD_COLUMN.match(text)):
+        raise ValueError(
+            f"migration {migration.version} ({migration.name}) is not additive-only "
+            "(plan §8.4: no schema change may need undoing) — only "
+            "'CREATE ... IF NOT EXISTS' and 'ALTER TABLE ... ADD COLUMN' are "
+            f"allowed: {statement!r}"
+        )
+
+
+# Later-phase schema additions append here; the v1 tables are baseline, not
+# migration consumers.
+MIGRATIONS: tuple[Migration, ...] = _validated(())
+
+
+def _utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
+def _read_schema_version(connection: sqlite3.Connection, db_path: Path) -> int:
+    """Return the stamped schema version, 0 for a database that predates the runner."""
+
+    row = connection.execute(
+        "SELECT value FROM meta WHERE key = ?", (SCHEMA_VERSION_KEY,)
+    ).fetchone()
+    if row is None:
+        return 0
+    try:
+        return int(row[0])
+    except (TypeError, ValueError):
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            f"{db_path} holds a non-integer {SCHEMA_VERSION_KEY}: {row[0]!r}",
+            "the state database is derived and disposable (plan §7.2): "
+            f"remove {db_path} and let the next run rebuild it",
+        ) from None
+
+
+def _stamp_baseline(connection: sqlite3.Connection) -> None:
+    connection.execute(
+        "INSERT INTO meta(key, value, updated_at) VALUES (?, ?, ?)",
+        (SCHEMA_VERSION_KEY, str(BASELINE_VERSION), _utc_now()),
+    )
+
+
+def _stamp(connection: sqlite3.Connection, version: int) -> None:
+    connection.execute(
+        "UPDATE meta SET value = ?, updated_at = ? WHERE key = ?",
+        (str(version), _utc_now(), SCHEMA_VERSION_KEY),
+    )
+
+
+def _apply_statement(connection: sqlite3.Connection, statement: str) -> None:
+    """Apply one migration statement; column adds are add-if-missing."""
+
+    text = statement.strip().rstrip(";").strip()
+    add_column = _ADD_COLUMN.match(text)
+    if add_column is None:
+        connection.execute(text)
+        return
+    table = add_column.group("table")
+    column = add_column.group("column")
+    existing = {row[1] for row in connection.execute(f"PRAGMA table_info({table})")}
+    if column not in existing:
+        connection.execute(
+            f"ALTER TABLE {table} ADD COLUMN {column} {add_column.group('definition')}"
+        )
+
+
+def run_migrations(connection: sqlite3.Connection, db_path: Path) -> int:
+    """Bring a DDL-prepared database up to this release's schema version.
+
+    ``V1_SCHEMA`` must already have run (``connect`` does that), so the ``meta``
+    table exists.  An unstamped database is stamped at the baseline first;
+    then every registered migration newer than the stamp applies, all inside
+    one ``BEGIN IMMEDIATE`` transaction whose commit also records the new
+    version — a statement that fails rolls the whole run back to the previous
+    shape and version, and the next open retries from there.
+
+    A database stamped above this release's newest migration — a rolled-back
+    release facing a newer database — is returned untouched: no statement
+    runs, and the stamp is never lowered (plan §8.4).  Unknown columns and
+    tables appended by additive migrations are exactly what older code can
+    still read, because every query names its columns.  Returns the version
+    now in effect.
+    """
+
+    current = _read_schema_version(connection, db_path)
+    newest = MIGRATIONS[-1].version if MIGRATIONS else BASELINE_VERSION
+    if current > newest:
+        return current
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        if current < BASELINE_VERSION:
+            _stamp_baseline(connection)
+            current = BASELINE_VERSION
+        for migration in MIGRATIONS:
+            if migration.version <= current:
+                continue
+            for statement in migration.statements:
+                _apply_statement(connection, statement)
+            _stamp(connection, migration.version)
+            current = migration.version
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    return current
+
+
 def connect(state_dir: Path, *, read_only: bool = False) -> sqlite3.Connection:
     """Open the state database as a writer, or explicitly read-only."""
 
@@ -246,6 +443,7 @@ def connect(state_dir: Path, *, read_only: bool = False) -> sqlite3.Connection:
         _verify_observation_shape(connection, db_path)
         connection.executescript(V1_SCHEMA)
         _apply_additive_columns(connection)
+        run_migrations(connection, db_path)
     except BaseException:
         connection.close()
         raise

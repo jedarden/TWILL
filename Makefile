@@ -13,6 +13,12 @@ CONFIG_FILE := $(CONFIG_DIR)/config.toml
 SKELETON := config.toml.skeleton
 LINK := $(BIN_DIR)/twill
 
+# Unit tests; every test module locates the repo root itself, so this works
+# from any checkout.
+.PHONY: test
+test:
+	python3 -m unittest discover -s tests
+
 .DEFAULT_GOAL := install
 .PHONY: install
 install:
