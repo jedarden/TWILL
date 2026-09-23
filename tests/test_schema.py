@@ -85,6 +85,7 @@ COLUMN_CONTRACT = {
         ("sha", "TEXT", 1, None, 0),
         ("indexed_at", "TEXT", 1, None, 0),
         ("last_read_by_agent", "TEXT", 0, None, 0),
+        ("stale", "INTEGER", 1, "0", 0),
     ],
     "session_usage": [
         ("session_id", "TEXT", 0, None, 1),
@@ -205,6 +206,44 @@ class SchemaContractTests(unittest.TestCase):
         self.addCleanup(fresh.close)
         fresh_columns = [row[1] for row in fresh.execute("PRAGMA table_info(cursor)")]
         self.assertEqual(columns, fresh_columns)
+
+    def test_additive_column_migrates_a_pre_existing_rule_doc_table(self):
+        # Same mechanism as cursor.path_missing, one table over: a database
+        # created before rule_doc.stale shipped (EC-11) converges on the
+        # fresh shape at the next writer open.
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at) "
+            "VALUES ('/h/CLAUDE.md', 'claude_md', 'sha', 't')"
+        )
+        self.connection.commit()
+        self.connection.close()
+        legacy = sqlite3.connect(self.state_dir / "twill.db")
+        legacy.execute("CREATE TABLE rule_doc_backup AS SELECT * FROM rule_doc")
+        legacy.execute("DROP TABLE rule_doc")
+        legacy.execute(
+            "CREATE TABLE rule_doc(path TEXT PRIMARY KEY, layer TEXT NOT NULL, "
+            "sha TEXT NOT NULL, indexed_at TEXT NOT NULL, last_read_by_agent TEXT)"
+        )
+        legacy.execute(
+            "INSERT INTO rule_doc SELECT path, layer, sha, indexed_at, "
+            "last_read_by_agent FROM rule_doc_backup"
+        )
+        legacy.execute("DROP TABLE rule_doc_backup")
+        legacy.commit()
+        legacy.close()
+
+        migrated = twill_schema.connect(self.state_dir)
+        self.addCleanup(migrated.close)
+        row = migrated.execute(
+            "SELECT path, layer, sha, stale FROM rule_doc"
+        ).fetchone()
+        self.assertEqual(row, ("/h/CLAUDE.md", "claude_md", "sha", 0))
+        fresh = twill_schema.connect(self.state_dir.parent / "fresh-rule-doc")
+        self.addCleanup(fresh.close)
+        self.assertEqual(
+            [r[1] for r in migrated.execute("PRAGMA table_info(rule_doc)")],
+            [r[1] for r in fresh.execute("PRAGMA table_info(rule_doc)")],
+        )
 
     def test_meta_is_not_part_of_this_schema(self):
         # meta(key, value, updated_at) has its own bead; the v1 schema bead

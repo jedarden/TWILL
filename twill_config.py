@@ -1,7 +1,8 @@
 """Configuration loading with working defaults (plan §13.1).
 
 TWILL reads ``~/.config/twill/config.toml`` for its settle window, retention,
-top-K, source globs, content fences and Explain model.  Every key has a
+top-K, source globs, rule globs, content fences and Explain model.  Every key
+has a
 working default except ``artifacts_root`` (plan §3, §7.2): it has none, and
 :func:`load_config` raises when it is unset or resolves inside this
 repository's working tree — a startup error, before any verb opens a file,
@@ -18,6 +19,9 @@ Key → consumer, for the keys no verb reads yet (plan §14):
 
 - ``retention`` — ``twill prune`` (Phase 3)
 - ``top_k`` — ``twill rank`` / ``twill explain`` (Phases 3–4)
+- ``rule_globs`` — the rule-corpus index the ranker's coverage matching reads
+  (Phase 3); each entry is ``<layer>:<glob>``, parsed by
+  :func:`twill_rulecorpus.parse_rule_pattern`
 - ``content_fences`` — the redactor, and again at lesson write (§11)
 - ``model`` — ``twill explain`` (Phase 4); the operator's final choice is
   Open Question 2, this default is only §13.1's working value
@@ -32,6 +36,8 @@ import re
 import tomllib
 from dataclasses import dataclass
 from pathlib import Path
+
+from twill_rulecorpus import DEFAULT_RULE_GLOBS, parse_rule_pattern
 
 CONFIG_PATH = Path("~/.config/twill/config.toml")
 
@@ -60,6 +66,7 @@ _KNOWN_KEYS = frozenset(
         "retention",
         "top_k",
         "source_globs",
+        "rule_globs",
         "content_fences",
         "model",
         "artifacts_root",
@@ -125,6 +132,7 @@ class TwillConfig:
     retention: float = DEFAULT_RETENTION_SECONDS
     top_k: int = DEFAULT_TOP_K
     source_globs: tuple[str, ...] = DEFAULT_SOURCE_GLOBS
+    rule_globs: tuple[str, ...] = DEFAULT_RULE_GLOBS
     content_fences: tuple[str, ...] = DEFAULT_CONTENT_FENCES
     model: str = DEFAULT_MODEL
 
@@ -185,6 +193,7 @@ def _build_config(values: dict[str, object], config_path: Path, repo: Path) -> T
         retention=_duration("retention", values, config_path),
         top_k=_positive_int("top_k", values, config_path),
         source_globs=_string_list("source_globs", values, config_path),
+        rule_globs=_rule_glob_list("rule_globs", values, config_path),
         content_fences=_string_list("content_fences", values, config_path),
         model=_non_empty_string("model", values, config_path),
         artifacts_root=_artifacts_root("artifacts_root", values, config_path, repo),
@@ -217,6 +226,24 @@ def _string_list(key: str, values: dict[str, object], config_path: Path) -> tupl
         if not isinstance(item, str) or not item.strip():
             raise ConfigError(f"{config_path}: {key} entries must be non-empty strings")
     return tuple(value)
+
+
+def _rule_glob_list(key: str, values: dict[str, object], config_path: Path) -> tuple[str, ...]:
+    """Validate ``rule_globs`` entries as ``<layer>:<glob>`` at load time.
+
+    A malformed entry must fail here, not at the weekly rank pass that is
+    the first thing to consume it -- the same bar every other key is held
+    to.  The grammar's home is :mod:`twill_rulecorpus`; config only refuses
+    to load what that parser would refuse to run.
+    """
+
+    globs = _string_list(key, values, config_path)
+    for entry in globs:
+        try:
+            parse_rule_pattern(entry)
+        except ValueError as exc:
+            raise ConfigError(f"{config_path}: {key}: {exc}") from exc
+    return globs
 
 
 def _non_empty_string(key: str, values: dict[str, object], config_path: Path) -> str:
@@ -272,6 +299,7 @@ def _default_for(key: str) -> object:
         "retention": DEFAULT_RETENTION,
         "top_k": DEFAULT_TOP_K,
         "source_globs": list(DEFAULT_SOURCE_GLOBS),
+        "rule_globs": list(DEFAULT_RULE_GLOBS),
         "content_fences": list(DEFAULT_CONTENT_FENCES),
         "model": DEFAULT_MODEL,
     }[key]

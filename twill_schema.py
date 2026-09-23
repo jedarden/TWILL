@@ -9,12 +9,12 @@ the only deviation is ``IF NOT EXISTS`` so repeated writer opens are idempotent.
 
 Two pieces of §7.1 deliberately live elsewhere: ``meta`` is added by its own
 bead, and the versioned migration runner (plan §8.4) is a separate bead.  The
-one column added after the v1 DDL shipped — ``cursor.path_missing`` (EC-05) —
-is applied inline by :func:`_apply_additive_columns`, idempotently, so a
-database created before the column exists converges on the same shape a fresh
-one gets.  The interim Phase 0 working tables (``session``,
-``transcript_event``) stay in ``twill_app`` — they are pipeline scaffolding,
-not corpus schema.
+columns added after the v1 DDL shipped — ``cursor.path_missing`` (EC-05) and
+``rule_doc.stale`` (EC-11) — are applied inline by
+:func:`_apply_additive_columns`, idempotently, so a database created before
+they exist converges on the same shape a fresh one gets.  The interim Phase 0
+working tables (``session``, ``transcript_event``) stay in ``twill_app`` —
+they are pipeline scaffolding, not corpus schema.
 """
 
 from __future__ import annotations
@@ -59,6 +59,10 @@ ADDITIVE_COLUMNS = (
     # EC-05: a vanished upstream transcript is flagged, never avenged — its
     # observations survive and `doctor` reports the spike.
     ("cursor", "path_missing", "INTEGER NOT NULL DEFAULT 0"),
+    # EC-11 (§8.1): a vanished rule file is flagged stale, never deleted —
+    # its row and FTS text survive so coverage degrades visibly, not
+    # silently.
+    ("rule_doc", "stale", "INTEGER NOT NULL DEFAULT 0"),
 )
 
 
@@ -97,7 +101,8 @@ CREATE TABLE IF NOT EXISTS cluster(
 -- the rule corpus TWILL checks coverage against (read-only inputs, hashed for staleness)
 CREATE TABLE IF NOT EXISTS rule_doc(
   path TEXT PRIMARY KEY, layer TEXT NOT NULL,  -- memory|claude_md|agents_md|skill|hook
-  sha TEXT NOT NULL, indexed_at TEXT NOT NULL, last_read_by_agent TEXT);
+  sha TEXT NOT NULL, indexed_at TEXT NOT NULL, last_read_by_agent TEXT,
+  stale INTEGER NOT NULL DEFAULT 0);   -- EC-11 (§8.1): path vanished, content kept for hash matching
 CREATE VIRTUAL TABLE IF NOT EXISTS rule_fts USING fts5(text, path UNINDEXED, tokenize='porter unicode61');
 
 -- per-session token/cost usage, extracted during ingest; feeds waste attribution

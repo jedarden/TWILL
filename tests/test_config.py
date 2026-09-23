@@ -15,6 +15,7 @@ from twill_config import (  # noqa: E402
     DEFAULT_CONTENT_FENCES,
     DEFAULT_MODEL,
     DEFAULT_RETENTION_SECONDS,
+    DEFAULT_RULE_GLOBS,
     DEFAULT_SETTLE_WINDOW_SECONDS,
     DEFAULT_SOURCE_GLOBS,
     DEFAULT_TOP_K,
@@ -52,6 +53,7 @@ class DefaultValueTests(unittest.TestCase):
             self.assertEqual(config.top_k, DEFAULT_TOP_K)
             self.assertEqual(config.top_k, 10)
             self.assertEqual(config.source_globs, DEFAULT_SOURCE_GLOBS)
+            self.assertEqual(config.rule_globs, DEFAULT_RULE_GLOBS)
             self.assertEqual(
                 config.source_globs,
                 (
@@ -115,6 +117,7 @@ class LoadedValueTests(unittest.TestCase):
                         'retention = "90d"',
                         "top_k = 5",
                         'source_globs = ["~/transcripts/**/*.jsonl"]',
+                        'rule_globs = ["memory:~/.claude/projects/*/memory/*.md"]',
                         'content_fences = ["a fenced entity"]',
                         'model = "claude-opus-5"',
                         f'artifacts_root = "{artifacts}"',
@@ -126,6 +129,10 @@ class LoadedValueTests(unittest.TestCase):
             self.assertEqual(config.retention, 90 * 86400.0)
             self.assertEqual(config.top_k, 5)
             self.assertEqual(config.source_globs, ("~/transcripts/**/*.jsonl",))
+            self.assertEqual(
+                config.rule_globs,
+                ("memory:~/.claude/projects/*/memory/*.md",),
+            )
             self.assertEqual(config.content_fences, ("a fenced entity",))
             self.assertEqual(config.model, "claude-opus-5")
             self.assertEqual(config.artifacts_root, artifacts.resolve())
@@ -271,6 +278,36 @@ class RejectionTests(unittest.TestCase):
             with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
                 with self.assertRaises(ConfigError):
                     load_config(write_config(Path(directory), body), repo_root=Path(directory))
+
+    def test_rule_globs_must_carry_a_known_layer(self):
+        # Rejected at load, not at the weekly rank pass that first consumes
+        # the corpus (plan §13.1: present-but-wrong config is a loud error).
+        for body in (
+            'rule_globs = "~/CLAUDE.md"\n',
+            'rule_globs = ["~/CLAUDE.md"]\n',
+            'rule_globs = ["essay:~/writings/*.md"]\n',
+            'rule_globs = ["skill:"]\n',
+            'rule_globs = ["memory:   "]\n',
+            "rule_globs = [7]\n",
+        ):
+            with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
+                with self.assertRaises(ConfigError) as caught:
+                    load_config(write_config(Path(directory), body), repo_root=Path(directory))
+                self.assertIn("rule_globs", caught.exception.message)
+
+    def test_empty_rule_globs_are_a_valid_explicit_choice(self):
+        # An operator may empty the corpus; the index then only sweeps
+        # stored paths for staleness.
+        with tempfile.TemporaryDirectory() as directory:
+            config = load_config(
+                write_config(
+                    Path(directory),
+                    "rule_globs = []\n"
+                    f'artifacts_root = "{Path(directory) / "artifacts"}"\n',
+                ),
+                repo_root=Path(directory) / "repo",
+            )
+            self.assertEqual(config.rule_globs, ())
 
     def test_model_must_be_a_non_empty_string(self):
         for body in ("model = 5\n", 'model = ""\n'):
