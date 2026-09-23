@@ -27,6 +27,7 @@ V1_TABLES = (
     "cluster_week",
     "cursor",
     "measurement",
+    "meta",
     "observation",
     "parse_shape",
     "rule_doc",
@@ -110,6 +111,11 @@ COLUMN_CONTRACT = {
         ("source", "TEXT", 1, None, 2),
         ("record_type", "TEXT", 1, None, 3),
         ("n", "INTEGER", 1, None, 0),
+    ],
+    "meta": [
+        ("key", "TEXT", 0, None, 1),
+        ("value", "TEXT", 1, None, 0),
+        ("updated_at", "TEXT", 1, None, 0),
     ],
     "measurement": [
         ("lesson_id", "TEXT", 1, None, 1),
@@ -245,16 +251,27 @@ class SchemaContractTests(unittest.TestCase):
             [r[1] for r in fresh.execute("PRAGMA table_info(rule_doc)")],
         )
 
-    def test_meta_is_not_part_of_this_schema(self):
-        # meta(key, value, updated_at) has its own bead; the v1 schema bead
-        # enumerates the other nine tables and must not absorb it.
-        names = {
-            row[0]
-            for row in self.connection.execute(
-                "SELECT name FROM sqlite_master WHERE type = 'table'"
+    def test_meta_enforces_key_value_state_contract(self):
+        self.connection.executemany(
+            "INSERT INTO meta(key, value, updated_at) VALUES (?, ?, ?)",
+            (
+                ("schema_version", "1", "2026-09-23T00:00:00+00:00"),
+                ("trailing_medians", "{}", "2026-09-23T00:00:00+00:00"),
+            ),
+        )
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "INSERT INTO meta(key, value, updated_at) VALUES (?, ?, ?)",
+                ("schema_version", "2", "2026-09-24T00:00:00+00:00"),
             )
-        }
-        self.assertNotIn("meta", names)
+        with self.assertRaises(sqlite3.IntegrityError):
+            self.connection.execute(
+                "INSERT INTO meta(key, updated_at) VALUES (?, ?)",
+                ("icg_catalog_version", "2026-09-24T00:00:00+00:00"),
+            )
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM meta").fetchone()[0], 2
+        )
 
     def test_index_contract(self):
         indexes = {

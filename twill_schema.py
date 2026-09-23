@@ -7,9 +7,8 @@ database file to mode 600, and ensures the v1 tables exist.  Read verbs use
 ``mode=ro`` and never runs the DDL.  The DDL below is the plan's §7.1 schema;
 the only deviation is ``IF NOT EXISTS`` so repeated writer opens are idempotent.
 
-Two pieces of §7.1 deliberately live elsewhere: ``meta`` is added by its own
-bead, and the versioned migration runner (plan §8.4) is a separate bead.  The
-columns added after the v1 DDL shipped — ``cursor.path_missing`` (EC-05) and
+The versioned migration runner (plan §8.4) is a separate bead.  The columns
+added after the v1 DDL shipped — ``cursor.path_missing`` (EC-05) and
 ``rule_doc.stale`` (EC-11) — are applied inline by
 :func:`_apply_additive_columns`, idempotently, so a database created before
 they exist converges on the same shape a fresh one gets.  The interim Phase 0
@@ -122,6 +121,9 @@ CREATE TABLE IF NOT EXISTS cluster_week(
 CREATE TABLE IF NOT EXISTS parse_shape(
   run_at TEXT NOT NULL, source TEXT NOT NULL, record_type TEXT NOT NULL,
   n INTEGER NOT NULL, PRIMARY KEY(run_at, source, record_type));
+
+CREATE TABLE IF NOT EXISTS meta(
+  key TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL);
 
 -- one row per (lesson, measurement day); mirrored to measurements/<lesson>.jsonl for durability
 -- detector_id carries the version (`D-01@2`, per EC-12), which is how §8.3's
