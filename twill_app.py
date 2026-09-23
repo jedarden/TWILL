@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Iterator, Sequence
 
+import twill_detectors
 import twill_schema
 import twill_cursor
 from codex_reader import CodexRolloutLineParser
@@ -37,6 +38,7 @@ from twill_contract import (
     EXIT_RUNTIME_ERROR,
     EXIT_SUCCESS,
     EXIT_USAGE_ERROR,
+    EXIT_VALIDATION_FAILURE,
     CliError,
     UsageError,
     emit_error,
@@ -47,7 +49,11 @@ from twill_redactor import Redactor, redact as _redact
 
 
 MAX_EXCERPT_LENGTH = 240
-MUTATING_VERBS = frozenset({"ingest"})
+MUTATING_VERBS = frozenset({"ingest", "detect"})
+
+# Plan §14: `twill detect [--window 30d] ...` — the default analysis window.
+DEFAULT_DETECT_WINDOW_DAYS = 30
+SECONDS_PER_DAY = 86400
 
 
 # Interim Phase 0 working tables.  The v1 corpus schema (cursor, observation,
@@ -727,6 +733,115 @@ def ingest_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _window_days(seconds: float) -> int:
+    """Convert a ``--window`` duration to whole days (cluster.window_days)."""
+
+    if seconds <= 0 or seconds % SECONDS_PER_DAY:
+        raise UsageError(
+            "--window must be a whole number of days, e.g. 30d or 7d",
+            "the window labels every cluster row it refreshes, so 12h-style "
+            "windows are refused rather than silently rounded",
+        )
+    return int(seconds // SECONDS_PER_DAY)
+
+
+def _detect_failure_hint(report: twill_detectors.DetectorRunReport) -> str:
+    if report.exit_code == EXIT_VALIDATION_FAILURE:
+        return (
+            "detector semantics are versioned (EC-12): a refused detector "
+            "changed under its recorded version — bump its version in "
+            "twill_detectors.REGISTRY to redefine what it means"
+        )
+    return (
+        "the failing detector was skipped and the others' clusters were "
+        "committed; re-run 'twill detect --detector <id>' to isolate it"
+    )
+
+
+def detect_command(args: argparse.Namespace) -> int:
+    # Same startup gate as ingest (plan §3): a wrong config fails before any
+    # detector runs, never mid-run.
+    load_config()
+    days = (
+        DEFAULT_DETECT_WINDOW_DAYS
+        if args.window is None
+        else _window_days(args.window)
+    )
+    registry = twill_detectors.REGISTRY
+    if args.detector:
+        # Fail fast on a typo before the database is opened: a partial run
+        # behind a usage error would be needlessly hard to reason about.
+        try:
+            twill_detectors.select_detectors(registry, args.detector)
+        except ValueError as exc:
+            raise UsageError(str(exc)) from exc
+
+    state_dir = _state_dir(args.state_dir)
+    connection = twill_schema.connect(state_dir)
+    try:
+        report = twill_detectors.run_detectors(
+            connection, window_days=days, only=args.detector
+        )
+    finally:
+        connection.close()
+
+    if report.exit_code != EXIT_SUCCESS:
+        failures = "; ".join(
+            f"{outcome.full_id}: {outcome.error}"
+            for outcome in report.failed
+            if outcome.error
+        )
+        message = (
+            f"{len(report.failed)} of {len(report.outcomes)} detector(s) "
+            f"failed ({failures})"
+        )
+        if len(report.failed) < len(report.outcomes):
+            message += "; the rest ran and their clusters were committed"
+        raise CliError(
+            report.exit_code,
+            message,
+            _detect_failure_hint(report),
+        )
+
+    warnings: list[str] = []
+    if not report.outcomes:
+        warnings.append(
+            "no detectors registered; 'twill detect' had nothing to run"
+        )
+    emit_success(
+        {
+            "window_days": report.window_days,
+            "window_start_utc": report.window_start_utc,
+            "detectors": [
+                {
+                    "detector_id": outcome.detector_id,
+                    "version": outcome.version,
+                    "full_id": outcome.full_id,
+                    "status": outcome.status,
+                    "clusters": outcome.clusters,
+                    "error": outcome.error,
+                }
+                for outcome in report.outcomes
+            ],
+        },
+        json_mode=args.json,
+        warnings=warnings,
+    )
+    if args.json:
+        return EXIT_SUCCESS
+
+    print("TWILL detect")
+    print(f"window: {report.window_days} day(s) starting {report.window_start_utc}")
+    if not report.outcomes:
+        print("no detectors registered; add detectors in twill_detectors.REGISTRY")
+        return EXIT_SUCCESS
+    for outcome in report.outcomes:
+        print(f"{outcome.full_id}: {outcome.clusters} cluster(s)")
+    total_clusters = sum(outcome.clusters for outcome in report.outcomes)
+    print(f"{len(report.outcomes)} detector(s) ran; {total_clusters} cluster(s)")
+    return EXIT_SUCCESS
+
+
 def digest_command(args: argparse.Namespace) -> int:
     state_dir = _state_dir(args.state_dir)
     # A read verb must not bootstrap the state directory or database.  An
@@ -791,6 +906,24 @@ def build_parser() -> argparse.ArgumentParser:
     ingest.add_argument("--state-dir")
     ingest.add_argument("--json", action="store_true")
     ingest.set_defaults(handler=ingest_command)
+
+    detect = subparsers.add_parser(
+        "detect", help="run the versioned detector registry over stored observations"
+    )
+    detect.add_argument(
+        "--window",
+        type=_parse_duration,
+        default=None,
+        help="trailing window as whole days, e.g. 30d or 7d (default 30d)",
+    )
+    detect.add_argument(
+        "--detector",
+        action="append",
+        help="detector id to run, e.g. D-01; may be repeated (default: all)",
+    )
+    detect.add_argument("--state-dir")
+    detect.add_argument("--json", action="store_true")
+    detect.set_defaults(handler=detect_command)
 
     digest = subparsers.add_parser("digest", help="render the stored Phase 0 digest")
     digest.add_argument("--stdout", action="store_true", help="render to stdout")

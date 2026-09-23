@@ -323,8 +323,27 @@ def _validate_statement(migration: Migration, statement: str) -> None:
 
 
 # Later-phase schema additions append here; the v1 tables are baseline, not
-# migration consumers.
-MIGRATIONS: tuple[Migration, ...] = _validated(())
+# migration consumers.  Version 2 is the detector registry's run record
+# (plan §8.1 EC-12, §8.2): one row per (detector, version) that has committed
+# clusters, stamping the semantics hash that refuses a same-version semantics
+# change, plus the last run's status for the per-detector failure report.
+MIGRATIONS: tuple[Migration, ...] = _validated(
+    (
+        Migration(
+            2,
+            "detector_run",
+            (
+                "CREATE TABLE IF NOT EXISTS detector_run("
+                "detector_id TEXT NOT NULL, version INTEGER NOT NULL, "
+                "full_id TEXT NOT NULL, semantics_sha TEXT NOT NULL, "
+                "first_run_at TEXT NOT NULL, last_run_at TEXT NOT NULL, "
+                "last_status TEXT NOT NULL, last_error TEXT, "
+                "clusters INTEGER NOT NULL, window_days INTEGER NOT NULL, "
+                "PRIMARY KEY(detector_id, version))",
+            ),
+        ),
+    )
+)
 
 
 def _utc_now() -> str:

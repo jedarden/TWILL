@@ -334,9 +334,10 @@ class SchemaContractTests(unittest.TestCase):
 class MigrationRunnerTests(unittest.TestCase):
     """Plan §8.4: additive-only, version-stamped, downgrade-tolerant migrations.
 
-    The shipped registry is empty — the v1 tables are the baseline, and the
-    runner's consumers are later-phase schema additions — so the apply path is
-    exercised by registering the kind of migrations those phases will add.
+    The shipped registry carries the additive tables later phases add on top
+    of the v1 baseline (currently version 2, ``detector_run``); the apply path
+    beyond it is exercised by registering the kind of migrations those phases
+    will add.
     """
 
     def setUp(self):
@@ -355,20 +356,31 @@ class MigrationRunnerTests(unittest.TestCase):
         self.assertIsNotNone(row)
         return row[0]
 
-    def test_shipped_registry_is_empty_and_fresh_databases_stamp_the_baseline(self):
-        # The v1 tables ship unmigrated; later phases append here.
-        self.assertEqual(twill_schema.MIGRATIONS, ())
-        connection = self._connect()
+    def test_shipped_registry_applies_and_stamps_its_newest_version(self):
+        # The v1 tables ship unmigrated; version 2 adds detector_run (the
+        # registry's run record, plan §8.1 EC-12 / §8.2).  _connect patches
+        # MIGRATIONS, so the shipped registry is passed explicitly.
+        versions = [migration.version for migration in twill_schema.MIGRATIONS]
+        self.assertEqual(versions, list(range(2, 2 + len(versions))))
+        connection = self._connect(twill_schema.MIGRATIONS)
         self.addCleanup(connection.close)
-        self.assertEqual(self.stamped_version(connection), "1")
+        tables = {
+            row[0]
+            for row in connection.execute(
+                "SELECT name FROM sqlite_master WHERE type = 'table'"
+            )
+        }
+        self.assertIn("detector_run", tables)
+        newest = str(versions[-1])
+        self.assertEqual(self.stamped_version(connection), newest)
         # Reopening neither duplicates nor bumps the stamp.
         connection.close()
-        reopened = self._connect()
+        reopened = self._connect(twill_schema.MIGRATIONS)
         self.addCleanup(reopened.close)
         rows = reopened.execute(
             "SELECT value FROM meta WHERE key = 'schema_version'"
         ).fetchall()
-        self.assertEqual(rows, [("1",)])
+        self.assertEqual(rows, [(newest,)])
 
     def test_registered_migrations_apply_in_order_and_stamp_the_version(self):
         registry = (
