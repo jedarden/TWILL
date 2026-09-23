@@ -39,6 +39,16 @@ def claude_line(session_id: str, text: str, index: int) -> str:
     )
 
 
+def codex_line(record_type: str, payload: dict, index: int) -> str:
+    return json.dumps(
+        {
+            "type": record_type,
+            "timestamp": f"2026-09-23T13:00:{index:02d}Z",
+            "payload": payload,
+        }
+    )
+
+
 class IdentityTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -505,6 +515,150 @@ class StoreCursorTests(unittest.TestCase):
             (idle.identity_sha, idle.size, idle.last_offset, idle.parse_errors),
             (previous.identity_sha, previous.size, previous.last_offset, previous.parse_errors),
         )
+
+
+class CodexStoreIntegrationTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+        self.path = self.root / ".codex" / "sessions" / "rollout.jsonl"
+        self.path.parent.mkdir(parents=True)
+        self.state = self.root / "state"
+
+    def test_appended_rollout_uses_contract_parser_without_duplicates(self):
+        token = "".join(("ghp_", "1234567890abcdefghijklmnop"))
+        base_lines = [
+            codex_line(
+                "session_meta",
+                {"session_id": "codex-store-001", "cwd": "/workspace/demo"},
+                0,
+            ),
+            codex_line(
+                "response_item",
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "run-1",
+                    "name": "exec",
+                    "input": "pytest -q",
+                },
+                1,
+            ),
+        ]
+        append_lines = [
+            codex_line(
+                "response_item",
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "run-1",
+                    "output": "Process exited with code 0",
+                },
+                2,
+            ),
+            codex_line(
+                "response_item",
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "read-1",
+                    "name": "read_file",
+                    "input": json.dumps({"file_path": "README.md"}),
+                },
+                3,
+            ),
+            codex_line(
+                "response_item",
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "read-1",
+                    "output": f"<tool_use_error>missing {token}</tool_use_error>",
+                },
+                4,
+            ),
+            codex_line(
+                "response_item",
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "deny-1",
+                    "name": "exec",
+                    "input": "rm -rf scratch",
+                },
+                5,
+            ),
+            codex_line(
+                "response_item",
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "deny-1",
+                    "output": "The user doesn't want to proceed with this tool use.",
+                },
+                6,
+            ),
+            codex_line("event_msg", {"type": "turn_aborted"}, 7),
+            codex_line(
+                "response_item",
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "use a dry run"}],
+                },
+                8,
+            ),
+        ]
+        self.path.write_text("\n".join(base_lines) + "\n")
+
+        first_store = Store(self.state)
+        try:
+            first = first_store.ingest_path(self.path)
+        finally:
+            first_store.close()
+        self.assertEqual(first["action"], twill_cursor.ACTION_PARSE)
+        self.assertEqual(first["events"], 0)
+
+        with self.path.open("a") as handle:
+            handle.write("\n".join(append_lines) + "\n")
+
+        second_store = Store(self.state)
+        try:
+            second = second_store.ingest_path(self.path)
+            third = second_store.ingest_path(self.path)
+            rows = second_store.connection.execute(
+                "SELECT kind, text, source_line FROM transcript_event "
+                "ORDER BY source_line, event_index"
+            ).fetchall()
+            observation_count = second_store.connection.execute(
+                "SELECT count(*) FROM observation"
+            ).fetchone()[0]
+            source = second_store.connection.execute(
+                "SELECT source FROM cursor WHERE path = ?",
+                (str(self.path.resolve()),),
+            ).fetchone()[0]
+            source_kind = second_store.connection.execute(
+                "SELECT source_kind FROM session WHERE source_path = ?",
+                (str(self.path.resolve()),),
+            ).fetchone()[0]
+        finally:
+            second_store.close()
+
+        self.assertEqual(second["action"], twill_cursor.ACTION_RESUME)
+        self.assertEqual(second["events"], 6)
+        self.assertEqual(third["action"], twill_cursor.ACTION_RESUME)
+        self.assertEqual(third["events"], 0)
+        self.assertEqual(observation_count, 6)
+        self.assertEqual(source, "codex")
+        self.assertEqual(source_kind, "codex")
+        self.assertEqual(
+            [row[0] for row in rows],
+            [
+                "run",
+                "file_read",
+                "tool_error",
+                "tool_rejected",
+                "interrupt",
+                "user_turn_after_correction",
+            ],
+        )
+        self.assertEqual(len(rows), 6)
+        self.assertNotIn(token, " ".join(row[1] for row in rows))
 
 
 class CursorCliTests(unittest.TestCase):

@@ -26,6 +26,7 @@ from typing import Iterator, Sequence
 
 import twill_schema
 import twill_cursor
+from codex_reader import CodexRolloutLineParser
 from twill_config import (
     ConfigError,
     TwillConfig,
@@ -189,6 +190,64 @@ def _source_kind(path: Path) -> str:
     return "jsonl"
 
 
+def _parse_codex_scan(
+    path: Path,
+    scan: twill_cursor.LineScan,
+    fallback_session_id: str,
+    source_kind: str,
+) -> tuple[SessionData, int]:
+    parser = CodexRolloutLineParser()
+    session_id = fallback_session_id
+
+    if scan.start_offset and scan.lines:
+        prefix_end = scan.lines[0][0]
+        prefix = twill_cursor.scan_lines(path, 0)
+        for source_line, line in prefix.lines:
+            if source_line >= prefix_end:
+                break
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if isinstance(record, dict):
+                session_id = _session_id(record, session_id)
+                parser.parse_line(line, source_line)
+
+    session_id = parser.session_id or session_id
+    normalized_events = []
+    invalid_lines = 0
+    for source_line, line in scan.lines:
+        if not line.strip():
+            continue
+        try:
+            record = json.loads(line)
+        except json.JSONDecodeError:
+            invalid_lines += 1
+            continue
+        if not isinstance(record, dict):
+            invalid_lines += 1
+            continue
+        session_id = _session_id(record, session_id)
+        normalized_events.extend(parser.parse_line(line, source_line))
+
+    session_id = parser.session_id or session_id
+    events = tuple(
+        TranscriptEvent(
+            session_id=event.session_id or session_id,
+            timestamp=event.timestamp or datetime.now(timezone.utc).isoformat(),
+            kind=event.kind,
+            text=event.text,
+            source_line=event.source_line,
+            event_index=event.event_index,
+            cwd=event.cwd,
+        )
+        for event in normalized_events
+    )
+    return SessionData(path, session_id, source_kind, events), invalid_lines
+
+
 def parse_scan(
     path: Path, scan: twill_cursor.LineScan, fallback_session_id: str
 ) -> tuple[SessionData, int]:
@@ -197,10 +256,13 @@ def parse_scan(
     Returns the session data and the number of complete, non-blank lines in
     the region that did not yield a JSON object — one half of the cursor's
     ``parse_errors`` input; the torn tail :class:`LineScan` already carries
-    is the other.  Parsing is stateless per line, so a resumed region's
-    events compose with the base parse's (the pairing state the detector
-    reader keeps lives in ``twill_reader`` and is not on this path).
+    is the other.  Codex parsing replays the committed prefix to restore its
+    stateful call and correction tracking before consuming the resumed span.
     """
+
+    source_kind = _source_kind(path)
+    if source_kind == "codex":
+        return _parse_codex_scan(path, scan, fallback_session_id, source_kind)
 
     events: list[TranscriptEvent] = []
     session_id = fallback_session_id
@@ -237,7 +299,7 @@ def parse_scan(
                     cwd=cwd_text,
                 )
             )
-    return SessionData(path, session_id, _source_kind(path), tuple(events)), invalid_lines
+    return SessionData(path, session_id, source_kind, tuple(events)), invalid_lines
 
 
 def read_session(path: Path) -> SessionData:
