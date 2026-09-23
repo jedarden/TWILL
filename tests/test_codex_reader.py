@@ -241,6 +241,60 @@ class CodexReaderTests(unittest.TestCase):
         self.assertEqual(parser.usage[1].cache_read_tokens, 1)
         self.assertEqual(parser.usage[1].total_tokens, 8)
 
+    def test_token_counter_reset_uses_full_current_snapshot(self):
+        parser = CodexRolloutLineParser()
+        parser.parse_line(
+            record(
+                "event_msg",
+                {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 20,
+                            "output_tokens": 10,
+                            "cached_input_tokens": 8,
+                            "cache_write_input_tokens": 6,
+                            "reasoning_output_tokens": 9,
+                            "total_tokens": 40,
+                        },
+                        "model_context_window": 272000,
+                    },
+                },
+            ),
+            1,
+        )
+        reset_snapshot = {
+            "input_tokens": 3,
+            "output_tokens": 1,
+            "cached_input_tokens": 2,
+            "cache_write_input_tokens": 4,
+            "reasoning_output_tokens": 5,
+            "total_tokens": 7,
+        }
+        for line_number in (2, 3):
+            parser.parse_line(
+                record(
+                    "token_usage_record",
+                    {
+                        "thread_token_usage": reset_snapshot,
+                        "model_context_window": 272000,
+                    },
+                ),
+                line_number,
+            )
+
+        self.assertEqual(len(parser.usage), 2)
+        reset = parser.usage[1]
+        self.assertEqual(reset.source_line, 2)
+        self.assertEqual(reset.event_index, 0)
+        self.assertEqual(reset.input_tokens, 3)
+        self.assertEqual(reset.output_tokens, 1)
+        self.assertEqual(reset.cache_read_tokens, 2)
+        self.assertEqual(reset.cache_write_tokens, 4)
+        self.assertEqual(reset.reasoning_output_tokens, 5)
+        self.assertEqual(reset.total_tokens, 7)
+        self.assertEqual(reset.model_context_window, 272000)
+
     def test_file_iteration_skips_truncated_line_and_flushes_unresolved_run(self):
         with tempfile.TemporaryDirectory() as directory:
             path = Path(directory) / "rollout.jsonl"
