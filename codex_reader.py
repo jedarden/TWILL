@@ -17,10 +17,11 @@ events; each row contains the delta since the previous cumulative snapshot.
 from __future__ import annotations
 
 import json
+import os
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Iterator
+from typing import BinaryIO, Iterator
 
 
 KIND_RUN = "run"
@@ -69,6 +70,7 @@ _EXEC_NAMES = frozenset({"exec", "exec_command", "shell", "bash", "run"})
 _READ_NAMES = frozenset({"read", "read_file", "readfile", "cat"})
 _CALL_TYPES = frozenset({"custom_tool_call", "function_call"})
 _OUTPUT_TYPES = frozenset({"custom_tool_call_output", "function_call_output"})
+_READ_CHUNK_BYTES = 1 << 20
 _REJECTION_EVENT_TYPES = frozenset(
     {"tool_call_rejected", "tool_rejected", "approval_rejected"}
 )
@@ -117,11 +119,13 @@ class TokenUsage:
 
 @dataclass(frozen=True)
 class ParseResult:
-    """All normalized output from one rollout file."""
+    """Normalized output and byte progress from one rollout parse span."""
 
     session_id: str | None
     events: tuple[NormalizedEvent, ...]
     usage: tuple[TokenUsage, ...]
+    next_offset: int = field(default=0, compare=False)
+    bytes_consumed: int = field(default=0, compare=False)
 
 
 @dataclass(frozen=True)
@@ -523,6 +527,66 @@ class CodexRolloutLineParser:
 CodexLineParser = CodexRolloutLineParser
 
 
+class CodexRolloutReader:
+    """Retain parser state while reading successive rollout spans."""
+
+    def __init__(self) -> None:
+        self._line_parser = CodexRolloutLineParser()
+        self._next_offset = 0
+        self._next_source_line = 1
+
+    @property
+    def session_id(self) -> str | None:
+        return self._line_parser.session_id
+
+    def parse(self, path: Path, last_offset: int = 0) -> ParseResult:
+        """Parse complete lines from ``last_offset`` without finalizing state."""
+
+        if last_offset < 0:
+            raise ValueError(f"parse start offset must be nonnegative: {last_offset}")
+
+        events: list[NormalizedEvent] = []
+        usage_offset = len(self._line_parser._usage)
+        with path.open("rb") as handle:
+            size = os.fstat(handle.fileno()).st_size
+            if last_offset > size:
+                raise ValueError(
+                    f"parse start {last_offset} is past end of file {path} ({size})"
+                )
+            if last_offset == self._next_offset:
+                source_line = self._next_source_line
+            else:
+                source_line = _count_newlines(handle, last_offset) + 1
+            handle.seek(last_offset)
+            bytes_consumed = 0
+            for raw_line in handle:
+                if not raw_line.endswith(b"\n"):
+                    break
+                bytes_consumed += len(raw_line)
+                events.extend(
+                    self._line_parser.parse_line(
+                        raw_line.decode("utf-8", errors="replace"), source_line
+                    )
+                )
+                source_line += 1
+
+        next_offset = last_offset + bytes_consumed
+        self._next_offset = next_offset
+        self._next_source_line = source_line
+        return ParseResult(
+            session_id=self._line_parser.session_id,
+            events=tuple(events),
+            usage=tuple(self._line_parser._usage[usage_offset:]),
+            next_offset=next_offset,
+            bytes_consumed=bytes_consumed,
+        )
+
+    def finish(self) -> list[NormalizedEvent]:
+        """Finalize unresolved calls at the end of the rollout."""
+
+        return self._line_parser.finish()
+
+
 def _first_string(*values: object) -> str | None:
     for value in values:
         if isinstance(value, str) and value:
@@ -660,35 +724,50 @@ def _usage_counters(snapshot: dict[str, object]) -> dict[str, int]:
     return counters
 
 
-def _parse_file(path: Path) -> tuple[CodexRolloutLineParser, list[NormalizedEvent]]:
-    parser = CodexRolloutLineParser()
-    events: list[NormalizedEvent] = []
-    with path.open("r", encoding="utf-8", errors="replace") as handle:
-        for source_line, line in enumerate(handle, start=1):
-            events.extend(parser.parse_line(line, source_line))
-    events.extend(parser.finish())
-    return parser, events
+def _count_newlines(handle: BinaryIO, limit: int) -> int:
+    count = 0
+    remaining = limit
+    while remaining > 0:
+        chunk = handle.read(min(_READ_CHUNK_BYTES, remaining))
+        if not chunk:
+            break
+        count += chunk.count(b"\n")
+        remaining -= len(chunk)
+    return count
 
 
-def parse_rollout(path: Path) -> ParseResult:
-    """Parse one rollout into normalized events and usage deltas."""
+def parse_rollout(
+    path: Path,
+    last_offset: int = 0,
+    *,
+    reader: CodexRolloutReader | None = None,
+) -> ParseResult:
+    """Parse one rollout span, finalizing it unless a retained reader is given."""
 
-    parser, events = _parse_file(path)
-    return ParseResult(parser.session_id, tuple(events), parser.usage)
+    retained_reader = reader is not None
+    rollout_reader = reader or CodexRolloutReader()
+    result = rollout_reader.parse(path, last_offset)
+    if retained_reader:
+        return result
+    return ParseResult(
+        session_id=result.session_id,
+        events=result.events + tuple(rollout_reader.finish()),
+        usage=result.usage,
+        next_offset=result.next_offset,
+        bytes_consumed=result.bytes_consumed,
+    )
 
 
 def iter_events(path: Path) -> Iterator[NormalizedEvent]:
     """Yield normalized detector events from a Codex rollout."""
 
-    _parser, events = _parse_file(path)
-    yield from events
+    yield from parse_rollout(path).events
 
 
 def iter_usage(path: Path) -> Iterator[TokenUsage]:
     """Yield positive token deltas from cumulative rollout snapshots."""
 
-    parser, _events = _parse_file(path)
-    yield from parser.usage
+    yield from parse_rollout(path).usage
 
 
 if __name__ == "__main__":  # pragma: no cover

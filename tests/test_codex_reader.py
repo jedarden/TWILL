@@ -6,6 +6,7 @@ from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
+FIXTURE_ROOT = ROOT / "tests" / "fixtures" / "transcripts" / "codex"
 sys.path.insert(0, str(ROOT))
 
 from codex_reader import (  # noqa: E402
@@ -16,6 +17,7 @@ from codex_reader import (  # noqa: E402
     KIND_TOOL_REJECTED,
     KIND_USER_TURN_AFTER_CORRECTION,
     CodexRolloutLineParser,
+    CodexRolloutReader,
     iter_events,
     parse_rollout,
 )
@@ -283,6 +285,159 @@ class CodexReaderTests(unittest.TestCase):
             result = parse_rollout(path)
             self.assertEqual(result.events, ())
             self.assertEqual(result.usage[0].total_tokens, 3)
+            self.assertEqual(result.next_offset, path.stat().st_size)
+            self.assertEqual(result.bytes_consumed, path.stat().st_size)
+
+    def test_appended_fixture_resume_matches_whole_file_event_stream(self):
+        base = FIXTURE_ROOT / "appended-between-runs" / "base.jsonl"
+        append = FIXTURE_ROOT / "appended-between-runs" / "append.jsonl"
+        base_bytes = base.read_bytes()
+        append_bytes = append.read_bytes()
+        split = append_bytes.index(b"\n") // 2
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            path.write_bytes(base_bytes)
+            reader = CodexRolloutReader()
+            first = parse_rollout(path, reader=reader)
+            self.assertEqual(first.next_offset, len(base_bytes))
+            self.assertEqual(first.bytes_consumed, len(base_bytes))
+
+            with path.open("ab") as handle:
+                handle.write(append_bytes[:split])
+            torn = parse_rollout(path, first.next_offset, reader=reader)
+            self.assertEqual(torn.next_offset, first.next_offset)
+            self.assertEqual(torn.bytes_consumed, 0)
+
+            with path.open("ab") as handle:
+                handle.write(append_bytes[split:])
+            resumed = parse_rollout(path, torn.next_offset, reader=reader)
+            final_events = resumed.events + tuple(reader.finish())
+            whole = parse_rollout(path)
+
+            self.assertEqual(resumed.next_offset, path.stat().st_size)
+            self.assertEqual(resumed.bytes_consumed, len(append_bytes))
+            self.assertEqual(resumed.session_id, whole.session_id)
+            self.assertEqual(final_events, whole.events)
+            self.assertEqual(first.usage + resumed.usage, whole.usage)
+
+    def test_resume_preserves_pending_call_and_usage_state(self):
+        lines = [
+            record(
+                "session_meta",
+                {"session_id": "codex-resume-001", "cwd": "/workspace/demo"},
+            ),
+            record(
+                "response_item",
+                {
+                    "type": "custom_tool_call",
+                    "call_id": "run-1",
+                    "name": "exec",
+                    "input": "pytest -q",
+                },
+            ),
+            record(
+                "event_msg",
+                {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 10,
+                            "output_tokens": 4,
+                            "total_tokens": 14,
+                        }
+                    },
+                },
+            ),
+            record(
+                "event_msg",
+                {
+                    "type": "token_count",
+                    "info": {
+                        "total_token_usage": {
+                            "input_tokens": 15,
+                            "output_tokens": 7,
+                            "total_tokens": 22,
+                        }
+                    },
+                },
+            ),
+            record(
+                "response_item",
+                {
+                    "type": "custom_tool_call_output",
+                    "call_id": "run-1",
+                    "output": "Process exited with code 0",
+                },
+            ),
+            record("event_msg", {"type": "turn_aborted"}),
+            record(
+                "response_item",
+                {
+                    "type": "message",
+                    "role": "user",
+                    "content": [{"type": "input_text", "text": "resume safely"}],
+                },
+            ),
+        ]
+        encoded = [line.encode("utf-8") + b"\n" for line in lines]
+        base_size = sum(len(line) for line in encoded[:3])
+        partial_size = len(encoded[3]) // 2
+
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "rollout.jsonl"
+            path.write_bytes(b"".join(encoded[:3]) + encoded[3][:partial_size])
+            reader = CodexRolloutReader()
+            first = parse_rollout(path, reader=reader)
+
+            self.assertEqual(first.next_offset, base_size)
+            self.assertEqual(first.bytes_consumed, base_size)
+            self.assertEqual(first.events, ())
+            self.assertEqual(first.usage[0].input_tokens, 10)
+            self.assertEqual(first.usage[0].output_tokens, 4)
+            self.assertEqual(first.usage[0].total_tokens, 14)
+
+            with path.open("ab") as handle:
+                handle.write(encoded[3][partial_size:])
+            second = parse_rollout(path, first.next_offset, reader=reader)
+            self.assertEqual(second.next_offset, base_size + len(encoded[3]))
+            self.assertEqual(second.usage[0].input_tokens, 5)
+            self.assertEqual(second.usage[0].output_tokens, 3)
+            self.assertEqual(second.usage[0].total_tokens, 8)
+
+            with path.open("ab") as handle:
+                handle.write(b"".join(encoded[4:6]))
+            third = parse_rollout(path, second.next_offset, reader=reader)
+            self.assertEqual(
+                [event.kind for event in third.events],
+                [KIND_RUN, KIND_INTERRUPT],
+            )
+            self.assertEqual(third.events[0].source_line, 2)
+            self.assertEqual(third.events[0].exit_code, 0)
+            self.assertEqual(third.events[1].source_line, 6)
+
+            with path.open("ab") as handle:
+                handle.write(encoded[6])
+            fourth = parse_rollout(path, third.next_offset, reader=reader)
+            self.assertEqual(
+                [event.kind for event in fourth.events],
+                [KIND_USER_TURN_AFTER_CORRECTION],
+            )
+            self.assertEqual(fourth.events[0].source_line, 7)
+            self.assertEqual(fourth.next_offset, path.stat().st_size)
+            self.assertEqual(reader.finish(), [])
+
+            resumed_events = (
+                first.events
+                + second.events
+                + third.events
+                + fourth.events
+            )
+            resumed_usage = first.usage + second.usage + third.usage + fourth.usage
+            whole = parse_rollout(path)
+            self.assertEqual(resumed_events, whole.events)
+            self.assertEqual(resumed_usage, whole.usage)
+            self.assertEqual(reader.session_id, whole.session_id)
 
 
 if __name__ == "__main__":
