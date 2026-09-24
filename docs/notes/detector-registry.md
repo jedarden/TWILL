@@ -125,6 +125,17 @@ normalized text as `key`. `sessions` counts distinct session ids, while `events`
 `last_seen` descending, then key ascending. The registry keeps `cluster.score` at zero; Phase 3's
 ranker owns the global score built from these fields.
 
+## D-09@1: unread rule document
+
+D-09 emits one cluster for each live indexed rule document whose newest `last_read_by_agent` value
+for its content hash is missing or earlier than the active window start and which has no matching
+`file_read` observation in the window. Reading either live copy of identical content marks that content
+read; stale rows are excluded because they are retained only for coverage and corpus diagnosis. The key
+is `unread-rule-doc:<path>`. `sessions` and `events` are zero because the finding has no contributing
+observations, and `first_seen` and `last_seen` use the row's `indexed_at` timestamp. Output is ordered
+by `indexed_at` descending, then key ascending. D-09 feeds rule decay and deletion review rather than
+the new-lesson path.
+
 ## Adding or changing a detector
 
 To add one (the D-01 … D-10 beads): append a `Detector` to

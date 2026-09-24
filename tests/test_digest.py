@@ -330,6 +330,25 @@ class DigestDiffTests(DigestStateCase):
         self.assertIn("no state database", twill_digest.render_text(report))
         self.assertTrue(report.warnings)
 
+    def test_default_registry_replays_rule_documents_for_d09(self):
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, last_read_by_agent, stale) "
+            "VALUES ('/rules/old.md', 'memory', 'sha-old', ?, NULL, 0)",
+            (IN_WEEK.isoformat(),),
+        )
+        self.connection.commit()
+
+        report = twill_digest.build_digest(self.state, SUBJECT)
+
+        d09 = next(
+            detector for detector in report.detectors if detector.detector_id == "D-09"
+        )
+        self.assertEqual(d09.current_status, "ok")
+        self.assertEqual(d09.current_clusters, 1)
+        self.assertEqual(d09.previous_status, "ok")
+        self.assertEqual(d09.previous_clusters, 1)
+        self.assertEqual(report.findings, ())
+
     def test_detector_failure_is_visible_and_not_clean(self):
         detector = twill_digest.Detector(
             "D-99",

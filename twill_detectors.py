@@ -402,11 +402,48 @@ RECURRING_ERROR_SIGNATURE = Detector(
     RECURRING_ERROR_SIGNATURE_WEEK_HIT_SQL,
 )
 
+
+UNREAD_RULE_DOC_SQL = """
+    WITH read_state AS (
+        SELECT sha, max(last_read_by_agent) AS last_read
+        FROM rule_doc
+        GROUP BY sha
+    )
+    SELECT 'unread-rule-doc:' || d.path AS key,
+           0 AS sessions,
+           0 AS events,
+           d.indexed_at AS first_seen,
+           d.indexed_at AS last_seen
+    FROM rule_doc AS d
+    JOIN read_state AS r ON r.sha = d.sha
+    WHERE d.stale = 0
+      AND d.path IS NOT NULL
+      AND trim(d.path) <> ''
+      AND (r.last_read IS NULL OR r.last_read < :window_start_utc)
+      AND NOT EXISTS (
+          SELECT 1
+          FROM observation AS o
+          JOIN rule_doc AS read_doc ON read_doc.path = o.path
+          WHERE read_doc.sha = d.sha
+            AND o.kind = 'file_read'
+            AND o.ts_utc >= :window_start_utc
+      )
+    ORDER BY d.indexed_at DESC, key ASC
+"""
+
+UNREAD_RULE_DOC = Detector(
+    "D-09",
+    1,
+    "live rule documents not read within the active trailing window",
+    UNREAD_RULE_DOC_SQL,
+)
+
+
 # The shipped catalog.  Phase 2's detector beads (D-01 missing binary, D-02
 # recurring error signature, ... D-10 ICG gate gap) append their entries here;
 # an entry leaves this tuple when its successor version lands.
 REGISTRY: tuple[Detector, ...] = build_registry(
-    MISSING_BINARY, RECURRING_ERROR_SIGNATURE
+    MISSING_BINARY, RECURRING_ERROR_SIGNATURE, UNREAD_RULE_DOC
 )
 
 

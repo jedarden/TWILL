@@ -236,7 +236,26 @@ def _read_window(
                 (start, end),
             ),
         )
+        rule_columns = tuple(
+            (str(row[1]), str(row[2] or "TEXT"))
+            for row in source.execute("PRAGMA table_info(rule_doc)")
+        )
+        if rule_columns:
+            rule_quoted_columns = ", ".join(
+                '"' + name.replace('"', '""') + '"' for name, _ in rule_columns
+            )
+            rule_declarations = ", ".join(
+                '"' + name.replace('"', '""') + '" ' + declaration
+                for name, declaration in rule_columns
+            )
+            rule_placeholders = ", ".join("?" for _ in rule_columns)
+            memory.execute(f"CREATE TABLE rule_doc ({rule_declarations})")
+            memory.executemany(
+                f"INSERT INTO rule_doc ({rule_quoted_columns}) VALUES ({rule_placeholders})",
+                source.execute(f"SELECT {rule_quoted_columns} FROM rule_doc"),
+            )
         memory.execute("PRAGMA query_only = ON")
+
         results: list[_DetectorWindow] = []
         for detector in detectors:
             try:

@@ -174,6 +174,23 @@ class CoverageTestCase(unittest.TestCase):
         self.assertEqual(report.ranking.clusters, ())
         self.assertEqual(self.cluster("command-not-found:sqlite3")[1], "drafted")
 
+    def test_zero_session_rule_document_finding_is_not_a_new_candidate(self):
+        self.add_cluster(
+            "unread-rule-doc:/rules/old.md",
+            detector_id="D-09",
+            sessions=0,
+        )
+
+        report = twill_ranker.run_rank(self.connection, [self.pattern])
+
+        self.assertEqual(report.ranking.clusters, ())
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT state, covered_by FROM cluster WHERE detector_id = 'D-09'"
+            ).fetchone(),
+            ("open", None),
+        )
+
     def test_refresh_is_idempotent(self):
         self.add_cluster("command-not-found:sqlite3")
 

@@ -128,7 +128,11 @@ class RankedCluster:
 
     @property
     def new_lesson_candidate(self) -> bool:
-        return self.state == "open" and self.covered_by is None
+        return (
+            self.state == "open"
+            and self.covered_by is None
+            and self.sessions > 0
+        )
 
     @property
     def escalation_candidate(self) -> bool:

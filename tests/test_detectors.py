@@ -1058,6 +1058,142 @@ class RecurringErrorSignatureDetectorTests(unittest.TestCase):
         self.assertEqual([row[0] for row in ordered], ["shared failure", "tool failure"])
 
 
+class UnreadRuleDocDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def seed_rule_doc(
+        self,
+        path: str,
+        sha: str,
+        indexed_at: str,
+        *,
+        last_read: str | None = None,
+        stale: int = 0,
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, last_read_by_agent, stale) "
+            "VALUES (?, 'memory', ?, ?, ?, ?)",
+            (path, sha, indexed_at, last_read, stale),
+        )
+        self.connection.commit()
+
+    def test_d09_reports_live_documents_without_recent_reads(self):
+        self.seed_rule_doc(
+            "/rules/new.md",
+            "sha-new",
+            "2026-09-20T00:00:00+00:00",
+        )
+        self.seed_rule_doc(
+            "/rules/old.md",
+            "sha-old",
+            "2026-08-01T00:00:00+00:00",
+            last_read="2026-08-15T00:00:00+00:00",
+        )
+        self.seed_rule_doc(
+            "/rules/recent.md",
+            "sha-recent",
+            "2026-09-21T00:00:00+00:00",
+            last_read="2026-09-23T00:00:00+00:00",
+        )
+        self.seed_rule_doc(
+            "/rules/observed.md",
+            "sha-observed",
+            "2026-09-20T12:00:00+00:00",
+        )
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
+            "VALUES ('s-read', ?, ?, 'file_read', '/rules/observed.md')",
+            (
+                "2026-09-23T00:00:00+00:00",
+                "2026-09-23T00:00:00+00:00",
+            ),
+        )
+        self.connection.commit()
+        self.seed_rule_doc(
+            "/rules/shared-read.md",
+            "sha-shared",
+            "2026-09-19T00:00:00+00:00",
+        )
+        self.seed_rule_doc(
+            "/rules/shared-copy.md",
+            "sha-shared",
+            "2026-09-18T00:00:00+00:00",
+            last_read="2026-09-23T00:00:00+00:00",
+        )
+        self.seed_rule_doc(
+            "/rules/stale.md",
+            "sha-stale",
+            "2026-09-22T00:00:00+00:00",
+            stale=1,
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.UNREAD_RULE_DOC,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-09@1", "ok", 2)],
+        )
+        rows = cluster_rows(self.connection, "D-09")
+        self.assertEqual(
+            [row[1] for row in rows],
+            [
+                "unread-rule-doc:/rules/new.md",
+                "unread-rule-doc:/rules/old.md",
+            ],
+        )
+        self.assertEqual([(row[3], row[4]) for row in rows], [(0, 0), (0, 0)])
+        self.assertEqual(
+            [(row[5], row[6]) for row in rows],
+            [
+                ("2026-09-20T00:00:00+00:00", "2026-09-20T00:00:00+00:00"),
+                ("2026-08-01T00:00:00+00:00", "2026-08-01T00:00:00+00:00"),
+            ],
+        )
+
+    def test_d09_uses_the_window_boundary_and_live_content_identity(self):
+        window_start = "2026-09-01T00:00:00+00:00"
+        self.seed_rule_doc(
+            "/rules/at-boundary.md",
+            "sha-boundary",
+            "2026-08-01T00:00:00+00:00",
+            last_read=window_start,
+        )
+        self.seed_rule_doc(
+            "/rules/before-boundary.md",
+            "sha-before",
+            "2026-08-01T00:00:00+00:00",
+            last_read="2026-08-31T23:59:59+00:00",
+        )
+        self.seed_rule_doc(
+            "/rules/never-read.md",
+            "sha-never",
+            "2026-08-01T00:00:00+00:00",
+        )
+
+        rows = self.connection.execute(
+            twill_detectors.UNREAD_RULE_DOC_SQL,
+            {"window_start_utc": window_start, "window_days": 30},
+        ).fetchall()
+
+        self.assertEqual(
+            [row[0] for row in rows],
+            [
+                "unread-rule-doc:/rules/before-boundary.md",
+                "unread-rule-doc:/rules/never-read.md",
+            ],
+        )
+
+
 class DetectCommandTests(unittest.TestCase):
     """The ``twill detect`` verb surface (§14) over the registry runner."""
 
@@ -1227,6 +1363,14 @@ class DetectCliTests(unittest.TestCase):
                         "clusters": 0,
                         "error": None,
                     },
+                    {
+                        "detector_id": "D-09",
+                        "version": 1,
+                        "full_id": "D-09@1",
+                        "status": "ok",
+                        "clusters": 0,
+                        "error": None,
+                    },
                 ],
             )
             self.assertEqual(envelope["data"]["window_days"], 30)
@@ -1237,6 +1381,7 @@ class DetectCliTests(unittest.TestCase):
             self.assertEqual(human.returncode, 0, human.stderr)
             self.assertIn("D-01@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-02@1: 0 cluster(s)", human.stdout)
+            self.assertIn("D-09@1: 0 cluster(s)", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):
         with tempfile.TemporaryDirectory() as directory:

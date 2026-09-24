@@ -565,6 +565,15 @@ and `tool_error` observations with a non-empty `signature` and `sig_hash`, group
 `last_seen` descending, with `key` as a deterministic tie-breaker. Persisted clusters retain
 `score = 0.0`; the Phase 3 ranker consumes these counts and timestamps for global ranking.
 
+**D-09@1 decision (2026-09-24):** D-09 emits one cluster for each live indexed rule document whose
+newest `last_read_by_agent` value for its content hash is missing or earlier than the trailing-window
+start and which has no matching `file_read` observation in the window. Reading either copy of identical
+content marks that content read, and stale rows are excluded. The key is `unread-rule-doc:<path>`;
+`sessions` and `events` are zero because an unread document has no contributing observations, while
+`first_seen` and `last_seen` use its indexed timestamp. Output is ordered by newest indexed document
+first and then key, making the rule-decay report deterministic. D-09 is a rule-corpus finding for the
+decay report, not evidence for a new operational lesson.
+
 
 **Digest shape, from the first version:** every line carries the exact command that re-derives it;
 the report is a week-over-week diff (new / worsening / improving / gone) rather than a standing top
