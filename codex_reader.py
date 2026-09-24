@@ -126,6 +126,7 @@ class ParseResult:
     usage: tuple[TokenUsage, ...]
     next_offset: int = field(default=0, compare=False)
     bytes_consumed: int = field(default=0, compare=False)
+    usage_max: tuple[TokenUsage, ...] = field(default=(), compare=False)
 
 
 @dataclass(frozen=True)
@@ -151,6 +152,14 @@ class CodexRolloutLineParser:
         self._awaiting_correction = False
         self._last_usage: dict[str, int] = {}
         self._usage: list[TokenUsage] = []
+        self._max_usage: dict[str, int] = {}
+        self._max_usage_context: dict[str, object] = {}
+        self._usage_keys: set[str] = set()
+        self._message_ids: set[str] = set()
+        self._max_cost_usd: float | None = None
+        self._model: str | None = None
+        self._first_timestamp: str | None = None
+        self._last_timestamp: str | None = None
 
     @property
     def usage(self) -> tuple[TokenUsage, ...]:
@@ -163,6 +172,64 @@ class CodexRolloutLineParser:
     @property
     def usage_deltas(self) -> tuple[TokenUsage, ...]:
         return self.usage
+
+    @property
+    def usage_max(self) -> tuple[TokenUsage, ...]:
+        """One row containing the component-wise maximum cumulative snapshot."""
+
+        if not self._max_usage:
+            return ()
+        context = self._max_usage_context
+        window = context.get("model_context_window")
+        return (
+            TokenUsage(
+                source_line=int(context.get("source_line", 1)),
+                event_index=0,
+                timestamp=context.get("timestamp"),
+                session_id=context.get("session_id"),
+                input_tokens=self._max_usage.get("input_tokens", 0),
+                output_tokens=self._max_usage.get("output_tokens", 0),
+                cache_read_tokens=self._max_usage.get("cache_read_tokens", 0),
+                cache_write_tokens=self._max_usage.get("cache_write_tokens", 0),
+                reasoning_output_tokens=self._max_usage.get(
+                    "reasoning_output_tokens", 0
+                ),
+                total_tokens=self._max_usage.get("total_tokens", 0),
+                model_context_window=window if isinstance(window, int) else None,
+            ),
+        )
+
+    @property
+    def cumulative_usage(self) -> tuple[TokenUsage, ...]:
+        return self.usage_max
+
+    @property
+    def max_usage(self) -> tuple[TokenUsage, ...]:
+        return self.usage_max
+
+    @property
+    def message_count(self) -> int:
+        return len(self._message_ids or self._usage_keys)
+
+    @property
+    def model(self) -> str | None:
+        return self._model
+
+    @property
+    def cost_usd(self) -> float | None:
+        return self._max_cost_usd
+
+    @property
+    def total_cost_usd(self) -> float | None:
+        return self._max_cost_usd
+
+    @property
+    def first_timestamp(self) -> str | None:
+        return self._first_timestamp
+
+    @property
+    def last_timestamp(self) -> str | None:
+        return self._last_timestamp
 
     def parse_line(self, line: str, source_line: int) -> list[NormalizedEvent]:
         """Parse one complete JSONL line, returning zero or more events."""
@@ -190,12 +257,14 @@ class CodexRolloutLineParser:
         if record_type == "event_msg":
             return self._parse_event_message(payload_dict, source_line, context)
         if record_type == "token_usage_record":
+            self._consume_cost(payload_dict)
             self._consume_usage_snapshot(
                 payload_dict.get("thread_token_usage")
                 or payload_dict.get("usage"),
                 payload_dict.get("model_context_window"),
                 source_line,
                 context,
+                _usage_key(payload_dict, source_line),
             )
         return []
 
@@ -224,6 +293,16 @@ class CodexRolloutLineParser:
         if cwd:
             self.cwd = cwd
 
+        model = _first_string(record.get("model"), payload.get("model"))
+        if model:
+            self._model = model
+
+        timestamp = _first_string(record.get("timestamp"), payload.get("timestamp"))
+        if timestamp:
+            if self._first_timestamp is None:
+                self._first_timestamp = timestamp
+            self._last_timestamp = timestamp
+
     def _context(
         self, record: dict[str, object], payload: dict[str, object]
     ) -> dict[str, object]:
@@ -248,6 +327,11 @@ class CodexRolloutLineParser:
         context: dict[str, object],
     ) -> list[NormalizedEvent]:
         payload_type = payload.get("type")
+        if payload_type == "message" and payload.get("role") == "assistant":
+            message_id = _first_string(
+                payload.get("id"), payload.get("message_id"), payload.get("response_id")
+            )
+            self._message_ids.add(message_id or f"line:{source_line}")
         if payload_type in _CALL_TYPES:
             return self._register_call(payload, source_line, context)
         if payload_type in _OUTPUT_TYPES:
@@ -274,11 +358,14 @@ class CodexRolloutLineParser:
             info = payload.get("info")
             info_dict = info if isinstance(info, dict) else {}
             total = info_dict.get("total_token_usage")
+            self._consume_cost(info_dict)
+            self._consume_cost(payload)
             self._consume_usage_snapshot(
                 total,
                 info_dict.get("model_context_window"),
                 source_line,
                 context,
+                _usage_key(payload, source_line),
             )
             return []
 
@@ -437,18 +524,50 @@ class CodexRolloutLineParser:
                 break
         return events
 
+    def _consume_cost(self, value: dict[str, object]) -> None:
+        cost = _first_nonnegative_float(
+            value,
+            (
+                "cost_usd",
+                "costUSD",
+                "cost",
+                "total_cost_usd",
+                "totalCostUSD",
+                "total_cost",
+                "totalCost",
+            ),
+        )
+        if cost is not None:
+            self._max_cost_usd = max(self._max_cost_usd or 0.0, cost)
+
     def _consume_usage_snapshot(
         self,
         snapshot: object,
         model_context_window: object,
         source_line: int,
         context: dict[str, object],
+        usage_key: str,
     ) -> None:
         if not isinstance(snapshot, dict):
             return
+        self._consume_cost(snapshot)
         current = _usage_counters(snapshot)
         if not current:
             return
+
+        improved = any(
+            value > self._max_usage.get(key, 0) for key, value in current.items()
+        )
+        for key, value in current.items():
+            self._max_usage[key] = max(self._max_usage.get(key, 0), value)
+        if improved or not self._max_usage_context:
+            self._max_usage_context = {
+                "source_line": source_line,
+                "timestamp": context.get("timestamp"),
+                "session_id": context.get("session_id"),
+                "model_context_window": model_context_window,
+            }
+        self._usage_keys.add(usage_key)
 
         deltas: dict[str, int] = {}
         for key, value in current.items():
@@ -539,19 +658,52 @@ class CodexRolloutReader:
     def session_id(self) -> str | None:
         return self._line_parser.session_id
 
-    def parse(self, path: Path, last_offset: int = 0) -> ParseResult:
+    @property
+    def usage_max(self) -> tuple[TokenUsage, ...]:
+        return self._line_parser.usage_max
+
+    @property
+    def message_count(self) -> int:
+        return self._line_parser.message_count
+
+    @property
+    def model(self) -> str | None:
+        return self._line_parser.model
+
+    @property
+    def cost_usd(self) -> float | None:
+        return self._line_parser.cost_usd
+
+    @property
+    def first_timestamp(self) -> str | None:
+        return self._line_parser.first_timestamp
+
+    @property
+    def last_timestamp(self) -> str | None:
+        return self._line_parser.last_timestamp
+
+    def parse(
+        self,
+        path: Path,
+        last_offset: int = 0,
+        *,
+        end_offset: int | None = None,
+    ) -> ParseResult:
         """Parse complete lines from ``last_offset`` without finalizing state."""
 
         if last_offset < 0:
             raise ValueError(f"parse start offset must be nonnegative: {last_offset}")
+        if end_offset is not None and end_offset < last_offset:
+            raise ValueError("parse end offset must not precede its start offset")
 
         events: list[NormalizedEvent] = []
         usage_offset = len(self._line_parser._usage)
         with path.open("rb") as handle:
             size = os.fstat(handle.fileno()).st_size
-            if last_offset > size:
+            limit = size if end_offset is None else min(size, end_offset)
+            if last_offset > limit:
                 raise ValueError(
-                    f"parse start {last_offset} is past end of file {path} ({size})"
+                    f"parse start {last_offset} is past end of file {path} ({limit})"
                 )
             if last_offset == self._next_offset:
                 source_line = self._next_source_line
@@ -561,6 +713,8 @@ class CodexRolloutReader:
             bytes_consumed = 0
             for raw_line in handle:
                 if not raw_line.endswith(b"\n"):
+                    break
+                if end_offset is not None and last_offset + bytes_consumed + len(raw_line) > end_offset:
                     break
                 bytes_consumed += len(raw_line)
                 events.extend(
@@ -579,6 +733,7 @@ class CodexRolloutReader:
             usage=tuple(self._line_parser._usage[usage_offset:]),
             next_offset=next_offset,
             bytes_consumed=bytes_consumed,
+            usage_max=self._line_parser.usage_max,
         )
 
     def finish(self) -> list[NormalizedEvent]:
@@ -705,14 +860,47 @@ def _looks_like_error(text: str) -> bool:
     )
 
 
+def _first_nonnegative_float(
+    value: dict[str, object], keys: tuple[str, ...]
+) -> float | None:
+    for key in keys:
+        candidate = value.get(key)
+        if (
+            isinstance(candidate, (int, float))
+            and not isinstance(candidate, bool)
+            and candidate >= 0
+        ):
+            return float(candidate)
+    return None
+
+
+def _usage_key(payload: dict[str, object], source_line: int) -> str:
+    value = _first_string(
+        payload.get("response_id"),
+        payload.get("responseId"),
+        payload.get("turn_id"),
+        payload.get("turnId"),
+        payload.get("id"),
+    )
+    return value or f"line:{source_line}"
+
+
 def _usage_counters(snapshot: dict[str, object]) -> dict[str, int]:
     aliases = {
-        "input_tokens": ("input_tokens",),
-        "output_tokens": ("output_tokens",),
-        "cache_read_tokens": ("cache_read_tokens", "cached_input_tokens"),
-        "cache_write_tokens": ("cache_write_tokens", "cache_write_input_tokens"),
-        "reasoning_output_tokens": ("reasoning_output_tokens",),
-        "total_tokens": ("total_tokens",),
+        "input_tokens": ("input_tokens", "inputTokens"),
+        "output_tokens": ("output_tokens", "outputTokens"),
+        "cache_read_tokens": (
+            "cache_read_tokens",
+            "cached_input_tokens",
+            "cache_read_input_tokens",
+        ),
+        "cache_write_tokens": (
+            "cache_write_tokens",
+            "cache_write_input_tokens",
+            "cache_creation_input_tokens",
+        ),
+        "reasoning_output_tokens": ("reasoning_output_tokens", "reasoningTokens"),
+        "total_tokens": ("total_tokens", "totalTokens"),
     }
     counters: dict[str, int] = {}
     for normalized, keys in aliases.items():
@@ -755,6 +943,7 @@ def parse_rollout(
         usage=result.usage,
         next_offset=result.next_offset,
         bytes_consumed=result.bytes_consumed,
+        usage_max=result.usage_max,
     )
 
 
@@ -768,6 +957,14 @@ def iter_usage(path: Path) -> Iterator[TokenUsage]:
     """Yield positive token deltas from cumulative rollout snapshots."""
 
     yield from parse_rollout(path).usage
+
+
+def iter_max_usage(path: Path) -> Iterator[TokenUsage]:
+    """Yield the component-wise maximum cumulative snapshot in a rollout."""
+
+    reader = CodexRolloutReader()
+    reader.parse(path)
+    yield from reader.usage_max
 
 
 if __name__ == "__main__":  # pragma: no cover

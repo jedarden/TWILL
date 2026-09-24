@@ -108,6 +108,37 @@ class NormalizedEvent:
 
 
 @dataclass(frozen=True)
+class MessageUsage:
+    """One deduplicated Claude provider-message usage record."""
+
+    source_line: int
+    event_index: int = 0
+    timestamp: str | None = None
+    session_id: str | None = None
+    message_id: str | None = None
+    model: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_write_tokens: int = 0
+    reasoning_output_tokens: int = 0
+    total_tokens: int = 0
+    cost_usd: float | None = None
+
+    @property
+    def provider_message_id(self) -> str | None:
+        return self.message_id
+
+    @property
+    def costUSD(self) -> float | None:
+        return self.cost_usd
+
+
+TokenUsage = MessageUsage
+UsageRecord = MessageUsage
+
+
+@dataclass(frozen=True)
 class _RecordContext:
     """Per-record fields copied onto every event the record produces."""
 
@@ -141,6 +172,68 @@ class ClaudeCodeLineParser:
         self.cwd: str | None = None
         self._pending: dict[str, _PendingToolUse] = {}
         self._awaiting_correction = False
+        self._usage_by_key: dict[str, MessageUsage] = {}
+        self._usage_order: list[str] = []
+        self._model: str | None = None
+        self._model_weights: dict[str, tuple[float, int]] = {}
+        self._cumulative_cost_usd: float | None = None
+        self._cumulative_duration_ms: int | None = None
+        self._saw_cost_state = False
+        self._cost_state_counters: dict[str, int] = {}
+        self._first_timestamp: str | None = None
+        self._last_timestamp: str | None = None
+
+    @property
+    def usage(self) -> tuple[MessageUsage, ...]:
+        """Usage records deduplicated by provider message id."""
+
+        return tuple(self._usage_by_key[key] for key in self._usage_order)
+
+    @property
+    def usage_deltas(self) -> tuple[MessageUsage, ...]:
+        return self.usage
+
+    @property
+    def model(self) -> str | None:
+        return self._model
+
+    @property
+    def total_cost_usd(self) -> float | None:
+        return self._cumulative_cost_usd
+
+    @property
+    def cost_usd(self) -> float | None:
+        return self._cumulative_cost_usd
+
+    @property
+    def cumulative_cost_usd(self) -> float | None:
+        return self._cumulative_cost_usd
+
+    @property
+    def wall_seconds(self) -> int | None:
+        if self._cumulative_duration_ms is None:
+            return None
+        return max(0, round(self._cumulative_duration_ms / 1000))
+
+    @property
+    def duration_seconds(self) -> int | None:
+        return self.wall_seconds
+
+    @property
+    def has_cost_state(self) -> bool:
+        return self._saw_cost_state
+
+    @property
+    def cost_state_counters(self) -> dict[str, int]:
+        return dict(self._cost_state_counters)
+
+    @property
+    def first_timestamp(self) -> str | None:
+        return self._first_timestamp
+
+    @property
+    def last_timestamp(self) -> str | None:
+        return self._last_timestamp
 
     def parse_line(self, line: str, source_line: int) -> list[NormalizedEvent]:
         stripped = line.strip()
@@ -156,6 +249,10 @@ class ClaudeCodeLineParser:
 
         self._absorb_record_identity(record)
         context = self._record_context(record)
+        self._note_timestamp(context.timestamp)
+        self._consume_usage_record(record, source_line, context)
+        if record.get("type") in {"cost-state", "cost_state"}:
+            self._consume_cost_state(record)
 
         record_type = record.get("type")
         if record_type == "assistant":
@@ -181,7 +278,7 @@ class ClaudeCodeLineParser:
     # -- record plumbing -----------------------------------------------------
 
     def _absorb_record_identity(self, record: dict[str, object]) -> None:
-        session_id = record.get("sessionId")
+        session_id = _first_string(record.get("sessionId"), record.get("session_id"))
         if isinstance(session_id, str) and session_id:
             self.session_id = session_id
         cwd = record.get("cwd")
@@ -190,6 +287,9 @@ class ClaudeCodeLineParser:
 
     def _record_context(self, record: dict[str, object]) -> _RecordContext:
         timestamp = record.get("timestamp")
+        if not isinstance(timestamp, str):
+            message = record.get("message")
+            timestamp = message.get("timestamp") if isinstance(message, dict) else None
         return _RecordContext(
             timestamp=timestamp if isinstance(timestamp, str) else None,
             session_id=self.session_id,
@@ -265,6 +365,167 @@ class ClaudeCodeLineParser:
             if event is not None:
                 events.append(event)
         return events
+
+    def _note_timestamp(self, timestamp: str | None) -> None:
+        if not timestamp:
+            return
+        if self._first_timestamp is None:
+            self._first_timestamp = timestamp
+        self._last_timestamp = timestamp
+
+    def _consume_usage_record(
+        self,
+        record: dict[str, object],
+        source_line: int,
+        context: _RecordContext,
+    ) -> None:
+        message = record.get("message")
+        if not isinstance(message, dict):
+            message = record
+        usage = message.get("usage")
+        if not isinstance(usage, dict):
+            usage = record.get("usage")
+        if not isinstance(usage, dict):
+            return
+
+        counters = _usage_counters(usage)
+        cost = _first_nonnegative_float(
+            usage, ("cost_usd", "costUSD", "cost")
+        )
+        if cost is None:
+            cost = _first_nonnegative_float(message, ("cost_usd", "costUSD", "cost"))
+        cumulative_cost = _first_nonnegative_float(
+            usage,             ("total_cost_usd", "totalCostUSD", "total_cost", "totalCost")
+
+        )
+        if cumulative_cost is None:
+            cumulative_cost = _first_nonnegative_float(
+                message,             ("total_cost_usd", "totalCostUSD", "total_cost", "totalCost")
+
+            )
+        if cumulative_cost is not None:
+            self._cumulative_cost_usd = max(
+                self._cumulative_cost_usd or 0.0, cumulative_cost
+            )
+        if not counters and cost is None and cumulative_cost is None:
+            return
+
+        message_id = _first_string(
+            message.get("id"),
+            message.get("message_id"),
+            message.get("uuid"),
+            record.get("message_id"),
+            record.get("provider_message_id"),
+            record.get("requestId"),
+            record.get("uuid"),
+            record.get("id"),
+        )
+        key = message_id or f"line:{source_line}"
+        model = _first_string(message.get("model"), record.get("model"))
+        candidate = MessageUsage(
+            source_line=source_line,
+            event_index=0,
+            timestamp=context.timestamp,
+            session_id=context.session_id,
+            message_id=message_id,
+            model=model,
+            cost_usd=cost,
+            **counters,
+        )
+        existing = self._usage_by_key.get(key)
+        if existing is None:
+            self._usage_by_key[key] = candidate
+            self._usage_order.append(key)
+        else:
+            self._usage_by_key[key] = _merge_message_usage(existing, candidate)
+        if model:
+            self._select_model(model, candidate)
+
+    def _consume_cost_state(self, record: dict[str, object]) -> None:
+        self._saw_cost_state = True
+        cost = _first_nonnegative_float(
+            record,
+            (
+                "totalCostUSD",
+                "total_cost_usd",
+                "totalCost",
+                "total_cost",
+                "costUSD",
+                "cost_usd",
+            ),
+        )
+        if cost is not None:
+            self._cumulative_cost_usd = max(
+                self._cumulative_cost_usd or 0.0, cost
+            )
+
+        duration = _first_nonnegative_float(
+            record,
+            ("totalDuration", "total_duration_ms", "duration_ms"),
+        )
+        if duration is not None:
+            duration_ms = max(0, round(duration))
+            self._cumulative_duration_ms = max(
+                self._cumulative_duration_ms or 0, duration_ms
+            )
+
+        model_usage = record.get("modelUsage") or record.get("model_usage")
+        if not isinstance(model_usage, dict):
+            return
+        for model_name, raw_usage in model_usage.items():
+            if not isinstance(model_name, str) or not model_name:
+                continue
+            if not isinstance(raw_usage, dict):
+                continue
+            model_cost = _first_nonnegative_float(
+                raw_usage, ("costUSD", "cost_usd", "cost")
+            )
+            if model_cost is not None:
+                self._cumulative_cost_usd = max(
+                    self._cumulative_cost_usd or 0.0, model_cost
+                )
+            model_input = dict(raw_usage)
+            for source_key, target_key in (
+                ("inputTokens", "input_tokens"),
+                ("outputTokens", "output_tokens"),
+                ("cacheReadInputTokens", "cache_read_tokens"),
+                ("cacheCreationInputTokens", "cache_write_tokens"),
+            ):
+                if source_key in model_input:
+                    model_input[target_key] = model_input[source_key]
+            model_counters = _usage_counters(model_input)
+            for key, value in model_counters.items():
+                self._cost_state_counters[key] = max(
+                    self._cost_state_counters.get(key, 0), value
+                )
+            model_total = sum(
+                model_counters.get(key, 0)
+                for key in ("input_tokens", "output_tokens", "reasoning_output_tokens")
+            )
+            weight = (model_cost or 0.0, model_total)
+            previous = self._model_weights.get(model_name)
+            if previous is None or weight > previous:
+                self._model_weights[model_name] = weight
+            self._select_model(model_name, None, weight=weight)
+
+    def _select_model(
+        self,
+        model: str,
+        usage: MessageUsage | None = None,
+        *,
+        weight: tuple[float, int] | None = None,
+    ) -> None:
+        if weight is None:
+            weight = _usage_weight(usage) if usage is not None else (0.0, 0)
+        previous = self._model_weights.get(model)
+        if previous is None or weight > previous:
+            self._model_weights[model] = weight
+        if self._model is None:
+            self._model = model
+            return
+        current_weight = self._model_weights.get(self._model, (0.0, 0))
+        if weight > current_weight:
+            self._model = model
 
     def _consume_tool_result(
         self,
@@ -462,6 +723,137 @@ def _split_exit_code(content_text: str) -> tuple[int | None, str | None]:
 
 def _matches_rejection(content_text: str) -> bool:
     return any(sentinel in content_text for sentinel in _REJECTION_SENTINELS)
+
+
+def _first_string(*values: object) -> str | None:
+    for value in values:
+        if isinstance(value, str) and value:
+            return value
+    return None
+
+
+def _first_nonnegative_int(value: dict[str, object], keys: tuple[str, ...]) -> int | None:
+    for key in keys:
+        candidate = value.get(key)
+        if isinstance(candidate, int) and not isinstance(candidate, bool) and candidate >= 0:
+            return candidate
+    return None
+
+
+def _first_nonnegative_float(
+    value: dict[str, object], keys: tuple[str, ...]
+) -> float | None:
+    for key in keys:
+        candidate = value.get(key)
+        if (
+            isinstance(candidate, (int, float))
+            and not isinstance(candidate, bool)
+            and candidate >= 0
+        ):
+            return float(candidate)
+    return None
+
+
+def _usage_counters(usage: dict[str, object]) -> dict[str, int]:
+    aliases = {
+        "input_tokens": ("input_tokens", "inputTokens", "prompt_tokens"),
+        "output_tokens": ("output_tokens", "outputTokens", "completion_tokens"),
+        "cache_read_tokens": (
+            "cache_read_tokens",
+            "cache_read_input_tokens",
+            "cacheReadInputTokens",
+            "cached_input_tokens",
+        ),
+        "cache_write_tokens": (
+            "cache_write_tokens",
+            "cache_creation_input_tokens",
+            "cacheCreationInputTokens",
+            "cache_creation_tokens",
+        ),
+        "reasoning_output_tokens": (
+            "reasoning_output_tokens",
+            "reasoning_tokens",
+        ),
+        "total_tokens": ("total_tokens", "totalTokens"),
+    }
+    counters: dict[str, int] = {}
+    for normalized, keys in aliases.items():
+        value = _first_nonnegative_int(usage, keys)
+        if value is not None:
+            counters[normalized] = value
+    details = usage.get("output_tokens_details")
+    if "reasoning_output_tokens" not in counters and isinstance(details, dict):
+        value = _first_nonnegative_int(
+            details, ("thinking_tokens", "reasoning_tokens")
+        )
+        if value is not None:
+            counters["reasoning_output_tokens"] = value
+    cache_creation = usage.get("cache_creation")
+    if "cache_write_tokens" not in counters and isinstance(cache_creation, dict):
+        values = [
+            _first_nonnegative_int(cache_creation, (key,))
+            for key in ("ephemeral_5m_input_tokens", "ephemeral_1h_input_tokens")
+        ]
+        present = [value for value in values if value is not None]
+        if present:
+            counters["cache_write_tokens"] = sum(present)
+    if "total_tokens" not in counters and counters:
+        counters["total_tokens"] = sum(
+            counters.get(key, 0)
+            for key in ("input_tokens", "output_tokens", "reasoning_output_tokens")
+        )
+    return counters
+
+
+def _usage_weight(usage: MessageUsage | None) -> tuple[float, int]:
+    if usage is None:
+        return 0.0, 0
+    total = usage.total_tokens or (
+        usage.input_tokens
+        + usage.output_tokens
+        + usage.reasoning_output_tokens
+    )
+    return usage.cost_usd or 0.0, total
+
+
+def _merge_message_usage(
+    existing: MessageUsage, candidate: MessageUsage
+) -> MessageUsage:
+    return MessageUsage(
+        source_line=existing.source_line,
+        event_index=existing.event_index,
+        timestamp=existing.timestamp or candidate.timestamp,
+        session_id=existing.session_id or candidate.session_id,
+        message_id=existing.message_id or candidate.message_id,
+        model=(candidate.model if _usage_weight(candidate) > _usage_weight(existing) else existing.model)
+        or candidate.model
+        or existing.model,
+        input_tokens=max(existing.input_tokens, candidate.input_tokens),
+        output_tokens=max(existing.output_tokens, candidate.output_tokens),
+        cache_read_tokens=max(existing.cache_read_tokens, candidate.cache_read_tokens),
+        cache_write_tokens=max(existing.cache_write_tokens, candidate.cache_write_tokens),
+        reasoning_output_tokens=max(
+            existing.reasoning_output_tokens, candidate.reasoning_output_tokens
+        ),
+        total_tokens=max(existing.total_tokens, candidate.total_tokens),
+        cost_usd=(
+            max(existing.cost_usd or 0.0, candidate.cost_usd or 0.0)
+            if existing.cost_usd is not None or candidate.cost_usd is not None
+            else None
+        ),
+    )
+
+
+def iter_usage(path: Path) -> Iterator[MessageUsage]:
+    """Yield deduplicated Claude usage records from one transcript."""
+
+    parser = ClaudeCodeLineParser()
+    with path.open("r", encoding="utf-8", errors="replace") as handle:
+        for source_line, line in enumerate(handle, start=1):
+            if not line.endswith("\n"):
+                break
+            parser.parse_line(line, source_line)
+    yield from parser.usage
 
 
 def iter_events(path: Path) -> Iterator[NormalizedEvent]:

@@ -4,9 +4,10 @@ The record every transcript parser must emit, pinning plan §6.2 step 4. A parse
 consumes complete JSONL lines from one transcript format and yields zero or more
 normalized events per line; the detector layer keys on nothing else. Today two
 parsers implement it — `twill_reader.py` and `codex_reader.py` — and their
-`NormalizedEvent` and `TokenUsage` dataclasses are the normative field list; the
-rules each format follows to produce them are that format's provenance rules,
-kept in a separate section so the contract itself stays source-agnostic.
+`NormalizedEvent`, `MessageUsage`, and `TokenUsage` dataclasses are the normative
+field lists; the rules each format follows to produce them are that format's
+provenance rules, kept in a separate section so the contract itself stays
+source-agnostic.
 Exercised by `tests/test_reader.py` and `tests/test_codex_reader.py`.
 
 ## `NormalizedEvent` — one detector-facing event
@@ -77,6 +78,28 @@ moved backwards is treated as a restart, not a negative: the new value itself
 becomes the delta. A snapshot whose every counter is unchanged emits no row.
 Source-specific counter spellings normalize to these six names.
 
+## `MessageUsage` — one deduplicated Claude provider message
+
+Claude assistant records carry usage counters on `message.usage` and identify
+one provider response with `message.id`. `MessageUsage` preserves that identity
+and the maximum value observed for every counter when a transcript repeats the
+same provider message. A missing provider id is retained as an unkeyed row
+rather than discarded. The persistence boundary sums these deduplicated rows
+into `session_usage`; the message id itself is not stored in the corpus.
+
+| Field | Type | Meaning |
+|---|---|---|
+| `source_line`, `event_index` | `int` | Location of the first record for this provider message. |
+| `timestamp`, `session_id` | `str \| None` | Record context, with the session id sticky per file. |
+| `message_id` / `provider_message_id` | `str \| None` | Provider message identity, when stated. |
+| `model` | `str \| None` | Model stated by the message or cumulative cost state. |
+| `input_tokens`, `output_tokens`, `cache_read_tokens`, `cache_write_tokens`, `reasoning_output_tokens`, `total_tokens` | `int` | Non-negative message counters; duplicate records contribute their component-wise maximum. |
+| `cost_usd` | `float \| None` | Per-message cost when the source states one. |
+
+Claude `cost-state` records are cumulative session snapshots. Their maximum
+`totalCostUSD` and duration supply the aggregate cost and wall time; they are
+never added once per repeated snapshot.
+
 ## Invariants shared by every parser
 
 - **Complete lines only.** A line that does not parse as a complete JSON object
@@ -121,7 +144,9 @@ Source-specific counter spellings normalize to these six names.
 - Usage arrives in `event_msg` `token_count` snapshots (and `token_usage_record`
   records) as cumulative totals; `cached_input_tokens` and
   `cache_write_input_tokens` are the counter spellings that normalize to
-  `cache_read_tokens` and `cache_write_tokens`.
+  `cache_read_tokens` and `cache_write_tokens`. Persistence keeps the
+  component-wise maximum snapshot for the rollout rather than summing repeated
+  cumulative snapshots.
 
 ### Claude Code transcripts (`twill_reader.py`)
 
@@ -138,6 +163,12 @@ Source-specific counter spellings normalize to these six names.
   user records are harness bookkeeping and never count as corrections.
 - The run tool and read tool are recognized by fixed tool names; a read is
   emitted at its invocation without waiting for a result.
+- Assistant usage is read from `message.usage`. Repeated records with the same
+  `message.id` are one `MessageUsage` row, with each counter reduced to its
+  maximum; rows without a provider id remain distinct.
+- `cost-state` records are cumulative: `totalCostUSD` and `totalDuration` are
+  reduced to their maxima, and `modelUsage` supplies the model when no message
+  states one.
 
 ## Related, and out of scope here
 

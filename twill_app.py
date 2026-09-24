@@ -31,7 +31,8 @@ import twill_ranker
 import twill_schema
 import twill_cursor
 import twill_doctor
-from codex_reader import CodexRolloutLineParser
+from codex_reader import CodexRolloutLineParser, CodexRolloutReader, TokenUsage
+from twill_reader import ClaudeCodeLineParser, MessageUsage
 from twill_config import (
     ConfigError,
     TwillConfig,
@@ -218,11 +219,49 @@ class TranscriptEvent:
 
 
 @dataclass(frozen=True)
+class SessionUsage:
+    session_id: str
+    model: str | None = None
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cost_usd: float | None = None
+    wall_seconds: int | None = None
+    messages: int = 0
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "session_id": self.session_id,
+            "model": self.model,
+            "input_tokens": self.input_tokens,
+            "output_tokens": self.output_tokens,
+            "cache_read_tokens": self.cache_read_tokens,
+            "cost_usd": self.cost_usd,
+            "wall_seconds": self.wall_seconds,
+            "messages": self.messages,
+        }
+
+
+@dataclass(frozen=True)
 class SessionData:
     path: Path
     session_id: str
     source_kind: str
     events: tuple[TranscriptEvent, ...]
+    usage: SessionUsage | None = None
+    usage_rows: tuple[MessageUsage, ...] = ()
+
+    @property
+    def usage_records(self) -> tuple[MessageUsage, ...]:
+        return self.usage_rows
+
+    @property
+    def message_usage(self) -> tuple[MessageUsage, ...]:
+        return self.usage_rows
+
+    @property
+    def session_usage(self) -> SessionUsage | None:
+        return self.usage
 
 
 def redact(text: object | None, content_fences: Sequence[str] = ()) -> str:
@@ -374,7 +413,17 @@ def _parse_codex_scan(
         )
         for event in normalized_events
     )
-    return SessionData(path, session_id, source_kind, events), invalid_lines
+    usage, usage_rows = _extract_usage(
+        path, source_kind, session_id, scan.new_offset
+    )
+    return SessionData(
+        path,
+        session_id,
+        source_kind,
+        events,
+        usage=usage,
+        usage_rows=usage_rows,
+    ), invalid_lines
 
 
 def parse_scan(
@@ -428,7 +477,17 @@ def parse_scan(
                     cwd=cwd_text,
                 )
             )
-    return SessionData(path, session_id, source_kind, tuple(events)), invalid_lines
+    usage, usage_rows = _extract_usage(
+        path, source_kind, session_id, scan.new_offset
+    )
+    return SessionData(
+        path,
+        session_id,
+        source_kind,
+        tuple(events),
+        usage=usage,
+        usage_rows=usage_rows,
+    ), invalid_lines
 
 
 def read_session(path: Path) -> SessionData:
@@ -436,6 +495,19 @@ def read_session(path: Path) -> SessionData:
 
     session, _ = parse_scan(path, twill_cursor.scan_lines(path, 0), path.stem)
     return session
+
+
+def extract_usage(
+    path: Path, source_kind: str | None = None
+) -> SessionUsage | None:
+    kind = source_kind or _source_kind(path)
+    end_offset = twill_cursor.scan_lines(path, 0).new_offset
+    usage, _ = _extract_usage(path, kind, path.stem, end_offset)
+    return usage
+
+
+def read_usage(path: Path, source_kind: str | None = None) -> SessionUsage | None:
+    return extract_usage(path, source_kind)
 
 
 def _parse_duration(value: str) -> float:
@@ -522,6 +594,211 @@ def _timestamp_pair(value: str) -> tuple[str, str]:
     return utc.isoformat(), utc.astimezone().isoformat()
 
 
+def _parse_usage_timestamp(value: object) -> datetime | None:
+    if isinstance(value, bool):
+        return None
+    if isinstance(value, (int, float)):
+        seconds = float(value)
+        if abs(seconds) > 100_000_000_000:
+            seconds /= 1000
+        try:
+            return datetime.fromtimestamp(seconds, timezone.utc)
+        except (OverflowError, OSError, ValueError):
+            return None
+    if not isinstance(value, str) or not value.strip():
+        return None
+    text = value.strip()
+    try:
+        parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+    except ValueError:
+        try:
+            return _parse_usage_timestamp(float(text))
+        except ValueError:
+            return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _usage_wall_seconds(first: str | None, last: str | None) -> int | None:
+    start = _parse_usage_timestamp(first)
+    end = _parse_usage_timestamp(last)
+    if start is None or end is None:
+        return None
+    return max(0, round((end - start).total_seconds()))
+
+
+def _message_usage_summary(
+    session_id: str,
+    rows: tuple[MessageUsage, ...],
+    *,
+    model: str | None = None,
+    cost_usd: float | None = None,
+    wall_seconds: int | None = None,
+) -> SessionUsage:
+    input_tokens = sum(row.input_tokens for row in rows)
+    output_tokens = sum(row.output_tokens for row in rows)
+    cache_read_tokens = sum(row.cache_read_tokens for row in rows)
+    if cost_usd is None:
+        row_costs = [row.cost_usd for row in rows if row.cost_usd is not None]
+        cost_usd = sum(row_costs) if row_costs else None
+    if model is None:
+        model = next((row.model for row in reversed(rows) if row.model), None)
+    return SessionUsage(
+        session_id=session_id,
+        model=model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cost_usd=cost_usd,
+        wall_seconds=wall_seconds,
+        messages=len(rows),
+    )
+
+
+def _extract_claude_usage(
+    path: Path, fallback_session_id: str, end_offset: int | None = None
+) -> tuple[SessionUsage | None, tuple[MessageUsage, ...]]:
+    parser = ClaudeCodeLineParser()
+    consumed = 0
+    with path.open("rb") as handle:
+        for source_line, raw_line in enumerate(handle, start=1):
+            if end_offset is not None and consumed + len(raw_line) > end_offset:
+                break
+            consumed += len(raw_line)
+            parser.parse_line(raw_line.decode("utf-8", errors="replace"), source_line)
+    rows = parser.usage
+    if not rows and parser.cost_state_counters:
+        rows = (
+            MessageUsage(
+                source_line=1,
+                model=parser.model,
+                **parser.cost_state_counters,
+            ),
+        )
+    wall_seconds = parser.wall_seconds
+    if wall_seconds is None:
+        wall_seconds = _usage_wall_seconds(parser.first_timestamp, parser.last_timestamp)
+    if not rows and parser.total_cost_usd is None and not parser.has_cost_state:
+        return None, ()
+    session_id = parser.session_id or fallback_session_id
+    summary = _message_usage_summary(
+        session_id,
+        rows,
+        model=parser.model,
+        cost_usd=parser.total_cost_usd,
+        wall_seconds=wall_seconds,
+    )
+    return summary, rows
+
+
+def _codex_usage_row(
+    row: TokenUsage, *, cost_usd: float | None = None
+) -> MessageUsage:
+    return MessageUsage(
+        source_line=row.source_line,
+        event_index=row.event_index,
+        timestamp=row.timestamp,
+        session_id=row.session_id,
+        input_tokens=row.input_tokens,
+        output_tokens=row.output_tokens,
+        cache_read_tokens=row.cache_read_tokens,
+        cache_write_tokens=row.cache_write_tokens,
+        reasoning_output_tokens=row.reasoning_output_tokens,
+        total_tokens=row.total_tokens,
+        cost_usd=cost_usd,
+    )
+
+
+def _extract_codex_usage(
+    path: Path, fallback_session_id: str, end_offset: int | None = None
+) -> tuple[SessionUsage | None, tuple[MessageUsage, ...]]:
+    reader = CodexRolloutReader()
+    reader.parse(path, end_offset=end_offset)
+    max_rows = reader.usage_max
+    if not max_rows and reader.cost_usd is None:
+        return None, ()
+    if max_rows:
+        row = max_rows[0]
+        usage_rows = (_codex_usage_row(row, cost_usd=reader.cost_usd),)
+        input_tokens = row.input_tokens
+        output_tokens = row.output_tokens
+        cache_read_tokens = row.cache_read_tokens
+    else:
+        row = None
+        usage_rows = ()
+        input_tokens = 0
+        output_tokens = 0
+        cache_read_tokens = 0
+    summary = SessionUsage(
+        session_id=reader.session_id or fallback_session_id,
+        model=reader.model,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        cache_read_tokens=cache_read_tokens,
+        cost_usd=reader.cost_usd,
+        wall_seconds=_usage_wall_seconds(reader.first_timestamp, reader.last_timestamp),
+        messages=max(1, reader.message_count),
+    )
+    return summary, usage_rows
+
+
+def _looks_like_codex(path: Path, end_offset: int | None = None) -> bool:
+    try:
+        consumed = 0
+        with path.open("rb") as handle:
+            for _ in range(1000):
+                raw_line = handle.readline()
+                if not raw_line:
+                    break
+                if end_offset is not None and consumed + len(raw_line) > end_offset:
+                    break
+                consumed += len(raw_line)
+                try:
+                    record = json.loads(raw_line.decode("utf-8", errors="replace"))
+                except json.JSONDecodeError:
+                    continue
+                if not isinstance(record, dict):
+                    continue
+                if record.get("type") in {"response_item", "token_usage_record"}:
+                    return True
+                payload = record.get("payload")
+                if (
+                    record.get("type") == "event_msg"
+                    and isinstance(payload, dict)
+                    and payload.get("type") in {"token_count", "turn_context"}
+                ):
+                    return True
+    except OSError:
+        return False
+    return False
+
+
+def _extract_usage(
+    path: Path,
+    source_kind: str,
+    fallback_session_id: str,
+    end_offset: int | None = None,
+) -> tuple[SessionUsage | None, tuple[MessageUsage, ...]]:
+    if source_kind == "codex" or (
+        source_kind == "jsonl" and _looks_like_codex(path, end_offset)
+    ):
+        return _extract_codex_usage(path, fallback_session_id, end_offset)
+    return _extract_claude_usage(path, fallback_session_id, end_offset)
+
+
+def _coerce_session_usage(session: SessionData) -> SessionUsage | None:
+    if isinstance(session.usage, SessionUsage):
+        return session.usage
+    if isinstance(session.usage, (tuple, list)):
+        rows = tuple(row for row in session.usage if isinstance(row, MessageUsage))
+        if rows or session.usage:
+            return _message_usage_summary(session.session_id, rows)
+    if session.usage_rows:
+        return _message_usage_summary(session.session_id, session.usage_rows)
+    return None
+
+
 @dataclass(frozen=True)
 class CursorUpdate:
     """The cursor-side half of one ingest span, written with its rows."""
@@ -551,6 +828,52 @@ class Store:
 
     def close(self) -> None:
         self.connection.close()
+
+    def _persist_usage(
+        self,
+        conn: sqlite3.Connection,
+        session: SessionData,
+        stored_session_id: str,
+        *,
+        replace: bool,
+        stale_session_ids: Sequence[str],
+    ) -> None:
+        if replace or stored_session_id not in stale_session_ids:
+            for stale_id in dict.fromkeys((*stale_session_ids, stored_session_id)):
+                conn.execute("DELETE FROM session_usage WHERE session_id = ?", (stale_id,))
+        usage = _coerce_session_usage(session)
+        if usage is None:
+            return
+        model = self.redactor.redact_text(usage.model) if usage.model else None
+        input_tokens = max(0, int(usage.input_tokens))
+        output_tokens = max(0, int(usage.output_tokens))
+        cache_read_tokens = max(0, int(usage.cache_read_tokens))
+        wall_seconds = (
+            max(0, int(usage.wall_seconds))
+            if usage.wall_seconds is not None
+            else None
+        )
+        cost_usd = float(usage.cost_usd) if usage.cost_usd is not None else None
+        messages = max(0, int(usage.messages))
+        conn.execute(
+            "INSERT INTO session_usage(session_id, model, input_tokens, output_tokens, "
+            "cache_read_tokens, cost_usd, wall_seconds, messages) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?) "
+            "ON CONFLICT(session_id) DO UPDATE SET model=excluded.model, "
+            "input_tokens=excluded.input_tokens, output_tokens=excluded.output_tokens, "
+            "cache_read_tokens=excluded.cache_read_tokens, cost_usd=excluded.cost_usd, "
+            "wall_seconds=excluded.wall_seconds, messages=excluded.messages",
+            (
+                stored_session_id,
+                model,
+                input_tokens,
+                output_tokens,
+                cache_read_tokens,
+                cost_usd,
+                wall_seconds,
+                messages,
+            ),
+        )
 
     def _persist(
         self,
@@ -599,6 +922,13 @@ class Store:
                 "ON CONFLICT(session_key) DO UPDATE SET session_id=excluded.session_id, "
                 "source_path=excluded.source_path, source_kind=excluded.source_kind, ingested_at=excluded.ingested_at",
                 (key, stored_session_id, stored_source_path, stored_source_kind, now),
+            )
+            self._persist_usage(
+                conn,
+                session,
+                stored_session_id,
+                replace=replace,
+                stale_session_ids=stale_session_ids,
             )
             for event in session.events:
                 ts_utc, ts_local = _timestamp_pair(event.timestamp)
