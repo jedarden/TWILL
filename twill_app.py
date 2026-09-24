@@ -28,6 +28,7 @@ from typing import Iterator, Sequence
 
 import twill_detectors
 import twill_lessons
+import twill_measure
 import twill_ranker
 import twill_schema
 import twill_cursor
@@ -58,7 +59,7 @@ from twill_status import read_status, record_stage
 MAX_EXCERPT_LENGTH = 240
 SIGNATURE_INPUT_LIMIT = 400
 SIGNATURE_HASH_LENGTH = 12
-MUTATING_VERBS = frozenset({"ingest", "detect", "rank", "accept", "apply"})
+MUTATING_VERBS = frozenset({"ingest", "detect", "rank", "accept", "apply", "measure"})
 
 _SIGNATURE_SUBSTITUTIONS = (
     (
@@ -1459,6 +1460,47 @@ def rank_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def measure_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    artifacts_root = config.require_artifacts_root()
+    state_dir = _state_dir(args.state_dir)
+    started = perf_counter()
+    connection = twill_schema.connect(state_dir)
+    try:
+        report = twill_measure.measure_lessons(
+            connection,
+            artifacts_root,
+            lesson_id=getattr(args, "lesson_id", None),
+        )
+    finally:
+        connection.close()
+    record_stage(
+        state_dir,
+        "measure",
+        perf_counter() - started,
+        {
+            "lessons": len(report.measurements),
+            "measurements": len(report.measurements),
+        },
+    )
+    emit_success(report.as_dict(), json_mode=args.json)
+    if args.json:
+        return EXIT_SUCCESS
+    print("TWILL measure")
+    print(
+        f"window: {report.window_days} day(s) starting {report.window_start_utc}"
+    )
+    if not report.measurements:
+        print("no eligible lessons")
+    for item in report.measurements:
+        print(
+            f"- {item.lesson_id} {item.detector_id}: "
+            f"{item.sessions} session(s), {item.events} event(s)"
+        )
+    print(f"{len(report.measurements)} measurement(s) recorded")
+    return EXIT_SUCCESS
+
+
 def _lesson_data(record: twill_lessons.LessonRecord) -> dict[str, object]:
     return {"lesson": record.as_dict()}
 
@@ -1665,6 +1707,14 @@ def build_parser() -> argparse.ArgumentParser:
     rank.add_argument("--state-dir")
     rank.add_argument("--json", action="store_true")
     rank.set_defaults(handler=rank_command)
+
+    measure = subparsers.add_parser(
+        "measure", help="replay accepted lesson detectors and append measurements"
+    )
+    measure.add_argument("--lesson", dest="lesson_id", metavar="ID")
+    measure.add_argument("--state-dir")
+    measure.add_argument("--json", action="store_true")
+    measure.set_defaults(handler=measure_command)
 
     accept = subparsers.add_parser(
         "accept", help="accept a drafted lesson after operator review"

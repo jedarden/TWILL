@@ -671,6 +671,12 @@ and the digest's own health line: lessons drafted / accepted / applied / resolve
 Also **`twill brief <repo>`**: the pull-only pre-flight — what historically bites agents working in
 this repo or launch dir, from accepted lessons and open clusters, rendered as plain text a human or
 an agent can read on request. Pull, never push: nothing here is injected into a prompt by TWILL.
+**Measurement decision (2026-09-24):** each accepted or applied lesson is replayed over the
+trailing seven-day UTC window; one point is recorded per lesson per UTC day, so a same-day rerun
+replaces that day's point without losing earlier history. Draft and terminal lessons receive no new
+points, while their existing mirror history is retained. The versioned JSONL mirror is authoritative
+for recovery: `twill measure` reconciles it into the derived table before recording new points, and
+all paths resolve through the validated external `artifacts_root`.
 **Completion criteria:** a simulated series drives escalate and retire deterministically in tests;
 the digest names its own zero-output state loudly if no lesson reached `applied` in 60 days.
 **Does NOT include:** other hosts, retrieval surface.
