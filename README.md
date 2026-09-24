@@ -82,7 +82,8 @@ verbs from a different phase.
 ## Tests
 
 ```sh
-make test        # or: pytest
+make test                        # or: pytest
+scripts/definition-of-done.sh    # the one "done" command: the gated suite, pytest, ruff
 ```
 
 The suite runs under the open-path audit harness (§8.3, §10.2): an
@@ -94,6 +95,13 @@ spawns — each CLI verb — installs the same hook, so the verbs themselves
 are policed. A bare `python3 -m unittest discover` skips the harness's
 startup and deliberately fails; run the suite through `make test` or
 pytest. See `docs/notes/open-path-audit.md`.
+
+`scripts/definition-of-done.sh` (§10.2) is the workspace's declared
+definition of done: one lane — the gated suite, the same suite under
+pytest, and `ruff check .`. NEEDLE's verification gate runs it against a
+clean `git archive` extraction of committed state, so it depends on
+nothing but a POSIX shell and whatever tools are on PATH; a missing
+optional tool (pytest, ruff) is a loud skip, never a silent pass.
 
 ## Phase 0 walking skeleton
 
