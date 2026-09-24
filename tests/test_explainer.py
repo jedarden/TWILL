@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 import twill_explainer  # noqa: E402
 import twill_schema  # noqa: E402
+from twill_config import ConfigError, TwillConfig  # noqa: E402
 from twill_contract import EXIT_VALIDATION_FAILURE, ValidationError  # noqa: E402
 from twill_ranker import RankedCluster  # noqa: E402
 
@@ -48,6 +49,34 @@ class ExplainerTestCase(unittest.TestCase):
 
     def excerpt(self, number: int, text: str = "sqlite3: command not found"):
         return twill_explainer.PromptExcerpt(number, f"session-{number}", text)
+
+    def config(self) -> TwillConfig:
+        return TwillConfig(artifacts_root=self.root / "artifacts")
+
+    def candidate(
+        self,
+        key: str = "command-not-found:sqlite3",
+        *,
+        detector_id: str = "D-01",
+        session_ids: tuple[str, ...] = ("session-11", "session-12"),
+    ):
+        return twill_explainer.PromptCluster(
+            self.cluster(key, detector_id=detector_id),
+            tuple(
+                twill_explainer.PromptExcerpt(index, session_id, "private transcript text")
+                for index, session_id in enumerate(session_ids, start=1)
+            ),
+        )
+
+    def draft(
+        self,
+        cluster_id: str = "D-01:command-not-found:sqlite3",
+        summary: str = (
+            "Agents repeatedly invoke a missing command, which wastes time. "
+            "Install the command before retrying the operation."
+        ),
+    ):
+        return twill_explainer.LessonDraft(cluster_id=cluster_id, summary=summary)
 
     def test_prompt_contains_cluster_ids_counts_and_framed_excerpts(self):
         prompt = twill_explainer.build_prompt(
@@ -252,6 +281,143 @@ class ExplainerTestCase(unittest.TestCase):
         self.assertEqual(drafts, ())
         self.assertEqual(state, "open")
         self.assertEqual(list(self.root.rglob("L-*.md")), [])
+
+    def test_writes_documented_draft_frontmatter_with_ids_and_counts_only(self):
+        candidate = self.candidate()
+
+        paths = twill_explainer.write_lesson_files(
+            (self.draft(),),
+            (candidate,),
+            self.config(),
+        )
+
+        self.assertEqual(len(paths), 1)
+        path = paths[0]
+        lesson_id = "L-" + hashlib.sha256(
+            b"D-01:command-not-found:sqlite3"
+        ).hexdigest()[:8]
+        self.assertEqual(path.name, f"{lesson_id}.md")
+        self.assertEqual(path.parent, self.root / "artifacts" / "lessons")
+        self.assertEqual(path.stat().st_mode & 0o777, 0o600)
+        text = path.read_text(encoding="utf-8")
+        self.assertTrue(text.startswith("---\nid: L-"))
+        self.assertTrue(text.endswith("installed: false}\n---\n"))
+        self.assertIn("state: draft\n", text)
+        self.assertIn("detector: D-01\n", text)
+        self.assertIn('key: "command-not-found:sqlite3"\n', text)
+        self.assertIn("sessions: 3, events: 7, first_seen:", text)
+        self.assertIn('session_ids: ["session-11","session-12"]', text)
+        self.assertIn(
+            "routing: {recommended: null, applied: null, applied_at: null, bead: null}",
+            text,
+        )
+        self.assertIn("backtest: {window_days: 180, sessions: 0", text)
+        self.assertIn("guard: {layer: null, artifact: null, installed: false}", text)
+        self.assertNotIn("private transcript text", text)
+        self.assertNotIn("observation_id", text)
+        repeated = twill_explainer.write_lesson_files(
+            (self.draft(),),
+            (candidate,),
+            self.config(),
+        )
+        self.assertEqual(repeated, paths)
+        self.assertEqual(path.read_bytes(), text.encode("utf-8"))
+
+    def test_writer_revalidates_summary_before_creating_any_file(self):
+        with self.assertRaises(ValidationError):
+            twill_explainer.write_lesson_files(
+                (self.draft(summary="Only one sentence."),),
+                (self.candidate(),),
+                self.config(),
+            )
+
+        self.assertFalse((self.root / "artifacts" / "lessons").exists())
+
+    def test_writer_rejects_a_batch_with_missing_evidence_before_any_write(self):
+        first = self.candidate()
+        second = self.candidate(
+            "normalized error: rejected",
+            detector_id="D-02",
+            session_ids=(),
+        )
+        drafts = (
+            self.draft(),
+            self.draft(
+                "D-02:normalized error: rejected",
+                "A recurring rejection interrupts work. Use the required input shape.",
+            ),
+        )
+
+        with self.assertRaises(ValidationError) as raised:
+            twill_explainer.write_lesson_files(drafts, (first, second), self.config())
+
+        self.assertIn("at least one evidence session id", str(raised.exception))
+        self.assertFalse((self.root / "artifacts" / "lessons").exists())
+
+    def test_writer_refuses_to_overwrite_a_different_existing_lesson(self):
+        candidate = self.candidate()
+        path = twill_explainer.write_lesson_files(
+            (self.draft(),),
+            (candidate,),
+            self.config(),
+        )[0]
+        path.write_text("operator-owned lesson\n", encoding="utf-8")
+
+        with self.assertRaises(ValidationError) as raised:
+            twill_explainer.write_lesson_files(
+                (self.draft(),),
+                (candidate,),
+                self.config(),
+            )
+
+        self.assertIn("refuses to overwrite a different lesson", str(raised.exception))
+        self.assertEqual(path.read_text(encoding="utf-8"), "operator-owned lesson\n")
+
+    def test_writer_marks_open_clusters_drafted_after_persistence(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        self.addCleanup(connection.close)
+        connection.execute(
+            "INSERT INTO cluster(detector_id, key, window_days, sessions, events, "
+            "first_seen, last_seen, score, covered_by, state) "
+            "VALUES ('D-01', 'command-not-found:sqlite3', 30, 3, 7, "
+            "'2026-09-01T00:00:00+00:00', '2026-09-24T00:00:00+00:00', "
+            "4.5, NULL, 'open')"
+        )
+        connection.commit()
+        candidate = self.candidate()
+
+        paths = twill_explainer.write_lesson_files(
+            (self.draft(),),
+            (candidate,),
+            self.config(),
+            connection=connection,
+        )
+        repeated = twill_explainer.write_lesson_files(
+            (self.draft(),),
+            (candidate,),
+            self.config(),
+            connection=connection,
+        )
+
+        self.assertEqual(repeated, paths)
+        self.assertEqual(
+            connection.execute("SELECT state FROM cluster").fetchone()[0],
+            "drafted",
+        )
+
+    def test_writer_refuses_an_in_tree_artifacts_root(self):
+        config = TwillConfig(artifacts_root=ROOT / "lessons")
+
+        with self.assertRaises(ConfigError):
+            twill_explainer.write_lesson_files(
+                (self.draft(),),
+                (self.candidate(),),
+                config,
+                repo_root=ROOT,
+            )
+
+        self.assertFalse((ROOT / "lessons").exists())
 
     def test_only_new_lesson_candidates_are_rendered(self):
         clusters = [

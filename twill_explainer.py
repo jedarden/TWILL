@@ -15,8 +15,10 @@ import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any, NoReturn, TypeGuard
 
+from twill_config import ConfigError, TwillConfig
 from twill_contract import ValidationError
 from twill_ranker import RankedCluster, RankReport
 from twill_redactor import MAX_EXCERPT_LENGTH, Redactor
@@ -30,6 +32,9 @@ MAX_TOTAL_BYTES = MAX_TOTAL_PROMPT_BYTES
 MAX_EVIDENCE_ROWS_PER_CLUSTER = 256
 MAX_IDENTIFIER_LENGTH = MAX_EXCERPT_LENGTH
 MAX_LESSON_SUMMARY_LENGTH = MAX_EXCERPT_LENGTH
+LESSON_DIRNAME = "lessons"
+LESSON_FILE_MODE = 0o600
+LESSON_BACKTEST_DAYS = 180
 _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,239}$")
 _SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 _CLAUDE_SESSION_ENV_VARS = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID")
@@ -110,6 +115,15 @@ ExplainCluster = PromptCluster
 class _NormalizedItem:
     cluster: Any
     evidence: tuple[PromptExcerpt, ...]
+
+
+@dataclass(frozen=True)
+class _PreparedLesson:
+    lesson_id: str
+    path: Path
+    text: str
+    detector_id: str
+    key: str
 
 
 def _get(value: object, name: str, default: object = None) -> object:
@@ -690,6 +704,350 @@ def _load_evidence(connection: sqlite3.Connection, cluster: object) -> tuple[Pro
     return tuple(PromptExcerpt(int(row[0]), str(row[1]), row[2] or "") for row in rows)
 
 
+def _invalid_lesson_write(
+    path: str,
+    reason: str,
+    hint: str = "write no lesson files and leave every cluster open",
+) -> NoReturn:
+    raise ValidationError(
+        f"Lesson write failed validation at {path}: {reason}",
+        hint,
+    )
+
+
+def _writer_items(source: object, redactor: Redactor) -> tuple[_NormalizedItem, ...]:
+    items: list[_NormalizedItem] = []
+    seen_clusters: set[tuple[str, str]] = set()
+    for source_item in _source_clusters(source):
+        cluster, raw_evidence = _item_parts(source_item)
+        evidence: list[PromptExcerpt] = []
+        seen_evidence: set[tuple[object, object]] = set()
+        for raw_excerpt in _evidence_from_value(raw_evidence):
+            normalized = _safe_excerpt_record(raw_excerpt, redactor)
+            if normalized is None:
+                continue
+            evidence_identity = (normalized.session_id, normalized.excerpt)
+            if evidence_identity in seen_evidence:
+                continue
+            seen_evidence.add(evidence_identity)
+            evidence.append(normalized)
+        metadata = _metadata(
+            _NormalizedItem(cluster, tuple(evidence)),
+            0,
+            redactor,
+        )
+        identity = (str(metadata["detector_id"]), str(metadata["key"]))
+        if identity in seen_clusters:
+            _invalid_lesson_write("source", "must not contain duplicate clusters")
+        seen_clusters.add(identity)
+        items.append(_NormalizedItem(cluster, tuple(evidence)))
+    return tuple(items)
+
+
+def _lesson_date(value: object, cluster_id: str) -> str:
+    parsed = _parse_timestamp(value)
+    if parsed is None:
+        _invalid_lesson_write(
+            f"{cluster_id}.evidence.first_seen",
+            "must be an ISO-8601 timestamp",
+        )
+    return parsed.date().isoformat()
+
+
+def _lesson_detector(value: object, cluster_id: str) -> str:
+    if not isinstance(value, str) or not value:
+        _invalid_lesson_write(f"{cluster_id}.detector", "must be a non-empty string")
+    base = value.partition("@")[0]
+    if not base or ":" in base or any(character.isspace() for character in base):
+        _invalid_lesson_write(f"{cluster_id}.detector", "must be a detector identifier")
+    return base
+
+
+def _lesson_text(
+    *,
+    lesson_id: str,
+    summary: str,
+    detector: str,
+    key: str,
+    sessions: int,
+    events: int,
+    first_seen: str,
+    session_ids: Sequence[str],
+) -> str:
+    encoded_summary = json.dumps(summary, ensure_ascii=False)
+    encoded_key = json.dumps(key, ensure_ascii=False)
+    encoded_date = json.dumps(first_seen, ensure_ascii=False)
+    encoded_sessions = json.dumps(list(session_ids), ensure_ascii=False, separators=(",", ":"))
+    lines = (
+        "---",
+        f"id: {lesson_id}",
+        f"summary: {encoded_summary}",
+        "state: draft",
+        f"detector: {detector}",
+        f"key: {encoded_key}",
+        "evidence: {"
+        f"sessions: {sessions}, events: {events}, first_seen: {encoded_date}, "
+        f"session_ids: {encoded_sessions}"
+        "}",
+        "routing: {recommended: null, applied: null, applied_at: null, bead: null}",
+        "backtest: {"
+        f"window_days: {LESSON_BACKTEST_DAYS}, sessions: 0, first_seen: null, "
+        "weeks_present: 0}",
+        "guard: {layer: null, artifact: null, installed: false}",
+        "---",
+        "",
+    )
+    return "\n".join(lines)
+
+
+def _prepare_lessons(
+    drafts: Iterable[LessonDraft],
+    source: object,
+    lessons_dir: Path,
+) -> tuple[_PreparedLesson, ...]:
+    draft_records = tuple(drafts)
+    if not draft_records:
+        return ()
+    safe_redactor = Redactor()
+    items = _writer_items(source, safe_redactor)
+    item_by_id: dict[str, _NormalizedItem] = {}
+    for item in items:
+        cluster_id = str(_metadata(item, 0, safe_redactor)["cluster_id"])
+        item_by_id[cluster_id] = item
+    prepared: list[_PreparedLesson] = []
+    seen_drafts: set[str] = set()
+    paths: set[Path] = set()
+    for index, draft in enumerate(draft_records):
+        path_name = f"lessons[{index}]"
+        if not isinstance(draft, LessonDraft):
+            _invalid_lesson_write(path_name, "must be a LessonDraft")
+        cluster_id = draft.cluster_id
+        if not _is_cluster_id(cluster_id):
+            _invalid_lesson_write(f"{path_name}.cluster_id", "must be a bounded single-line id")
+        if cluster_id in seen_drafts:
+            _invalid_lesson_write(f"{path_name}.cluster_id", "must be unique within the batch")
+        seen_drafts.add(cluster_id)
+        if cluster_id not in item_by_id:
+            _invalid_lesson_write(
+                f"{path_name}.cluster_id",
+                "does not name a supplied candidate cluster",
+            )
+        try:
+            summary = _validate_summary(draft.summary, f"{path_name}.summary")
+        except ValidationError as error:
+            _invalid_lesson_write(f"{path_name}.summary", error.message)
+        item = item_by_id[cluster_id]
+        metadata = _metadata(item, 0, safe_redactor)
+        detector = _lesson_detector(metadata["detector_id"], cluster_id)
+        key = metadata["key"]
+        if not isinstance(key, str) or not key:
+            _invalid_lesson_write(f"{cluster_id}.key", "must be a non-empty string")
+        first_seen = _lesson_date(metadata["first_seen"], cluster_id)
+        session_ids = tuple(sorted({excerpt.session_id for excerpt in item.evidence}))
+        if not session_ids:
+            _invalid_lesson_write(
+                f"{cluster_id}.evidence.session_ids",
+                "must contain at least one evidence session id",
+            )
+        raw_detector = _get(item.cluster, "detector_id")
+        raw_key = _get(item.cluster, "key")
+        if not isinstance(raw_detector, str) or not isinstance(raw_key, str):
+            _invalid_lesson_write(f"{cluster_id}", "candidate identity must be text")
+        lesson_id = f"L-{hashlib.sha256(cluster_id.encode('utf-8')).hexdigest()[:8]}"
+        path = lessons_dir / f"{lesson_id}.md"
+        if path in paths:
+            _invalid_lesson_write(path_name, f"lesson id collision at {lesson_id}")
+        paths.add(path)
+        text = _lesson_text(
+            lesson_id=lesson_id,
+            summary=summary,
+            detector=detector,
+            key=key,
+            sessions=_count(metadata["sessions"]),
+            events=_count(metadata["events"]),
+            first_seen=first_seen,
+            session_ids=session_ids,
+        )
+        prepared.append(
+            _PreparedLesson(
+                lesson_id=lesson_id,
+                path=path,
+                text=text,
+                detector_id=raw_detector,
+                key=raw_key,
+            )
+        )
+    if seen_drafts != set(item_by_id):
+        _invalid_lesson_write(
+            "lessons",
+            "must match the supplied candidate cluster set exactly",
+        )
+    return tuple(prepared)
+
+
+def _existing_lesson_matches(path: Path, text: str) -> bool:
+    if path.is_symlink() or not path.is_file():
+        _invalid_lesson_write(
+            path.name,
+            "refuses to overwrite a non-regular existing path",
+        )
+    try:
+        existing = path.read_bytes()
+    except OSError as error:
+        _invalid_lesson_write(path.name, f"cannot read existing file: {error.strerror}")
+    if existing != text.encode("utf-8"):
+        _invalid_lesson_write(
+            path.name,
+            "refuses to overwrite a different lesson",
+            "keep the existing lesson and reconcile the cluster before retrying",
+        )
+    return True
+
+
+def _create_lesson(path: Path, text: str) -> bool:
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+    if hasattr(os, "O_CLOEXEC"):
+        flags |= os.O_CLOEXEC
+    try:
+        descriptor = os.open(path, flags, LESSON_FILE_MODE)
+    except FileExistsError:
+        if _existing_lesson_matches(path, text):
+            return False
+        raise
+    try:
+        os.fchmod(descriptor, LESSON_FILE_MODE)
+        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
+            descriptor = -1
+            handle.write(text)
+    except BaseException:
+        if descriptor >= 0:
+            os.close(descriptor)
+        path.unlink(missing_ok=True)
+        raise
+    return True
+
+
+def _write_prepared_lessons(
+    prepared: Sequence[_PreparedLesson],
+) -> tuple[tuple[Path, ...], tuple[Path, ...]]:
+    pending: list[_PreparedLesson] = []
+    for lesson in prepared:
+        if os.path.lexists(lesson.path):
+            _existing_lesson_matches(lesson.path, lesson.text)
+        else:
+            pending.append(lesson)
+    created: list[Path] = []
+    try:
+        for lesson in pending:
+            if _create_lesson(lesson.path, lesson.text):
+                created.append(lesson.path)
+    except BaseException:
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        raise
+    return tuple(lesson.path for lesson in prepared), tuple(created)
+
+
+def _begin_cluster_state_writes(
+    connection: sqlite3.Connection,
+    prepared: Sequence[_PreparedLesson],
+) -> None:
+    if connection.in_transaction:
+        raise ValueError("lesson writing requires a connection outside an active transaction")
+    connection.execute("BEGIN IMMEDIATE")
+    for lesson in prepared:
+        row = connection.execute(
+            "SELECT state, covered_by FROM cluster WHERE detector_id = ? AND key = ?",
+            (lesson.detector_id, lesson.key),
+        ).fetchone()
+        if row is None:
+            raise ValidationError(
+                f"Lesson write cannot mark missing cluster {lesson.lesson_id}",
+                "rebuild the derived state database and retry",
+            )
+        if str(row[0]) not in {"open", "drafted"} or row[1] is not None:
+            raise ValidationError(
+                f"Lesson write cannot mark non-candidate cluster {lesson.lesson_id}",
+                "leave the cluster unchanged and inspect its review state",
+            )
+
+
+def _finish_cluster_state_writes(
+    connection: sqlite3.Connection,
+    prepared: Sequence[_PreparedLesson],
+) -> None:
+    for lesson in prepared:
+        updated = connection.execute(
+            "UPDATE cluster SET state = 'drafted' "
+            "WHERE detector_id = ? AND key = ? AND state = 'open'",
+            (lesson.detector_id, lesson.key),
+        ).rowcount
+        if updated == 0:
+            state = connection.execute(
+                "SELECT state FROM cluster WHERE detector_id = ? AND key = ?",
+                (lesson.detector_id, lesson.key),
+            ).fetchone()
+            if state is None or str(state[0]) != "drafted":
+                raise ValidationError(
+                    f"Lesson write could not mark cluster {lesson.lesson_id} drafted",
+                    "leave the cluster unchanged and retry after checking concurrent runs",
+                )
+    connection.commit()
+
+
+def write_lesson_files(
+    drafts: Iterable[LessonDraft],
+    source: object,
+    config: TwillConfig,
+    *,
+    connection: sqlite3.Connection | None = None,
+    repo_root: Path | None = None,
+) -> tuple[Path, ...]:
+    """Render and atomically batch one draft markdown file per validated lesson."""
+
+    artifacts_root = Path(config.require_artifacts_root(repo_root)).expanduser().resolve()
+    lessons_dir = artifacts_root / LESSON_DIRNAME
+    prepared = _prepare_lessons(drafts, source, lessons_dir)
+    if not prepared:
+        return ()
+    repository = (Path(__file__).resolve().parent if repo_root is None else repo_root).resolve()
+    directory_created = not lessons_dir.exists()
+    lessons_dir.mkdir(parents=True, exist_ok=True, mode=0o700)
+    resolved_lessons_dir = lessons_dir.resolve()
+    if resolved_lessons_dir == repository or repository in resolved_lessons_dir.parents:
+        if directory_created:
+            resolved_lessons_dir.rmdir()
+        raise ConfigError(
+            f"{resolved_lessons_dir} resolves inside the TWILL repository tree ({repository})",
+            "this repository is public; lessons belong under artifacts_root outside it",
+        )
+    transaction_started = False
+    created: tuple[Path, ...] = ()
+    try:
+        if connection is not None:
+            _begin_cluster_state_writes(connection, prepared)
+            transaction_started = True
+        paths, created = _write_prepared_lessons(prepared)
+        if connection is not None:
+            _finish_cluster_state_writes(connection, prepared)
+            transaction_started = False
+        return paths
+    except BaseException:
+        if transaction_started:
+            connection.rollback()
+        for path in reversed(created):
+            path.unlink(missing_ok=True)
+        if directory_created:
+            try:
+                lessons_dir.rmdir()
+            except OSError:
+                pass
+        raise
+
+
+persist_lesson_drafts = write_lesson_files
+
+
 def build_prompt_from_db(
     connection: sqlite3.Connection,
     clusters: object | None = None,
@@ -808,6 +1166,9 @@ __all__ = [
     "EXCERPT_END",
     "ExplainCluster",
     "ExplainExcerpt",
+    "LESSON_BACKTEST_DAYS",
+    "LESSON_DIRNAME",
+    "LESSON_FILE_MODE",
     "LessonDraft",
     "MAX_CLUSTER_BYTES",
     "MAX_CLUSTER_PROMPT_BYTES",
@@ -823,5 +1184,7 @@ __all__ = [
     "build_prompt_from_db",
     "invoke_claude",
     "load_candidate_clusters",
+    "persist_lesson_drafts",
     "validate_explain_output",
+    "write_lesson_files",
 ]
