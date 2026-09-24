@@ -21,7 +21,7 @@ import re
 import sqlite3
 import sys
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
 from typing import Iterator, Sequence
@@ -30,6 +30,7 @@ import twill_detectors
 import twill_digest
 import twill_lessons
 import twill_measure
+import twill_prune
 import twill_ranker
 import twill_schema
 import twill_cursor
@@ -60,7 +61,9 @@ from twill_status import read_status, record_stage
 MAX_EXCERPT_LENGTH = 240
 SIGNATURE_INPUT_LIMIT = 400
 SIGNATURE_HASH_LENGTH = 12
-MUTATING_VERBS = frozenset({"ingest", "detect", "rank", "accept", "apply", "measure"})
+MUTATING_VERBS = frozenset(
+    {"ingest", "detect", "rank", "accept", "apply", "measure", "prune"}
+)
 
 _SIGNATURE_SUBSTITUTIONS = (
     (
@@ -818,10 +821,14 @@ class Store:
         *,
         read_only: bool = False,
         content_fences: Sequence[str] = (),
+        retention_seconds: float | None = None,
     ):
         self.state_dir = state_dir
         self.db_path = twill_schema.state_db_path(state_dir)
         self.redactor = Redactor(content_fences)
+        if retention_seconds is not None:
+            twill_prune.validate_retention(retention_seconds)
+        self.retention_seconds = retention_seconds
         self.connection = twill_schema.connect(state_dir, read_only=read_only)
         if not read_only:
             self.connection.executescript(SCHEMA)
@@ -955,7 +962,12 @@ class Store:
                         self.redactor.redact_excerpt(event.cwd),
                     ),
                 )
-            observation_count = self._run_detector(conn, key, stored_session_id)
+            observation_count = self._run_detector(
+                conn,
+                key,
+                stored_session_id,
+                self.retention_seconds,
+            )
             if cursor_update is not None:
                 twill_cursor.upsert_cursor(
                     conn,
@@ -1049,17 +1061,29 @@ class Store:
         return int(row[0]) if row else 0
 
     @staticmethod
-    def _run_detector(conn: sqlite3.Connection, session_key: str, session_id: str) -> int:
+    def _run_detector(
+        conn: sqlite3.Connection,
+        session_key: str,
+        session_id: str,
+        retention_seconds: float | None = None,
+    ) -> int:
         """D-00@1: a minimal detector proving stored events become observations."""
 
         # The v1 observation table carries no detector_id (cluster and
         # measurement attribute detectors); D-00@1 events are recognisable by
         # their kind until Phase 2 replaces this detector.
-        rows = conn.execute(
+        query = (
             "SELECT ts_utc, ts_local, text, signature, cwd "
-            "FROM transcript_event WHERE session_key = ? AND trim(text) <> ''",
-            (session_key,),
-        ).fetchall()
+            "FROM transcript_event WHERE session_key = ? AND trim(text) <> ''"
+        )
+        parameters: list[object] = [session_key]
+        if retention_seconds is not None:
+            cutoff = datetime.now(timezone.utc) - timedelta(
+                seconds=float(retention_seconds)
+            )
+            query += " AND julianday(ts_utc) >= julianday(?)"
+            parameters.append(cutoff.isoformat())
+        rows = conn.execute(query, parameters).fetchall()
         for ts_utc, ts_local, text, stored_signature, cwd in rows:
             normalized = (
                 stored_signature if stored_signature is not None else signature(text)
@@ -1188,7 +1212,11 @@ def ingest_command(args: argparse.Namespace) -> int:
         )
     except (OSError, ValueError) as exc:
         raise CliError(EXIT_RUNTIME_ERROR, str(exc), "check the transcript path and try again") from exc
-    store = Store(state_dir, content_fences=config.content_fences)
+    store = Store(
+        state_dir,
+        content_fences=config.content_fences,
+        retention_seconds=config.retention,
+    )
     try:
         # EC-05: on every enumerated run, flag upstream files that vanished.
         # The sweep runs before the no-settled-files error so a fully cleaned
@@ -1502,6 +1530,89 @@ def measure_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def prune_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    retention = config.retention if args.older_than is None else args.older_than
+    try:
+        twill_prune.validate_retention(retention)
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+    state_dir = _state_dir(args.state_dir)
+    started = perf_counter()
+    connection = twill_schema.connect(state_dir)
+    try:
+        report = twill_prune.prune_observations(
+            connection,
+            retention_seconds=retention,
+        )
+    except ValueError as exc:
+        raise UsageError(str(exc)) from exc
+    finally:
+        connection.close()
+
+    if report.exit_code != EXIT_SUCCESS:
+        record_stage(
+            state_dir,
+            "prune",
+            perf_counter() - started,
+            {
+                "observations": report.remaining_observations,
+                "pruned_observations": report.pruned_observations,
+                "remaining_observations": report.remaining_observations,
+                "clusters": report.clusters,
+                "detectors": len(report.detector_report.outcomes),
+            },
+            succeeded=False,
+        )
+        failures = "; ".join(
+            f"{outcome.full_id}: {outcome.error}"
+            for outcome in report.detector_report.failed
+            if outcome.error
+        )
+        message = (
+            f"{len(report.detector_report.failed)} of "
+            f"{len(report.detector_report.outcomes)} detector(s) failed "
+            f"({failures})"
+        )
+        hint = (
+            "detector semantics are versioned; a refused detector changed under "
+            "its recorded version — bump its version in twill_detectors.REGISTRY"
+            if report.detector_report.refused
+            else "retention was committed; fix the failing detector and retry its refresh"
+        )
+        raise CliError(report.exit_code, message, hint)
+
+    record_stage(
+        state_dir,
+        "prune",
+        perf_counter() - started,
+        {
+            "observations": report.remaining_observations,
+            "pruned_observations": report.pruned_observations,
+            "remaining_observations": report.remaining_observations,
+            "clusters": report.clusters,
+            "detectors": len(report.detector_report.outcomes),
+        },
+    )
+    emit_success(report.as_dict(), json_mode=args.json)
+    if args.json:
+        return EXIT_SUCCESS
+    print("TWILL prune")
+    print(
+        f"retention: {report.retention_days} day(s), "
+        f"cutoff {report.cutoff_utc}"
+    )
+    if report.pruned_observations == 0:
+        print("no work; no observations were older than the retention window")
+    else:
+        print(f"pruned {report.pruned_observations} observation(s)")
+    print(
+        f"{report.remaining_observations} observation(s) remain; "
+        f"{report.clusters} cluster(s) recomputed"
+    )
+    return EXIT_SUCCESS
+
+
 def _lesson_data(record: twill_lessons.LessonRecord) -> dict[str, object]:
     return {"lesson": record.as_dict()}
 
@@ -1715,6 +1826,19 @@ def build_parser() -> argparse.ArgumentParser:
     measure.add_argument("--state-dir")
     measure.add_argument("--json", action="store_true")
     measure.set_defaults(handler=measure_command)
+
+    prune = subparsers.add_parser(
+        "prune", help="remove observations outside the retention window"
+    )
+    prune.add_argument(
+        "--older-than",
+        type=_parse_duration,
+        default=None,
+        help="retention duration such as 180d (default: config retention)",
+    )
+    prune.add_argument("--state-dir")
+    prune.add_argument("--json", action="store_true")
+    prune.set_defaults(handler=prune_command)
 
     accept = subparsers.add_parser(
         "accept", help="accept a drafted lesson after operator review"

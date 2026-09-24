@@ -34,6 +34,8 @@ COUNT_FIELDS = frozenset(
         "measurements",
         "missing_paths",
         "observations",
+        "pruned_observations",
+        "remaining_observations",
         "records",
         "rows",
         "sessions",

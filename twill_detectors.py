@@ -687,6 +687,39 @@ def _replay_parameters(window_start_utc: str, window_days: int) -> dict[str, obj
     return {"window_start_utc": window_start_utc, "window_days": window_days}
 
 
+def _clock(value: str | datetime | None) -> datetime:
+    if value is None:
+        return datetime.now(timezone.utc)
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError as exc:
+            raise ValueError("now must be an ISO-8601 timestamp") from exc
+    else:
+        raise ValueError("now must be an ISO-8601 timestamp or datetime")
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _detector_window(
+    detector: Detector,
+    default_window_days: int,
+    windows: Mapping[str, int] | None,
+) -> int:
+    if windows is None:
+        return default_window_days
+    value = windows.get(detector.full_id, windows.get(detector.detector_id, default_window_days))
+    if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+        raise ValueError(f"window for {detector.full_id} must be a positive integer")
+    return value
+
+
 def validate_detector_semantics(
     connection: sqlite3.Connection, detector: Detector
 ) -> None:
@@ -790,6 +823,8 @@ def _run_one(
     window_days: int,
     parameters: dict[str, object],
     ran_at: str,
+    *,
+    manage_transaction: bool = True,
 ) -> int:
     """Run one detector and commit its refresh in one transaction (§8.2).
 
@@ -798,7 +833,11 @@ def _run_one(
     writes and no semantics stamp for output that never committed.
     """
 
-    connection.execute("BEGIN IMMEDIATE")
+    savepoint = "twill_detector_run"
+    if manage_transaction:
+        connection.execute("BEGIN IMMEDIATE")
+    else:
+        connection.execute(f"SAVEPOINT {savepoint}")
     try:
         cursor = connection.execute(detector.cluster_sql, parameters)
         emitted = _collect_clusters(detector, cursor)
@@ -856,9 +895,16 @@ def _run_one(
                 window_days,
             ),
         )
-        connection.commit()
+        if manage_transaction:
+            connection.commit()
+        else:
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
     except BaseException:
-        connection.rollback()
+        if manage_transaction:
+            connection.rollback()
+        else:
+            connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+            connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         raise
     return len(emitted)
 
@@ -868,6 +914,8 @@ def _record_failure(
     detector: Detector,
     ran_at: str,
     error_text: str,
+    *,
+    manage_transaction: bool = True,
 ) -> None:
     """Note a failed run on a version that has succeeded before, if it has.
 
@@ -878,18 +926,38 @@ def _record_failure(
     detector that already failed once.
     """
 
+    savepoint = "twill_detector_failure"
     try:
-        with connection:
-            connection.execute(
-                "UPDATE detector_run SET last_run_at = ?, last_status = 'error', "
-                "last_error = ? WHERE detector_id = ? AND version = ?",
-                (
-                    ran_at,
-                    _bounded(error_text),
-                    detector.detector_id,
-                    detector.version,
-                ),
-            )
+        if manage_transaction:
+            with connection:
+                connection.execute(
+                    "UPDATE detector_run SET last_run_at = ?, last_status = 'error', "
+                    "last_error = ? WHERE detector_id = ? AND version = ?",
+                    (
+                        ran_at,
+                        _bounded(error_text),
+                        detector.detector_id,
+                        detector.version,
+                    ),
+                )
+        else:
+            connection.execute(f"SAVEPOINT {savepoint}")
+            try:
+                connection.execute(
+                    "UPDATE detector_run SET last_run_at = ?, last_status = 'error', "
+                    "last_error = ? WHERE detector_id = ? AND version = ?",
+                    (
+                        ran_at,
+                        _bounded(error_text),
+                        detector.detector_id,
+                        detector.version,
+                    ),
+                )
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+            except BaseException:
+                connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+                connection.execute(f"RELEASE SAVEPOINT {savepoint}")
+                raise
     except sqlite3.Error:
         pass
 
@@ -897,9 +965,11 @@ def _record_failure(
 def run_detectors(
     connection: sqlite3.Connection,
     *,
-    window_days: int,
+    window_days: int = 30,
     registry: Sequence[Detector] | None = None,
     only: Sequence[str] | None = None,
+    window_days_by_detector: Mapping[str, int] | None = None,
+    now: str | datetime | None = None,
 ) -> DetectorRunReport:
     """Run the registry with per-detector isolation; never raises per-detector.
 
@@ -917,16 +987,27 @@ def run_detectors(
     active = build_registry(*(registry if registry is not None else REGISTRY))
     if only:
         active = select_detectors(active, only)
+    if window_days_by_detector is not None:
+        for detector in active:
+            _detector_window(detector, window_days, window_days_by_detector)
 
-    now = datetime.now(timezone.utc)
-    parameters = {
-        "window_start_utc": (now - timedelta(days=window_days)).isoformat(),
-        "window_days": window_days,
-    }
-    ran_at = now.isoformat()
+    current = _clock(now)
+    ran_at = current.isoformat()
+    manage_transactions = not connection.in_transaction
 
     outcomes: list[DetectorOutcome] = []
+    resolved_windows: list[int] = []
     for detector in active:
+        detector_days = _detector_window(
+            detector, window_days, window_days_by_detector
+        )
+        resolved_windows.append(detector_days)
+        parameters = {
+            "window_start_utc": (
+                current - timedelta(days=detector_days)
+            ).isoformat(),
+            "window_days": detector_days,
+        }
         row = connection.execute(
             "SELECT semantics_sha, attribution_sha, backtest_sha FROM detector_run "
             "WHERE detector_id = ? AND version = ?",
@@ -973,10 +1054,21 @@ def run_detectors(
             continue
         try:
             clusters = _run_one(
-                connection, detector, window_days, parameters, ran_at
+                connection,
+                detector,
+                detector_days,
+                parameters,
+                ran_at,
+                manage_transaction=manage_transactions,
             )
         except (sqlite3.Error, DetectorContractError) as exc:
-            _record_failure(connection, detector, ran_at, str(exc))
+            _record_failure(
+                connection,
+                detector,
+                ran_at,
+                str(exc),
+                manage_transaction=manage_transactions,
+            )
             outcomes.append(
                 DetectorOutcome(
                     detector_id=detector.detector_id,
@@ -994,9 +1086,16 @@ def run_detectors(
                 clusters=clusters,
             )
         )
+    report_window_days = (
+        resolved_windows[0]
+        if resolved_windows and len(set(resolved_windows)) == 1
+        else window_days
+    )
     return DetectorRunReport(
-        window_days=window_days,
-        window_start_utc=str(parameters["window_start_utc"]),
+        window_days=report_window_days,
+        window_start_utc=(
+            current - timedelta(days=report_window_days)
+        ).isoformat(),
         ran_at=ran_at,
         outcomes=tuple(outcomes),
     )

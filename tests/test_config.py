@@ -240,6 +240,28 @@ class RejectionTests(unittest.TestCase):
                     repo_root=Path(directory),
                 )
 
+    def test_retention_must_be_positive(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ConfigError):
+                load_config(
+                    write_config(
+                        Path(directory),
+                        f'retention = "0"\nartifacts_root = "{Path(directory) / "artifacts"}"\n',
+                    ),
+                    repo_root=Path(directory),
+                )
+
+    def test_nonfinite_numeric_duration_is_rejected(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(ConfigError):
+                load_config(
+                    write_config(
+                        Path(directory),
+                        f'retention = nan\nartifacts_root = "{Path(directory) / "artifacts"}"\n',
+                    ),
+                    repo_root=Path(directory),
+                )
+
     def test_top_k_must_be_a_positive_integer(self):
         for body in ("top_k = 0\n", 'top_k = "ten"\n', "top_k = true\n", "top_k = 1.5\n"):
             with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:

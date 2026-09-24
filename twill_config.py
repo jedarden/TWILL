@@ -32,6 +32,7 @@ artifact writer through :meth:`TwillConfig.require_artifacts_root`.
 
 from __future__ import annotations
 
+import math
 import re
 import tomllib
 from dataclasses import dataclass
@@ -94,9 +95,15 @@ def parse_duration(value: object) -> float:
     if isinstance(value, bool):
         raise ConfigError("duration must be a number or a string such as 2h, not a boolean")
     if isinstance(value, (int, float)):
-        if value < 0:
+        try:
+            resolved = float(value)
+        except (OverflowError, ValueError):
+            raise ConfigError("duration is outside the supported range") from None
+        if not math.isfinite(resolved):
+            raise ConfigError("duration must be finite")
+        if resolved < 0:
             raise ConfigError(f"duration must not be negative: {value}")
-        return float(value)
+        return resolved
     if not isinstance(value, str):
         raise ConfigError(
             "duration must be seconds or a form such as 2h, 30m, or 0; "
@@ -202,7 +209,10 @@ def _build_config(values: dict[str, object], config_path: Path, repo: Path) -> T
 
 def _duration(key: str, values: dict[str, object], config_path: Path) -> float:
     try:
-        return parse_duration(values.get(key, _default_for(key)))
+        resolved = parse_duration(values.get(key, _default_for(key)))
+        if key == "retention" and resolved <= 0:
+            raise ConfigError("retention must be greater than zero")
+        return resolved
     except ConfigError as exc:
         hint = exc.hint or "fix the value in the TWILL config file and try again"
         raise ConfigError(f"{config_path}: {key}: {exc.message}", hint) from exc
