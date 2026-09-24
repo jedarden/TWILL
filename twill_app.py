@@ -17,6 +17,7 @@ import glob
 import hashlib
 import json
 import os
+import re
 import sqlite3
 import sys
 from dataclasses import dataclass
@@ -45,11 +46,71 @@ from twill_contract import (
     emit_success,
 )
 from twill_lock import StateLock
-from twill_redactor import Redactor, redact as _redact
+from twill_redactor import Redactor, redact as _redact, redact_text
 
 
 MAX_EXCERPT_LENGTH = 240
+SIGNATURE_INPUT_LIMIT = 400
+SIGNATURE_HASH_LENGTH = 12
 MUTATING_VERBS = frozenset({"ingest", "detect"})
+
+_SIGNATURE_SUBSTITUTIONS = (
+    (
+        re.compile(
+            r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b",
+            re.IGNORECASE,
+        ),
+        "<uuid>",
+    ),
+    (re.compile(r"\b(?:[0-9a-f]{40}|[0-9a-f]{64})\b", re.IGNORECASE), "<sha>"),
+    (re.compile(r"\b0x[0-9a-f]+\b", re.IGNORECASE), "<hex>"),
+    (re.compile(r"\b[0-9a-f]{7,64}\b", re.IGNORECASE), "<hex>"),
+    (re.compile(r"/(?:home|tmp|var|Users)/[^\s:'\"]+", re.IGNORECASE), "<path>"),
+    (
+        re.compile(r"(?<![A-Za-z0-9_/])/(?:[A-Za-z0-9._@+-]+/)*[A-Za-z0-9._@+-]+"),
+        "<path>",
+    ),
+    (
+        re.compile(
+            r"(?P<prefix>^|[\s(\"'=,:])"
+            r"(?:(?:\./|\.\./)[A-Za-z0-9._@+-]+(?:/[A-Za-z0-9._@+-]+)*"
+            r"|(?:[A-Za-z0-9._@+-]+/)+[A-Za-z0-9._@+-]*[._0-9-][A-Za-z0-9._@+-]*)"
+        ),
+        lambda match: f"{match.group('prefix')}<path>",
+    ),
+    (re.compile(r"\b\d+\b"), "<n>"),
+    (re.compile(r"\s+"), " "),
+)
+
+
+def signature(text: object | None) -> str:
+    """Normalize a redacted error text without retaining volatile values."""
+
+    normalized = redact_text(text).strip()[:SIGNATURE_INPUT_LIMIT]
+    for pattern, replacement in _SIGNATURE_SUBSTITUTIONS:
+        normalized = pattern.sub(replacement, normalized)
+    return normalized.strip()
+
+
+def h12(text: str) -> str:
+    """Return the compact SHA-256 fingerprint used for error signatures."""
+
+    return hashlib.sha256(text.encode("utf-8", "replace")).hexdigest()[
+        :SIGNATURE_HASH_LENGTH
+    ]
+
+
+def normalize_error_signature(text: object | None) -> str:
+    """Descriptive alias for :func:`signature`."""
+
+    return signature(text)
+
+
+def hash_error_signature(text: object | None) -> str:
+    """Normalize and hash one error text."""
+
+    return h12(signature(text))
+
 
 # Plan §14: `twill detect [--window 30d] ...` — the default analysis window.
 DEFAULT_DETECT_WINDOW_DAYS = 30
@@ -77,10 +138,68 @@ CREATE TABLE IF NOT EXISTS transcript_event (
     ts_local TEXT NOT NULL,
     kind TEXT NOT NULL,
     text TEXT NOT NULL,
+    signature TEXT,
+    sig_hash TEXT,
     cwd TEXT,
     UNIQUE(session_key, source_line, event_index)
 );
 """
+
+
+def _ensure_transcript_event_signature_columns(
+    connection: sqlite3.Connection,
+) -> None:
+    columns = {
+        row[1] for row in connection.execute("PRAGMA table_info(transcript_event)")
+    }
+    for column in ("signature", "sig_hash"):
+        if column not in columns:
+            connection.execute(f"ALTER TABLE transcript_event ADD COLUMN {column} TEXT")
+
+
+def _backfill_transcript_event_signatures(
+    connection: sqlite3.Connection,
+) -> None:
+    with connection:
+        rows = connection.execute(
+            "SELECT event_id, text FROM transcript_event "
+            "WHERE signature IS NULL OR sig_hash IS NULL"
+        ).fetchall()
+        for event_id, text in rows:
+            normalized = signature(text)
+            connection.execute(
+                "UPDATE transcript_event SET signature = ?, sig_hash = ? WHERE event_id = ?",
+                (normalized, h12(normalized), event_id),
+            )
+        connection.execute(
+            """
+            UPDATE observation
+               SET signature = (
+                       SELECT e.signature
+                         FROM transcript_event AS e
+                         JOIN session AS s ON s.session_key = e.session_key
+                        WHERE s.session_id = observation.session_id
+                          AND e.ts_utc = observation.ts_utc
+                          AND e.ts_local = observation.ts_local
+                          AND e.text = observation.excerpt
+                          AND e.cwd = observation.cwd
+                        LIMIT 1
+                   ),
+                   sig_hash = (
+                       SELECT e.sig_hash
+                         FROM transcript_event AS e
+                         JOIN session AS s ON s.session_key = e.session_key
+                        WHERE s.session_id = observation.session_id
+                          AND e.ts_utc = observation.ts_utc
+                          AND e.ts_local = observation.ts_local
+                          AND e.text = observation.excerpt
+                          AND e.cwd = observation.cwd
+                        LIMIT 1
+                   )
+             WHERE kind = 'session_activity'
+               AND (signature IS NULL OR sig_hash IS NULL)
+            """
+        )
 
 
 @dataclass(frozen=True)
@@ -422,6 +541,9 @@ class Store:
         self.connection = twill_schema.connect(state_dir, read_only=read_only)
         if not read_only:
             self.connection.executescript(SCHEMA)
+            _ensure_transcript_event_signature_columns(self.connection)
+            _backfill_transcript_event_signatures(self.connection)
+            self.connection.commit()
 
     def close(self) -> None:
         self.connection.close()
@@ -476,11 +598,13 @@ class Store:
             )
             for event in session.events:
                 ts_utc, ts_local = _timestamp_pair(event.timestamp)
+                stored_text = self.redactor.redact_excerpt(event.text)
+                normalized = signature(self.redactor.redact_text(event.text))
                 # The boundary is before the first database bind.  There is no
                 # unredacted transcript text in the state DB.
                 conn.execute(
-                    "INSERT INTO transcript_event(session_key, source_line, event_index, ts_utc, ts_local, kind, text, cwd) "
-                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                    "INSERT INTO transcript_event(session_key, source_line, event_index, ts_utc, ts_local, kind, text, signature, sig_hash, cwd) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                     (
                         key,
                         event.source_line,
@@ -488,7 +612,9 @@ class Store:
                         ts_utc,
                         ts_local,
                         self.redactor.redact_text(event.kind),
-                        self.redactor.redact_excerpt(event.text),
+                        stored_text,
+                        normalized,
+                        h12(normalized),
                         self.redactor.redact_excerpt(event.cwd),
                     ),
                 )
@@ -592,13 +718,22 @@ class Store:
         # The v1 observation table carries no detector_id (cluster and
         # measurement attribute detectors); D-00@1 events are recognisable by
         # their kind until Phase 2 replaces this detector.
-        conn.execute(
-            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, excerpt, cwd) "
-            "SELECT ?, e.ts_utc, e.ts_local, 'session_activity', e.text, e.cwd "
-            "FROM transcript_event AS e "
-            "WHERE e.session_key = ? AND trim(e.text) <> ''",
-            (session_id, session_key),
-        )
+        rows = conn.execute(
+            "SELECT ts_utc, ts_local, text, signature, cwd "
+            "FROM transcript_event WHERE session_key = ? AND trim(text) <> ''",
+            (session_key,),
+        ).fetchall()
+        for ts_utc, ts_local, text, stored_signature, cwd in rows:
+            normalized = (
+                stored_signature if stored_signature is not None else signature(text)
+            )
+            sig_hash = h12(normalized)
+            conn.execute(
+                "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
+                "signature, sig_hash, excerpt, cwd) "
+                "VALUES (?, ?, ?, 'session_activity', ?, ?, ?, ?)",
+                (session_id, ts_utc, ts_local, normalized, sig_hash, text, cwd),
+            )
         row = conn.execute(
             "SELECT count(*) FROM observation WHERE session_id = ? AND kind = 'session_activity'",
             (session_id,),
