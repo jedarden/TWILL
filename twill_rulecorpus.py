@@ -46,6 +46,7 @@ from __future__ import annotations
 import glob
 import hashlib
 import sqlite3
+from contextlib import nullcontext
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -253,6 +254,7 @@ def index_corpus(
     patterns: Sequence[str],
     *,
     now: str | None = None,
+    manage_transaction: bool = True,
 ) -> IndexReport:
     """Re-index the corpus described by ``patterns`` in one transaction.
 
@@ -260,7 +262,9 @@ def index_corpus(
     :func:`parse_rule_pattern`; ``now`` stamps new and reindexed rows and is
     injectable for tests.  Every stored path is afterwards checked for
     existence so a vanished rule file becomes ``stale`` rather than
-    silently absent (EC-11).  Returns the per-action report.
+    silently absent (EC-11).  ``manage_transaction`` is for callers that
+    already own an outer transaction; the default keeps the index atomic on
+    its own.  Returns the per-action report.
     """
 
     if now is None:
@@ -281,7 +285,8 @@ def index_corpus(
     for doc in discovery.docs:
         paths_by_sha[doc.sha] = paths_by_sha.get(doc.sha, ()) + (str(doc.path),)
 
-    with connection:
+    transaction = connection if manage_transaction else nullcontext()
+    with transaction:
         for doc in discovery.docs:
             path_text = str(doc.path)
             row = connection.execute(

@@ -27,6 +27,7 @@ from time import perf_counter
 from typing import Iterator, Sequence
 
 import twill_detectors
+import twill_ranker
 import twill_schema
 import twill_cursor
 from codex_reader import CodexRolloutLineParser
@@ -54,7 +55,7 @@ from twill_status import read_status, record_stage
 MAX_EXCERPT_LENGTH = 240
 SIGNATURE_INPUT_LIMIT = 400
 SIGNATURE_HASH_LENGTH = 12
-MUTATING_VERBS = frozenset({"ingest", "detect"})
+MUTATING_VERBS = frozenset({"ingest", "detect", "rank"})
 
 _SIGNATURE_SUBSTITUTIONS = (
     (
@@ -1031,6 +1032,97 @@ def detect_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def rank_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    top_k = config.top_k if getattr(args, "top", None) is None else args.top
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise UsageError("--top must be a positive integer")
+    state_dir = _state_dir(args.state_dir)
+    started = perf_counter()
+    connection = twill_schema.connect(state_dir)
+    try:
+        result = twill_ranker.run_rank(
+            connection,
+            config.rule_globs,
+            top_k=top_k,
+        )
+    finally:
+        connection.close()
+
+    coverage = result.ranking.coverage
+    warnings: list[str] = []
+    if result.index.skipped:
+        warnings.append(
+            f"skipped {len(result.index.skipped)} rule document(s) during indexing"
+        )
+    if result.index.still_stale or result.index.vanished:
+        warnings.append(
+            "the rule corpus contains stale documents; coverage is degraded"
+        )
+    record_stage(
+        state_dir,
+        "rank",
+        perf_counter() - started,
+        {
+            "rows": result.index.docs,
+            "clusters": coverage.total,
+        },
+    )
+    data = {
+        "top_k": top_k,
+        "clusters": [cluster.as_dict() for cluster in result.ranking.clusters],
+        "covered_clusters": [
+            cluster.as_dict() for cluster in result.ranking.covered_clusters
+        ],
+        "escalations": [
+            cluster.as_dict() for cluster in result.ranking.escalations
+        ],
+        "degraded_clusters": [
+            cluster.as_dict() for cluster in result.ranking.degraded_clusters
+        ],
+        "suppressed_clusters": [
+            cluster.as_dict() for cluster in result.ranking.suppressed_clusters
+        ],
+        "coverage": {
+            "total": coverage.total,
+            "covered": coverage.covered,
+            "uncovered": coverage.uncovered,
+        },
+        "corpus": {
+            "documents": result.index.docs,
+            "stale": result.index.still_stale + len(result.index.vanished),
+            "skipped": len(result.index.skipped),
+        },
+    }
+    emit_success(data, json_mode=args.json, warnings=warnings)
+    if args.json:
+        return EXIT_SUCCESS
+
+    print("TWILL rank")
+    print(f"top: {top_k}")
+    if not result.ranking.clusters:
+        print("no new-lesson candidates")
+    for cluster in result.ranking.clusters:
+        print(
+            f"- {cluster.detector_id} {cluster.key}: "
+            f"{cluster.sessions} session(s), {cluster.events} event(s)"
+        )
+    if result.ranking.escalations:
+        print("escalations:")
+        for cluster in result.ranking.escalations:
+            rule = f" ({cluster.covered_by})" if cluster.covered_by else ""
+            print(f"- {cluster.detector_id} {cluster.key}{rule}")
+    if result.ranking.degraded_clusters:
+        print("degraded coverage:")
+        for cluster in result.ranking.degraded_clusters:
+            print(f"- {cluster.detector_id} {cluster.key} ({cluster.covered_by})")
+    print(
+        f"{coverage.covered} covered cluster(s); "
+        f"{coverage.uncovered} uncovered cluster(s)"
+    )
+    return EXIT_SUCCESS
+
+
 def status_command(args: argparse.Namespace) -> int:
     payload = read_status(_state_dir(args.state_dir))
     if args.json:
@@ -1143,6 +1235,14 @@ def build_parser() -> argparse.ArgumentParser:
     detect.add_argument("--state-dir")
     detect.add_argument("--json", action="store_true")
     detect.set_defaults(handler=detect_command)
+
+    rank = subparsers.add_parser(
+        "rank", help="refresh rule coverage and list new-lesson candidates"
+    )
+    rank.add_argument("--top", type=int, default=None, help="maximum uncovered clusters")
+    rank.add_argument("--state-dir")
+    rank.add_argument("--json", action="store_true")
+    rank.set_defaults(handler=rank_command)
 
     status = subparsers.add_parser("status", help="show stage status records")
     status.add_argument("--state-dir")
