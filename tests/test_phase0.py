@@ -84,12 +84,25 @@ class Phase0CliTests(unittest.TestCase):
             self.assertEqual(ingest.returncode, 0, ingest.stderr)
             self.assertIn("observation(s)", ingest.stdout)
 
-            digest = self.run_cli("digest", "--stdout", "--state-dir", str(state))
+            digest = self.run_cli(
+                "digest",
+                "--stdout",
+                "--week",
+                "2026-W38",
+                "--state-dir",
+                str(state),
+            )
             self.assertEqual(digest.returncode, 0, digest.stderr)
             self.assertIn("TWILL digest", digest.stdout)
-            self.assertIn("observation #", digest.stdout)
-            self.assertIn("error: command not found", digest.stdout)
-            self.assertIn("<redacted:github-token>", digest.stdout)
+            self.assertIn(
+                "observations: 2 total, 2 current, 0 previous",
+                digest.stdout,
+            )
+            self.assertIn(
+                " | $ twill digest --week 2026-W38 --stdout",
+                digest.stdout,
+            )
+            self.assertNotIn(token, digest.stdout)
 
             connection = sqlite3.connect(state / "twill.db")
             try:
@@ -152,8 +165,16 @@ class Phase0CliTests(unittest.TestCase):
                 str(root / "state"),
             )
             self.assertEqual(result.returncode, 0, result.stderr)
-            digest = self.run_cli("digest", "--stdout", "--state-dir", str(root / "state"))
-            self.assertIn("codex observation", digest.stdout)
+            digest = self.run_cli(
+                "digest",
+                "--stdout",
+                "--week",
+                "2026-W38",
+                "--state-dir",
+                str(root / "state"),
+            )
+            self.assertEqual(digest.returncode, 0, digest.stderr)
+            self.assertIn("week: 2026-W38", digest.stdout)
 
 
 if __name__ == "__main__":

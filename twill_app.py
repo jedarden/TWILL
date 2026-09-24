@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
-"""Phase 0 implementation of the TWILL transcript-to-digest pipeline.
+"""TWILL transcript-to-digest pipeline.
 
-The first version deliberately keeps the pipeline small and deterministic.  It
-does not retain raw transcript lines and has no artifact writer:
-reader -> cursor -> redactor -> SQLite -> one activity detector -> digest.
+The pipeline keeps raw transcript lines out of the corpus and writes distilled
+artifacts only to the configured external artifacts root:
+reader -> cursor -> redactor -> SQLite -> detectors -> weekly digest.
 Ingest is cursor-bookkept (plan §6.2 steps 3-6, §8.1 EC-02..EC-05): appended
 files resume at ``last_offset``, rewritten or shrunk files reparse from zero,
 a torn final line is left for the next run, and a vanished file is flagged
@@ -27,6 +27,7 @@ from time import perf_counter
 from typing import Iterator, Sequence
 
 import twill_detectors
+import twill_digest
 import twill_lessons
 import twill_measure
 import twill_ranker
@@ -1618,41 +1619,40 @@ def doctor_command(args: argparse.Namespace) -> int:
 
 
 def digest_command(args: argparse.Namespace) -> int:
-    state_dir = _state_dir(args.state_dir)
-    # A read verb must not bootstrap the state directory or database.  An
-    # absent derived database is simply an empty first-run digest; an existing
-    # database is always opened through SQLite's URI mode=ro path.
-    if twill_schema.state_db_path(state_dir).is_file():
-        store = Store(state_dir, read_only=True)
-        try:
-            total, rows = store.digest_rows()
-        finally:
-            store.close()
-    else:
-        total, rows = 0, []
+    try:
+        selected_week = (
+            twill_digest.parse_week(args.week)
+            if args.week is not None
+            else twill_digest.default_week()
+        )
+    except twill_digest.WeekError as exc:
+        raise UsageError(str(exc)) from exc
+    report = twill_digest.build_digest(_state_dir(args.state_dir), selected_week)
+    warnings = list(report.warnings)
     if args.json:
         emit_success(
-            {
-                "observations": total,
-                "detectors": ["D-00@1"],
-                "rows": [dict(row) for row in rows],
-            },
+            twill_digest.render_data(report),
             json_mode=True,
+            warnings=warnings,
         )
         return EXIT_SUCCESS
-
-    print("TWILL digest")
-    print(f"observations: {total}")
-    print("detectors: D-00@1 (session activity)")
-    if not rows:
-        print("no observations")
-        return EXIT_SUCCESS
-    for row in rows:
+    text = twill_digest.render_text(report)
+    if args.stdout:
+        sys.stdout.write(text)
+    else:
+        config = load_config()
+        artifact = twill_digest.write_digest_file(
+            text,
+            config.require_artifacts_root(),
+            selected_week,
+        )
         print(
-            f"- observation #{row['obs_id']} [{row['detector_id']}] "
-            f"{row['kind']} session={row['session_id']}: {row['excerpt']}"
+            f"digest {report.week_id}: {len(report.findings)} finding(s) "
+            f"written to {redact_text(artifact)}"
         )
-    return 0
+    for warning in warnings:
+        print(f"warning: {redact_text(warning)}", file=sys.stderr)
+    return EXIT_SUCCESS
 
 
 class _ArgumentParser(argparse.ArgumentParser):
@@ -1755,8 +1755,19 @@ def build_parser() -> argparse.ArgumentParser:
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(handler=doctor_command)
 
-    digest = subparsers.add_parser("digest", help="render the stored Phase 0 digest")
-    digest.add_argument("--stdout", action="store_true", help="render to stdout")
+    digest = subparsers.add_parser(
+        "digest",
+        help="render the week-over-week digest with reproduction commands",
+    )
+    digest.add_argument(
+        "--week",
+        help="ISO week to render, e.g. 2026-W37 (default: last completed week)",
+    )
+    digest.add_argument(
+        "--stdout",
+        action="store_true",
+        help="render to stdout instead of writing the weekly artifact",
+    )
     digest.add_argument("--state-dir")
     digest.add_argument("--json", action="store_true")
     digest.set_defaults(handler=digest_command)
@@ -1771,7 +1782,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         args = parser.parse_args(actual_argv)
         if getattr(args, "limit", 1) < 1:
             raise CliError(EXIT_USAGE_ERROR, "--limit must be at least 1")
-        if args.command in MUTATING_VERBS:
+        writes_artifact = args.command == "digest" and not args.stdout and not args.json
+        if args.command in MUTATING_VERBS or writes_artifact:
             with StateLock(_state_dir(args.state_dir)):
                 return int(args.handler(args))
         return int(args.handler(args))

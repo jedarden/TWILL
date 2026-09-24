@@ -726,9 +726,17 @@ class CursorCliTests(unittest.TestCase):
             self.assertEqual(kept, (0,))
             self.assertEqual(survivors, 1)
 
-            digest = self.run_cli("digest", "--stdout", "--state-dir", str(state))
+            digest = self.run_cli(
+                "digest",
+                "--stdout",
+                "--week",
+                "2026-W38",
+                "--state-dir",
+                str(state),
+            )
             self.assertEqual(digest.returncode, 0, digest.stderr)
-            self.assertIn("lost file turn", digest.stdout)
+            self.assertIn("week: 2026-W38", digest.stdout)
+            self.assertIn(" | $ twill digest --week 2026-W38 --stdout", digest.stdout)
 
     def test_cli_sweep_runs_even_when_no_file_is_settled(self):
         with tempfile.TemporaryDirectory() as directory:
