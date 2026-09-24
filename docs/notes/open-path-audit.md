@@ -25,7 +25,11 @@ the mode, or any of `O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND` in the flags
   repository (never inside its `lessons/`, `digests/`, `measurements/` or
   `guards/` names: §10.2's second artifact guard), the state directory
   (`TWILL_STATE_DIR` or `~/.local/state/twill`, the same resolution as the
-  CLI), `artifacts_root`, or the temp scratch root. A read must simply be
+  CLI), `artifacts_root`, or the temp scratch root. The repository is
+  decided before the temp root, so the artifact names are denied even in a
+  checkout that itself lives under the temp root — a clean extraction or a
+  CI checkout in TMPDIR; the first extraction run caught the original
+  ordering letting those through. A read must simply be
   outside `~/agent-transcript-archive` — any open under it fails, read or
   write, which is the stricter §8.3 wording. Violations raise
   `OpenPathViolation` (an `AssertionError`) at the open itself; the refused

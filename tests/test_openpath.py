@@ -67,6 +67,21 @@ class WritePolicyTests(unittest.TestCase):
                 violation = deny("write", str(ROOT / name / "L-0001.md"), "w", 0)
                 self.assertIn(str(ROOT / name), str(violation))
 
+    def test_artifact_denial_beats_the_temp_root_allowance(self):
+        # A clean extraction or a CI checkout lives under the temp root;
+        # the repository is still decided first, so an artifact name in
+        # that checkout is denied and the rest of it stays writable.
+        injected = ROOT.parent  # contains REPO_TREE, so it would allow all of it
+        previous = openpath._temp_root
+        openpath._temp_root = injected
+        try:
+            for name in openpath.ARTIFACT_DIRS:
+                with self.subTest(artifact_dir=name):
+                    deny("write", str(ROOT / name / "L-0001.md"), "w", 0)
+            allow(str(ROOT / "__pycache__" / "engine.pyc"), "wb", 0)
+        finally:
+            openpath._temp_root = previous
+
     def test_write_under_the_state_dir_is_allowed(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"

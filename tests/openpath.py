@@ -45,8 +45,10 @@ invariant it enforces:
   three artifact-containment guards (§10.2), and it is what makes "no lesson,
   digest, measurement or guard artifact is ever written inside this
   repository's tree" (§8.3) a property of every open instead of a review
-  note.  The names mirror the ``.gitignore`` block and are checked against it
-  by a test.
+  note.  The repository is decided *before* the temp-root allowance below,
+  so the artifact denial holds even in a checkout that itself lives under
+  the temp root (a clean extraction, a CI checkout in TMPDIR).  The names
+  mirror the ``.gitignore`` block and are checked against it by a test.
 - **the state directory** (``TWILL_STATE_DIR`` or ``~/.local/state/twill``,
   the same resolution as the engine's ``--state-dir`` default).
 - **``artifacts_root``**, read from the operator config when one is loadable.
@@ -208,23 +210,30 @@ def is_write(mode: str | None, flags: int) -> bool:
 
 
 def is_allowed_write(resolved: Path) -> bool:
-    """Whether a resolved absolute path may be opened for writing."""
+    """Whether a resolved absolute path may be opened for writing.
+
+    The repository is decided first and definitively, before the temp-root
+    allowance: an artifact name inside the tree is denied even in a
+    checkout that itself lives under the temp root (a clean extraction or
+    a CI checkout in TMPDIR -- the extraction run caught the first version
+    of this function letting those through).
+    """
 
     if resolved == Path(os.devnull):
         return True
-    if _under(resolved, temp_root()):
-        return True
-    if _under(resolved, state_dir()):
-        return True
-    for root in artifacts_root():
-        if _under(resolved, root):
-            return True
     if _under(resolved, REPO_TREE):
         # The repository is writable except for the artifact names inside
         # it: guard two of the artifact-containment guards (§10.2).
         for name in ARTIFACT_DIRS:
             if _under(resolved, REPO_TREE / name):
                 return False
+        return True
+    if _under(resolved, state_dir()):
+        return True
+    for root in artifacts_root():
+        if _under(resolved, root):
+            return True
+    if _under(resolved, temp_root()):
         return True
     return False
 
