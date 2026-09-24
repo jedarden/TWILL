@@ -408,6 +408,16 @@ backtest: {window_days: 180, sessions: 1096, first_seen: 2026-06-14, weeks_prese
 guard: {layer: hook, artifact: guards/L-3b02ce2a.hook.json, installed: false}
 ```
 
+The model-owned part of Explain is deliberately smaller than the persisted frontmatter. `claude -p`
+returns one unfenced JSON object shaped as
+`{"lessons":[{"cluster_id":"<exact input cluster_id>","summary":"<two sentences>"}]}` with exactly
+one item per prompt cluster, an exact copied `cluster_id`, and a one-line summary of at most 240
+characters that says what goes wrong and then what to do instead. Lesson IDs, state, evidence,
+routing, backtest, and guard metadata are derived by TWILL in their owning phases; the model cannot
+author them.
+Validation requires that returned ID set to equal the prompt's cluster ID set and is all-or-nothing
+before any lesson file or cluster-state write.
+
 `backtest` is populated before a lesson may be reviewed (§9 Phase 4): the same detector is replayed
 over the trailing 180 days, so a reviewer sees whether this is a standing problem or one bad week.
 `guard` points at the ready-to-install artifact the router generated (§9 Phase 5); TWILL never

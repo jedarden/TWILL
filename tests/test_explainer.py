@@ -1,6 +1,7 @@
 """Tests for Explain prompt construction and Claude invocation."""
 
 import hashlib
+import json
 import os
 import subprocess
 import sys
@@ -14,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 import twill_explainer  # noqa: E402
 import twill_schema  # noqa: E402
+from twill_contract import EXIT_VALIDATION_FAILURE, ValidationError  # noqa: E402
 from twill_ranker import RankedCluster  # noqa: E402
 
 
@@ -66,6 +68,190 @@ class ExplainerTestCase(unittest.TestCase):
         self.assertIn("untrusted data", prompt)
         self.assertEqual(prompt.count(twill_explainer.EXCERPT_BEGIN), 2)
         self.assertEqual(prompt.count(twill_explainer.EXCERPT_END), 2)
+
+    def test_prompt_requests_the_strict_lesson_output_contract(self):
+        prompt = twill_explainer.build_prompt(
+            [
+                twill_explainer.PromptCluster(
+                    self.cluster(), (self.excerpt(11), self.excerpt(12))
+                )
+            ]
+        )
+
+        self.assertIn("TRUSTED OUTPUT CONTRACT", prompt)
+        self.assertIn(
+            '{"lessons":[{"cluster_id":"<exact input cluster_id>",'
+            '"summary":"<two sentences>"}]}',
+            prompt,
+        )
+        self.assertIn("Include exactly one item for every input cluster", prompt)
+        self.assertIn("do not emit any other keys", prompt)
+
+    def test_validates_complete_lesson_output_against_expected_clusters(self):
+        cluster_id = "D-01:command-not-found:sqlite3"
+        summary = (
+            "Agents repeatedly invoke a missing command, which wastes time. "
+            "Install the command before retrying the operation."
+        )
+        signature_cluster_id = "D-02:normalized error: tool rejected"
+        signature_summary = (
+            "A recurring tool rejection interrupts the workflow. "
+            "Use the tool's required input shape on the next attempt."
+        )
+
+        drafts = twill_explainer.validate_explain_output(
+            json.dumps(
+                {
+                    "lessons": [
+                        {"cluster_id": cluster_id, "summary": summary},
+                        {
+                            "cluster_id": signature_cluster_id,
+                            "summary": signature_summary,
+                        },
+                    ]
+                },
+                separators=(",", ":"),
+            ),
+            expected_cluster_ids=(cluster_id, signature_cluster_id),
+        )
+
+        self.assertEqual(
+            drafts,
+            (
+                twill_explainer.LessonDraft(cluster_id=cluster_id, summary=summary),
+                twill_explainer.LessonDraft(
+                    cluster_id=signature_cluster_id,
+                    summary=signature_summary,
+                ),
+            ),
+        )
+
+    def test_schema_invalid_output_is_one_atomic_exit_four_failure(self):
+        cluster_id = "D-01:command-not-found:sqlite3"
+        other_cluster_id = "D-02:same normalized error"
+        valid_summary = "A recurring failure wastes time. Fix the environment first."
+        secret = "ghp_" + "1234567890abcdefghijklmnop"
+        valid_item = {"cluster_id": cluster_id, "summary": valid_summary}
+        invalid_outputs = {
+            "malformed_json": "{",
+            "non_object": "[]",
+            "unknown_top_level_key": json.dumps(
+                {"lessons": [], "unexpected": secret}
+            ),
+            "lessons_not_an_array": json.dumps({"lessons": {}}),
+            "missing_summary": json.dumps({"lessons": [{"cluster_id": cluster_id}]}),
+            "unknown_lesson_key": json.dumps(
+                {"lessons": [{**valid_item, "state": "accepted"}]}
+            ),
+            "one_sentence": json.dumps(
+                {"lessons": [{**valid_item, "summary": "Only one sentence."}]}
+            ),
+            "empty_first_sentence": json.dumps(
+                {"lessons": [{**valid_item, "summary": ". Fix the environment."}]}
+            ),
+            "trailing_clause": json.dumps(
+                {
+                    "lessons": [
+                        {
+                            **valid_item,
+                            "summary": "A failure recurs. Fix it. Then verify the fix",
+                        }
+                    ]
+                }
+            ),
+            "three_sentences": json.dumps(
+                {
+                    "lessons": [
+                        {
+                            **valid_item,
+                            "summary": "One problem occurs. It recurs. Fix it.",
+                        }
+                    ]
+                }
+            ),
+            "multiline_summary": json.dumps(
+                {"lessons": [{**valid_item, "summary": "One problem.\nFix it."}]}
+            ),
+            "oversized_summary": json.dumps(
+                {
+                    "lessons": [
+                        {
+                            **valid_item,
+                            "summary": "A recurring failure wastes time. " + "x" * 240,
+                        }
+                    ]
+                }
+            ),
+            "duplicate_lesson": json.dumps(
+                {"lessons": [valid_item, dict(valid_item)]}
+            ),
+            "duplicate_json_key": '{"lessons":[],"lessons":[]}',
+            "non_finite_number": '{"lessons":[],"unexpected":NaN}',
+            "oversized_json_integer": (
+                '{"lessons":[],"unexpected":' + ("9" * 5_000) + "}"
+            ),
+            "wrong_cluster_set": json.dumps(
+                {
+                    "lessons": [
+                        valid_item,
+                        {
+                            "cluster_id": other_cluster_id,
+                            "summary": valid_summary,
+                        },
+                    ]
+                }
+            ),
+        }
+
+        for name, output in invalid_outputs.items():
+            with self.subTest(name=name):
+                with self.assertRaises(ValidationError) as raised:
+                    twill_explainer.validate_explain_output(
+                        output,
+                        expected_cluster_ids=(cluster_id,),
+                    )
+                self.assertEqual(raised.exception.code, EXIT_VALIDATION_FAILURE)
+                self.assertNotIn(secret, str(raised.exception))
+
+    def test_invalid_batch_fails_before_partial_drafts_or_persistence(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        self.addCleanup(connection.close)
+        connection.execute(
+            "INSERT INTO cluster(detector_id, key, window_days, sessions, events, "
+            "first_seen, last_seen, score, covered_by, state) "
+            "VALUES ('D-01', 'command-not-found:sqlite3', 30, 3, 7, "
+            "'2026-09-01T00:00:00+00:00', '2026-09-24T00:00:00+00:00', "
+            "4.5, NULL, 'open')"
+        )
+        connection.commit()
+        output = json.dumps(
+            {
+                "lessons": [
+                    {
+                        "cluster_id": "D-01:command-not-found:sqlite3",
+                        "summary": "A recurring failure wastes time. Install the command.",
+                    },
+                    {
+                        "cluster_id": "D-02:invented cluster",
+                        "summary": "Another failure wastes time. Fix that environment.",
+                    },
+                ]
+            }
+        )
+
+        drafts = ()
+        with self.assertRaises(ValidationError) as raised:
+            drafts = twill_explainer.validate_explain_output(
+                output,
+                expected_cluster_ids=("D-01:command-not-found:sqlite3",),
+            )
+
+        state = connection.execute("SELECT state FROM cluster").fetchone()[0]
+        self.assertEqual(raised.exception.code, EXIT_VALIDATION_FAILURE)
+        self.assertEqual(drafts, ())
+        self.assertEqual(state, "open")
+        self.assertEqual(list(self.root.rglob("L-*.md")), [])
 
     def test_only_new_lesson_candidates_are_rendered(self):
         clusters = [
