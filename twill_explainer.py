@@ -2,6 +2,9 @@
 
 The builder consumes ranked clusters and their already-associated observations. It never accepts a
 transcript path or a session record, and it redacts every value again at the prompt boundary.
+Draft lessons carry a backtest block (§7.1): the drafting detector is replayed over the trailing
+180 days, so a reviewer can tell a standing problem from one bad week before spending attention
+on the draft.
 """
 
 from __future__ import annotations
@@ -12,16 +15,25 @@ import os
 import re
 import sqlite3
 import subprocess
-from collections.abc import Iterable, Mapping, Sequence
-from datetime import datetime, timezone
+from collections.abc import Callable, Iterable, Mapping, Sequence
+from datetime import datetime, timedelta, timezone
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, NoReturn, TypeGuard
 
 from twill_config import ConfigError, TwillConfig
 from twill_contract import ValidationError
+from twill_detectors import (
+    MAX_ERROR_LENGTH,
+    REGISTRY,
+    DetectorContractError,
+    normalize_detector_key,
+    read_cluster_weeks,
+    read_clusters,
+    validate_detector_semantics,
+)
 from twill_ranker import RankedCluster, RankReport
-from twill_redactor import MAX_EXCERPT_LENGTH, Redactor
+from twill_redactor import MAX_EXCERPT_LENGTH, Redactor, redact_text
 
 
 MAX_CLUSTER_PROMPT_BYTES = 8 * 1024
@@ -124,6 +136,21 @@ class _PreparedLesson:
     text: str
     detector_id: str
     key: str
+
+
+@dataclass(frozen=True)
+class LessonBacktest:
+    """§7.1's backtest block: the drafting detector replayed over 180 days.
+
+    ``weeks_present`` counts the distinct ISO weeks (UTC) of the observations
+    that belong to the cluster inside the replay window, which is what lets a
+    reviewer separate a standing problem from one bad week.
+    """
+
+    window_days: int
+    sessions: int
+    first_seen: str | None
+    weeks_present: int
 
 
 def _get(value: object, name: str, default: object = None) -> object:
@@ -666,6 +693,151 @@ def _short_hash(value: str) -> str:
     return hashlib.sha256(value.encode("utf-8", "replace")).hexdigest()[:12]
 
 
+_D01_MEMBERSHIP = (
+    "kind = 'run_failed' AND program = ? "
+    "AND signature IS NOT NULL AND trim(signature) <> '' "
+    "AND sig_hash IS NOT NULL AND lower(signature) LIKE '%command not found%'"
+)
+_D02_MEMBERSHIP = (
+    "kind IN ('run_failed', 'tool_error') "
+    "AND signature = ? AND trim(signature) <> '' "
+    "AND sig_hash = ?"
+)
+
+
+def _membership_predicate(
+    detector_id: str, key: str
+) -> tuple[str, tuple[object, ...]] | None:
+    if detector_id == "D-01" and key.startswith("command-not-found:"):
+        program = key.split(":", 1)[1]
+        if not program:
+            return None
+        return _D01_MEMBERSHIP, (program,)
+    if detector_id == "D-02":
+        return _D02_MEMBERSHIP, (key, _short_hash(key))
+    return None
+
+
+def _load_legacy_evidence(
+    connection: sqlite3.Connection,
+    detector_id: str,
+    key: str,
+    cluster: object,
+    first: str,
+    last: str,
+) -> tuple[PromptExcerpt, ...]:
+    sessions = _count(_get(cluster, "sessions", 0))
+    events = _count(_get(cluster, "events", 0))
+    if sessions < 1 or events < 1 or len(key) != MAX_IDENTIFIER_LENGTH:
+        return ()
+    if detector_id == "D-01":
+        predicate = (
+            "kind = 'run_failed' "
+            f"AND substr('command-not-found:' || program, 1, {MAX_IDENTIFIER_LENGTH}) = ? "
+            "AND signature IS NOT NULL AND trim(signature) <> '' "
+            "AND sig_hash IS NOT NULL AND lower(signature) LIKE '%command not found%'"
+        )
+        matching_group = (
+            "grouped.kind = 'run_failed' "
+            f"AND substr('command-not-found:' || grouped.program, 1, "
+            f"{MAX_IDENTIFIER_LENGTH}) = ? "
+            "AND grouped.program = observation.program "
+            "AND signature IS NOT NULL AND trim(signature) <> '' "
+            "AND sig_hash IS NOT NULL AND lower(signature) LIKE '%command not found%' "
+            "AND datetime(grouped.ts_utc) >= datetime(?) "
+            "AND datetime(grouped.ts_utc) <= datetime(?) "
+            "GROUP BY grouped.program "
+            "HAVING count(DISTINCT grouped.session_id) = ? AND count(*) = ?"
+        )
+        unique_group = (
+            "(SELECT count(*) FROM ("
+            "SELECT 1 FROM observation AS candidate "
+            "WHERE candidate.kind = 'run_failed' "
+            f"AND substr('command-not-found:' || candidate.program, 1, "
+            f"{MAX_IDENTIFIER_LENGTH}) = ? "
+            "AND candidate.signature IS NOT NULL "
+            "AND trim(candidate.signature) <> '' "
+            "AND candidate.sig_hash IS NOT NULL "
+            "AND lower(candidate.signature) LIKE '%command not found%' "
+            "AND datetime(candidate.ts_utc) >= datetime(?) "
+            "AND datetime(candidate.ts_utc) <= datetime(?) "
+            "GROUP BY candidate.program "
+            "HAVING count(DISTINCT candidate.session_id) = ? AND count(*) = ?"
+            ")) = 1"
+        )
+    elif detector_id == "D-02":
+        predicate = (
+            "kind IN ('run_failed', 'tool_error') "
+            f"AND substr(signature, 1, {MAX_IDENTIFIER_LENGTH}) = ? "
+            "AND trim(signature) <> '' AND sig_hash IS NOT NULL"
+        )
+        matching_group = (
+            "grouped.kind IN ('run_failed', 'tool_error') "
+            f"AND substr(grouped.signature, 1, {MAX_IDENTIFIER_LENGTH}) = ? "
+            "AND grouped.sig_hash = observation.sig_hash "
+            "AND grouped.signature = observation.signature "
+            "AND trim(grouped.signature) <> '' AND grouped.sig_hash IS NOT NULL "
+            "AND datetime(grouped.ts_utc) >= datetime(?) "
+            "AND datetime(grouped.ts_utc) <= datetime(?) "
+            "GROUP BY grouped.sig_hash, grouped.signature "
+            "HAVING count(DISTINCT grouped.session_id) = ? AND count(*) = ?"
+        )
+        unique_group = (
+            "(SELECT count(*) FROM ("
+            "SELECT 1 FROM observation AS candidate "
+            "WHERE candidate.kind IN ('run_failed', 'tool_error') "
+            f"AND substr(candidate.signature, 1, {MAX_IDENTIFIER_LENGTH}) = ? "
+            "AND trim(candidate.signature) <> '' "
+            "AND candidate.sig_hash IS NOT NULL "
+            "AND datetime(candidate.ts_utc) >= datetime(?) "
+            "AND datetime(candidate.ts_utc) <= datetime(?) "
+            "GROUP BY candidate.sig_hash, candidate.signature "
+            "HAVING count(DISTINCT candidate.session_id) = ? AND count(*) = ?"
+            ")) = 1"
+        )
+    else:
+        return ()
+    return _load_membership_evidence(
+        connection,
+        f"{predicate} AND EXISTS (SELECT 1 FROM observation AS grouped "
+        f"WHERE {matching_group}) AND {unique_group}",
+        (
+            key,
+            key,
+            first,
+            last,
+            sessions,
+            events,
+            key,
+            first,
+            last,
+            sessions,
+            events,
+        ),
+        first,
+        last,
+    )
+
+
+def _load_membership_evidence(
+    connection: sqlite3.Connection,
+    predicate: str,
+    parameters: tuple[object, ...],
+    first: str,
+    last: str,
+) -> tuple[PromptExcerpt, ...]:
+    query = (
+        "SELECT obs_id, session_id, excerpt FROM observation "
+        f"WHERE {predicate} "
+        "AND datetime(ts_utc) >= datetime(?) "
+        "AND datetime(ts_utc) <= datetime(?) ORDER BY obs_id LIMIT ?"
+    )
+    rows = connection.execute(
+        query, (*parameters, first, last, MAX_EVIDENCE_ROWS_PER_CLUSTER)
+    ).fetchall()
+    return tuple(PromptExcerpt(int(row[0]), str(row[1]), row[2] or "") for row in rows)
+
+
 def _load_evidence(connection: sqlite3.Connection, cluster: object) -> tuple[PromptExcerpt, ...]:
     bounds = _interval_bounds(cluster)
     if bounds is None:
@@ -675,33 +847,18 @@ def _load_evidence(connection: sqlite3.Connection, cluster: object) -> tuple[Pro
     key = _get(cluster, "key")
     if not isinstance(detector_id, str) or not isinstance(key, str):
         return ()
-    if detector_id == "D-01" and key.startswith("command-not-found:"):
-        program = key.split(":", 1)[1]
-        if not program:
-            return ()
-        query = (
-            "SELECT obs_id, session_id, excerpt FROM observation "
-            "WHERE kind = 'run_failed' AND program = ? "
-            "AND signature IS NOT NULL AND trim(signature) <> '' "
-            "AND sig_hash IS NOT NULL AND lower(signature) LIKE '%command not found%' "
-            "AND datetime(ts_utc) >= datetime(?) "
-            "AND datetime(ts_utc) <= datetime(?) ORDER BY obs_id LIMIT ?"
-        )
-        parameters = (program, first, last, MAX_EVIDENCE_ROWS_PER_CLUSTER)
-    elif detector_id == "D-02":
-        query = (
-            "SELECT obs_id, session_id, excerpt FROM observation "
-            "WHERE kind IN ('run_failed', 'tool_error') "
-            "AND signature = ? AND trim(signature) <> '' "
-            "AND sig_hash = ? "
-            "AND datetime(ts_utc) >= datetime(?) "
-            "AND datetime(ts_utc) <= datetime(?) ORDER BY obs_id LIMIT ?"
-        )
-        parameters = (key, _short_hash(key), first, last, MAX_EVIDENCE_ROWS_PER_CLUSTER)
-    else:
+    membership = _membership_predicate(detector_id, key)
+    if membership is None:
         return ()
-    rows = connection.execute(query, parameters).fetchall()
-    return tuple(PromptExcerpt(int(row[0]), str(row[1]), row[2] or "") for row in rows)
+    predicate, parameters = membership
+    evidence = _load_membership_evidence(
+        connection, predicate, parameters, first, last
+    )
+    if not evidence and len(key) == MAX_IDENTIFIER_LENGTH:
+        evidence = _load_legacy_evidence(
+            connection, detector_id, key, cluster, first, last
+        )
+    return evidence
 
 
 def _invalid_lesson_write(
@@ -712,6 +869,75 @@ def _invalid_lesson_write(
     raise ValidationError(
         f"Lesson write failed validation at {path}: {reason}",
         hint,
+    ) from None
+
+
+_EMPTY_BACKTEST = LessonBacktest(
+    window_days=LESSON_BACKTEST_DAYS, sessions=0, first_seen=None, weeks_present=0
+)
+
+
+def _backtest_window_start() -> str:
+    """The trailing-window start, in the same form ``run_detectors`` binds."""
+
+    now = datetime.now(timezone.utc)
+    return (now - timedelta(days=LESSON_BACKTEST_DAYS)).isoformat()
+
+
+def compute_lesson_backtest(
+    connection: sqlite3.Connection,
+    detector_id: str,
+    key: str,
+    *,
+    window_start_utc: str | None = None,
+) -> LessonBacktest:
+    """Replay the drafting detector over the trailing 180 days (§7.1, Phase 4)."""
+
+    identity = redact_text(f"{detector_id}:{key}")[:MAX_IDENTIFIER_LENGTH]
+    base_detector_id = detector_id.partition("@")[0]
+    detector = next(
+        (entry for entry in REGISTRY if entry.detector_id == base_detector_id), None
+    )
+    if detector is None:
+        _invalid_lesson_write(
+            identity,
+            "backtest replay requires a detector registered in the shipped catalog",
+        )
+    window_start = window_start_utc or _backtest_window_start()
+    try:
+        validate_detector_semantics(connection, detector)
+        canonical_key = normalize_detector_key(detector, key)
+        emitted = read_clusters(
+            connection,
+            detector,
+            window_start_utc=window_start,
+            window_days=LESSON_BACKTEST_DAYS,
+        )
+        row = emitted.get(canonical_key)
+        if row is None or (row[0] == 0 and row[1] == 0):
+            return _EMPTY_BACKTEST
+        weeks = read_cluster_weeks(
+            connection,
+            detector,
+            canonical_key,
+            window_start_utc=window_start,
+            window_days=LESSON_BACKTEST_DAYS,
+        )
+        if weeks == 0:
+            raise DetectorContractError(
+                f"{detector.full_id} emitted a cluster but no matching ISO weeks"
+            )
+    except (sqlite3.Error, DetectorContractError, ValueError) as error:
+        reason = redact_text(error)[:MAX_ERROR_LENGTH]
+        _invalid_lesson_write(identity, f"backtest replay failed: {reason}")
+    if row is None:
+        return _EMPTY_BACKTEST
+    sessions, _events, first_seen, _last_seen = row
+    return LessonBacktest(
+        window_days=LESSON_BACKTEST_DAYS,
+        sessions=sessions,
+        first_seen=_lesson_date(first_seen, f"{identity}.backtest.first_seen"),
+        weeks_present=weeks,
     )
 
 
@@ -744,13 +970,10 @@ def _writer_items(source: object, redactor: Redactor) -> tuple[_NormalizedItem, 
     return tuple(items)
 
 
-def _lesson_date(value: object, cluster_id: str) -> str:
+def _lesson_date(value: object, path: str) -> str:
     parsed = _parse_timestamp(value)
     if parsed is None:
-        _invalid_lesson_write(
-            f"{cluster_id}.evidence.first_seen",
-            "must be an ISO-8601 timestamp",
-        )
+        _invalid_lesson_write(path, "must be an ISO-8601 timestamp")
     return parsed.date().isoformat()
 
 
@@ -773,6 +996,7 @@ def _lesson_text(
     events: int,
     first_seen: str,
     session_ids: Sequence[str],
+    backtest: LessonBacktest,
 ) -> str:
     encoded_summary = json.dumps(summary, ensure_ascii=False)
     encoded_key = json.dumps(key, ensure_ascii=False)
@@ -791,8 +1015,9 @@ def _lesson_text(
         "}",
         "routing: {recommended: null, applied: null, applied_at: null, bead: null}",
         "backtest: {"
-        f"window_days: {LESSON_BACKTEST_DAYS}, sessions: 0, first_seen: null, "
-        "weeks_present: 0}",
+        f"window_days: {backtest.window_days}, sessions: {backtest.sessions}, "
+        f"first_seen: {json.dumps(backtest.first_seen)}, "
+        f"weeks_present: {backtest.weeks_present}}}",
         "guard: {layer: null, artifact: null, installed: false}",
         "---",
         "",
@@ -804,6 +1029,7 @@ def _prepare_lessons(
     drafts: Iterable[LessonDraft],
     source: object,
     lessons_dir: Path,
+    backtest_for: Callable[[str, str], LessonBacktest],
 ) -> tuple[_PreparedLesson, ...]:
     draft_records = tuple(drafts)
     if not draft_records:
@@ -842,7 +1068,9 @@ def _prepare_lessons(
         key = metadata["key"]
         if not isinstance(key, str) or not key:
             _invalid_lesson_write(f"{cluster_id}.key", "must be a non-empty string")
-        first_seen = _lesson_date(metadata["first_seen"], cluster_id)
+        first_seen = _lesson_date(
+            metadata["first_seen"], f"{cluster_id}.evidence.first_seen"
+        )
         session_ids = tuple(sorted({excerpt.session_id for excerpt in item.evidence}))
         if not session_ids:
             _invalid_lesson_write(
@@ -853,6 +1081,7 @@ def _prepare_lessons(
         raw_key = _get(item.cluster, "key")
         if not isinstance(raw_detector, str) or not isinstance(raw_key, str):
             _invalid_lesson_write(f"{cluster_id}", "candidate identity must be text")
+        backtest = backtest_for(detector, raw_key)
         lesson_id = f"L-{hashlib.sha256(cluster_id.encode('utf-8')).hexdigest()[:8]}"
         path = lessons_dir / f"{lesson_id}.md"
         if path in paths:
@@ -867,6 +1096,7 @@ def _prepare_lessons(
             events=_count(metadata["events"]),
             first_seen=first_seen,
             session_ids=session_ids,
+            backtest=backtest,
         )
         prepared.append(
             _PreparedLesson(
@@ -955,21 +1185,25 @@ def _begin_cluster_state_writes(
     if connection.in_transaction:
         raise ValueError("lesson writing requires a connection outside an active transaction")
     connection.execute("BEGIN IMMEDIATE")
-    for lesson in prepared:
-        row = connection.execute(
-            "SELECT state, covered_by FROM cluster WHERE detector_id = ? AND key = ?",
-            (lesson.detector_id, lesson.key),
-        ).fetchone()
-        if row is None:
-            raise ValidationError(
-                f"Lesson write cannot mark missing cluster {lesson.lesson_id}",
-                "rebuild the derived state database and retry",
-            )
-        if str(row[0]) not in {"open", "drafted"} or row[1] is not None:
-            raise ValidationError(
-                f"Lesson write cannot mark non-candidate cluster {lesson.lesson_id}",
-                "leave the cluster unchanged and inspect its review state",
-            )
+    try:
+        for lesson in prepared:
+            row = connection.execute(
+                "SELECT state, covered_by FROM cluster WHERE detector_id = ? AND key = ?",
+                (lesson.detector_id, lesson.key),
+            ).fetchone()
+            if row is None:
+                raise ValidationError(
+                    f"Lesson write cannot mark missing cluster {lesson.lesson_id}",
+                    "rebuild the derived state database and retry",
+                )
+            if str(row[0]) not in {"open", "drafted"} or row[1] is not None:
+                raise ValidationError(
+                    f"Lesson write cannot mark non-candidate cluster {lesson.lesson_id}",
+                    "leave the cluster unchanged and inspect its review state",
+                )
+    except BaseException:
+        connection.rollback()
+        raise
 
 
 def _finish_cluster_state_writes(
@@ -1003,11 +1237,32 @@ def write_lesson_files(
     connection: sqlite3.Connection | None = None,
     repo_root: Path | None = None,
 ) -> tuple[Path, ...]:
-    """Render and atomically batch one draft markdown file per validated lesson."""
+    """Render and atomically batch one draft markdown file per validated lesson.
+
+    Every draft carries a populated backtest block: with a state-database
+    connection the drafting detector is replayed over the trailing 180 days
+    (§7.1, §9 Phase 4); without one — the connection-less writer used for
+    source shapes that never came from the database — the block shows the
+    same empty result a genuinely new cluster would, because there is no
+    history to replay.
+    """
 
     artifacts_root = Path(config.require_artifacts_root(repo_root)).expanduser().resolve()
     lessons_dir = artifacts_root / LESSON_DIRNAME
-    prepared = _prepare_lessons(drafts, source, lessons_dir)
+
+    window_start = _backtest_window_start() if connection is not None else None
+
+    def backtest_for(detector_id: str, key: str) -> LessonBacktest:
+        if connection is None:
+            return _EMPTY_BACKTEST
+        return compute_lesson_backtest(
+            connection,
+            detector_id,
+            key,
+            window_start_utc=window_start,
+        )
+
+    prepared = _prepare_lessons(drafts, source, lessons_dir, backtest_for)
     if not prepared:
         return ()
     repository = (Path(__file__).resolve().parent if repo_root is None else repo_root).resolve()
@@ -1169,6 +1424,7 @@ __all__ = [
     "LESSON_BACKTEST_DAYS",
     "LESSON_DIRNAME",
     "LESSON_FILE_MODE",
+    "LessonBacktest",
     "LessonDraft",
     "MAX_CLUSTER_BYTES",
     "MAX_CLUSTER_PROMPT_BYTES",
@@ -1181,6 +1437,7 @@ __all__ = [
     "PromptExcerpt",
     "build_explain_prompt",
     "build_prompt",
+    "compute_lesson_backtest",
     "build_prompt_from_db",
     "invoke_claude",
     "load_candidate_clusters",

@@ -353,7 +353,7 @@ class MigrationRunnerTests(unittest.TestCase):
     """Plan §8.4: additive-only, version-stamped, downgrade-tolerant migrations.
 
     The shipped registry carries the additive tables later phases add on top
-    of the v1 baseline (currently version 3); the apply path beyond it is
+    of the v1 baseline (currently version 4); the apply path beyond it is
     exercised by registering the kind of migrations those phases will add.
     """
 
@@ -389,10 +389,11 @@ class MigrationRunnerTests(unittest.TestCase):
         }
         self.assertIn("detector_run", tables)
         self.assertIn("cluster_session", tables)
-        self.assertIn(
-            "attribution_sha",
-            [row[1] for row in connection.execute("PRAGMA table_info(detector_run)")],
-        )
+        detector_columns = [
+            row[1] for row in connection.execute("PRAGMA table_info(detector_run)")
+        ]
+        self.assertIn("attribution_sha", detector_columns)
+        self.assertIn("backtest_sha", detector_columns)
         newest = str(versions[-1])
         self.assertEqual(self.stamped_version(connection), newest)
         # Reopening neither duplicates nor bumps the stamp.
@@ -506,7 +507,8 @@ class MigrationRunnerTests(unittest.TestCase):
         writer.commit()
         writer.close()
 
-        older = twill_schema.connect(self.state_dir)
+        with mock.patch.object(twill_schema, "MIGRATIONS", ()):
+            older = twill_schema.connect(self.state_dir)
         self.addCleanup(older.close)
         self.assertEqual(self.stamped_version(older), "3")
         columns = [row[1] for row in older.execute("PRAGMA table_info(observation)")]

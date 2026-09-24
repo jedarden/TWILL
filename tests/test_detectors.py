@@ -66,6 +66,7 @@ def make_detector(
     sql: str | None = None,
     description: str = "groups run failures",
     session_hits_sql: str | None = None,
+    week_hits_sql: str | None = None,
 ) -> twill_detectors.Detector:
     return twill_detectors.Detector(
         detector_id,
@@ -73,6 +74,7 @@ def make_detector(
         description,
         sql or program_failure_sql(),
         session_hits_sql,
+        week_hits_sql,
     )
 
 
@@ -130,8 +132,8 @@ def cluster_rows(connection: sqlite3.Connection, detector_id: str) -> list[tuple
 def run_row(connection: sqlite3.Connection, detector_id: str, version: int):
     return connection.execute(
         "SELECT detector_id, version, full_id, semantics_sha, first_run_at, "
-        "last_run_at, last_status, last_error, clusters, window_days "
-        "FROM detector_run WHERE detector_id = ? AND version = ?",
+        "last_run_at, last_status, last_error, clusters, window_days, "
+        "backtest_sha FROM detector_run WHERE detector_id = ? AND version = ?",
         (detector_id, version),
     ).fetchone()
 
@@ -172,11 +174,31 @@ class RegistryContractTests(unittest.TestCase):
             ).attribution_sha,
         )
 
+    def test_backtest_hash_tracks_only_week_semantics(self):
+        base = make_detector()
+        week_sql = "SELECT program AS key, strftime('%G-W%V', ts_utc) AS week FROM observation"
+        with_week = make_detector(week_hits_sql=week_sql)
+        self.assertIsNone(base.backtest_sha)
+        self.assertIsNotNone(with_week.backtest_sha)
+        self.assertEqual(base.semantics_sha, with_week.semantics_sha)
+        self.assertNotEqual(
+            with_week.backtest_sha,
+            make_detector(
+                week_hits_sql=week_sql.replace("ts_utc", "datetime(ts_utc)")
+            ).backtest_sha,
+        )
+
     def test_build_registry_rejects_malformed_session_hit_sql(self):
         for bad in ("", "   ", "UPDATE cluster_session SET session_id = 'x'",
                     "SELECT 1; SELECT 2"):
             with self.subTest(bad=bad), self.assertRaises(ValueError):
                 twill_detectors.build_registry(make_detector(session_hits_sql=bad))
+
+    def test_build_registry_rejects_malformed_week_hit_sql(self):
+        for bad in ("", "   ", "UPDATE cluster_session SET session_id = 'x'",
+                    "SELECT 1; SELECT 2"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                twill_detectors.build_registry(make_detector(week_hits_sql=bad))
 
     def test_build_registry_rejects_malformed_ids(self):
         for bad in ("D-1", "d-01", "D01", "D-01x", "X-01", "D-", "01"):
@@ -553,6 +575,76 @@ class DetectorRunTests(unittest.TestCase):
         self.assertEqual(
             [row[1] for row in cluster_rows(self.connection, "D-01")], ["sqlite3"]
         )
+
+    def test_week_query_rejects_a_malformed_week_for_another_key(self):
+        for week in ("not-a-week", "2021-W53"):
+            with self.subTest(week=week):
+                detector = make_detector(
+                    "D-01",
+                    1,
+                    week_hits_sql=f"SELECT 'other-key' AS key, '{week}' AS week",
+                )
+                with self.assertRaises(twill_detectors.DetectorContractError):
+                    twill_detectors.read_cluster_weeks(
+                        self.connection,
+                        detector,
+                        "sqlite3",
+                        window_start_utc="2026-01-01T00:00:00+00:00",
+                        window_days=180,
+                    )
+
+    def test_backtest_semantics_drift_under_the_same_version_is_refused(self):
+        first = make_detector(
+            "D-01",
+            1,
+            week_hits_sql=(
+                "SELECT program AS key, '2026-W01' AS week FROM observation"
+            ),
+        )
+        twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(first,)
+        )
+        stamped = run_row(self.connection, "D-01", 1)
+        drifted = make_detector(
+            "D-01",
+            1,
+            week_hits_sql=(
+                "SELECT program AS key, '2026-W02' AS week FROM observation"
+            ),
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(drifted,)
+        )
+
+        self.assertEqual(report.exit_code, EXIT_VALIDATION_FAILURE)
+        self.assertEqual(report.outcomes[0].status, "refused")
+        self.assertIn("backtest semantics changed", report.outcomes[0].error)
+        self.assertEqual(run_row(self.connection, "D-01", 1)[10], stamped[10])
+        self.assertEqual(stamped[10], first.backtest_sha)
+
+    def test_removing_backtest_semantics_under_the_same_version_is_refused(self):
+        first = make_detector(
+            "D-01",
+            1,
+            week_hits_sql=(
+                "SELECT program AS key, '2026-W01' AS week FROM observation"
+            ),
+        )
+        twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(first,)
+        )
+        stamped = run_row(self.connection, "D-01", 1)
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(make_detector("D-01", 1),),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_VALIDATION_FAILURE)
+        self.assertIn("removed backtest semantics", report.outcomes[0].error)
+        self.assertEqual(run_row(self.connection, "D-01", 1)[10], stamped[10])
 
     def test_drift_in_one_detector_does_not_stop_the_others(self):
         seed_observation(self.connection, program="sqlite3", session_id="s1")

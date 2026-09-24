@@ -9,7 +9,9 @@ Plan §4 defines a detector as a named, versioned SQL query over observations;
   time that version commits clusters.  Re-registering the same version with
   different SQL is *refused*: changing what a detector means requires a new
   version, so a lesson's before/after measurement series is never silently
-  redefined.  Measurements and run records cite the full versioned id.
+  redefined.  The optional week-hit query used by lesson backtests has its own
+  hash and follows the same refusal rule. Measurements and run records cite the
+  full versioned id.
 * **Isolation (§8.2).**  Each detector runs inside its own ``BEGIN IMMEDIATE``
   transaction: a detector whose SQL errors (or whose output breaks the column
   contract below) is rolled back, skipped and reported, while every other
@@ -59,7 +61,7 @@ import dataclasses
 import hashlib
 import re
 import sqlite3
-from datetime import datetime, timedelta, timezone
+from datetime import date, datetime, timedelta, timezone
 from typing import Mapping, Sequence
 
 from twill_contract import (
@@ -80,6 +82,7 @@ MAX_ERROR_LENGTH = 500
 # The columns a detector's SQL must emit, and the parameters the runner binds.
 CLUSTER_COLUMNS = ("key", "sessions", "events", "first_seen", "last_seen")
 SESSION_HIT_COLUMNS = ("key", "session_id")
+WEEK_HIT_COLUMNS = ("key", "week")
 SQL_PARAMETERS = ("window_start_utc", "window_days")
 
 STATUS_OK = "ok"
@@ -92,6 +95,9 @@ STATUS_REFUSED = "refused"
 # rejects multiple statements per execute(); the shape check keeps a write
 # statement from ever being attempted.
 _QUERY_SHAPE = re.compile(r"(?:SELECT|WITH)\b", re.IGNORECASE)
+_ISO_WEEK_RE = re.compile(
+    r"^(?P<year>\d{4})-W(?P<week>0[1-9]|[1-4]\d|5[0-3])$"
+)
 
 
 class DetectorContractError(ValueError):
@@ -114,6 +120,7 @@ class Detector:
     description: str
     cluster_sql: str
     session_hits_sql: str | None = None
+    week_hits_sql: str | None = None
 
     @property
     def full_id(self) -> str:
@@ -141,6 +148,19 @@ class Detector:
                 f"detector={self.detector_id}",
                 f"version={self.version}",
                 f"hits_sql={' '.join(self.session_hits_sql.split())}",
+            )
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @property
+    def backtest_sha(self) -> str | None:
+        if self.week_hits_sql is None:
+            return None
+        canonical = "\n".join(
+            (
+                f"detector={self.detector_id}",
+                f"version={self.version}",
+                f"week_sql={' '.join(self.week_hits_sql.split())}",
             )
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -204,6 +224,21 @@ def build_registry(*detectors: Detector) -> tuple[Detector, ...]:
                     f"single read-only SELECT (or WITH ... SELECT): "
                     f"{detector.session_hits_sql!r}"
                 )
+        if detector.week_hits_sql is not None:
+            week_statement = detector.week_hits_sql.strip().rstrip(";").strip()
+            if not week_statement:
+                raise ValueError(f"detector {detector.full_id} has empty week-hit SQL")
+            if ";" in week_statement:
+                raise ValueError(
+                    f"detector {detector.full_id} week-hit SQL must be one "
+                    f"statement: {detector.week_hits_sql!r}"
+                )
+            if not _QUERY_SHAPE.match(week_statement):
+                raise ValueError(
+                    f"detector {detector.full_id} week-hit SQL must be a "
+                    f"single read-only SELECT (or WITH ... SELECT): "
+                    f"{detector.week_hits_sql!r}"
+                )
         previous = seen.get(detector.detector_id)
         if previous is not None:
             raise ValueError(
@@ -266,12 +301,41 @@ MISSING_BINARY_HIT_SQL = """
     ORDER BY key ASC, session_id ASC
 """
 
+MISSING_BINARY_WEEK_HIT_SQL = """
+    WITH qualifying AS (
+      SELECT program, session_id, ts_utc
+      FROM observation
+      WHERE ts_utc >= :window_start_utc
+        AND kind = 'run_failed'
+        AND program IS NOT NULL
+        AND trim(program) <> ''
+        AND signature IS NOT NULL
+        AND trim(signature) <> ''
+        AND sig_hash IS NOT NULL
+        AND lower(signature) LIKE '%command not found%'
+    ),
+    qualifying_groups AS (
+      SELECT program
+      FROM qualifying
+      GROUP BY program
+      HAVING count(DISTINCT session_id) >= 2
+    )
+    SELECT substr('command-not-found:' || qualifying.program, 1, 240) AS key,
+           strftime('%G-W%V', qualifying.ts_utc) AS week
+    FROM qualifying
+    JOIN qualifying_groups USING (program)
+    GROUP BY substr('command-not-found:' || qualifying.program, 1, 240),
+             strftime('%G-W%V', qualifying.ts_utc)
+    ORDER BY key ASC, week ASC
+"""
+
 MISSING_BINARY = Detector(
     "D-01",
     1,
     "missing binaries reported as command-not-found across distinct sessions",
     MISSING_BINARY_SQL,
     MISSING_BINARY_HIT_SQL,
+    MISSING_BINARY_WEEK_HIT_SQL,
 )
 
 
@@ -304,12 +368,38 @@ RECURRING_ERROR_SIGNATURE_HIT_SQL = """
     ORDER BY key ASC, session_id ASC
 """
 
+RECURRING_ERROR_SIGNATURE_WEEK_HIT_SQL = """
+    WITH qualifying AS (
+      SELECT sig_hash, signature, session_id, ts_utc
+      FROM observation
+      WHERE ts_utc >= :window_start_utc
+        AND kind IN ('run_failed', 'tool_error')
+        AND signature IS NOT NULL
+        AND trim(signature) <> ''
+        AND sig_hash IS NOT NULL
+    ),
+    qualifying_groups AS (
+      SELECT sig_hash, signature
+      FROM qualifying
+      GROUP BY sig_hash, signature
+      HAVING count(DISTINCT session_id) >= 2
+    )
+    SELECT substr(qualifying.signature, 1, 240) AS key,
+           strftime('%G-W%V', qualifying.ts_utc) AS week
+    FROM qualifying
+    JOIN qualifying_groups USING (sig_hash, signature)
+    GROUP BY substr(qualifying.signature, 1, 240),
+             strftime('%G-W%V', qualifying.ts_utc)
+    ORDER BY key ASC, week ASC
+"""
+
 RECURRING_ERROR_SIGNATURE = Detector(
     "D-02",
     1,
     "recurring normalized error signatures across distinct sessions",
     RECURRING_ERROR_SIGNATURE_SQL,
     RECURRING_ERROR_SIGNATURE_HIT_SQL,
+    RECURRING_ERROR_SIGNATURE_WEEK_HIT_SQL,
 )
 
 # The shipped catalog.  Phase 2's detector beads (D-01 missing binary, D-02
@@ -396,6 +486,38 @@ def _attribution_drift_message(detector: Detector, recorded_sha: str) -> str:
     )
 
 
+def _backtest_drift_message(detector: Detector, recorded_sha: str | None) -> str:
+    if detector.backtest_sha is None:
+        return (
+            f"{detector.full_id} removed backtest semantics without a version bump; "
+            "restore them or bump the version"
+        )
+    if recorded_sha is None:
+        return (
+            f"{detector.full_id} predates backtest semantics stamping; "
+            "run twill detect before drafting a lesson"
+        )
+    return (
+        f"backtest semantics changed without a version bump (recorded "
+        f"{_short_sha(recorded_sha)}, registered "
+        f"{_short_sha(detector.backtest_sha)}); bump the version so "
+        "lesson history is redefined openly"
+    )
+
+
+def _is_iso_week(value: object) -> bool:
+    if not isinstance(value, str):
+        return False
+    match = _ISO_WEEK_RE.fullmatch(value)
+    if match is None:
+        return False
+    try:
+        date.fromisocalendar(int(match["year"]), int(match["week"]), 1)
+    except ValueError:
+        return False
+    return True
+
+
 def _emitted_key(detector: Detector, raw: object) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise DetectorContractError(
@@ -407,6 +529,10 @@ def _emitted_key(detector: Detector, raw: object) -> str:
             f"{detector.full_id} emitted a key that redacts to nothing"
         )
     return key
+
+
+def normalize_detector_key(detector: Detector, raw: object) -> str:
+    return _emitted_key(detector, raw)
 
 
 def _emitted_count(detector: Detector, column: str, raw: object) -> int:
@@ -451,6 +577,10 @@ def _collect_clusters(
     for row in cursor.fetchall():
         value = dict(zip(columns, row))
         key = _emitted_key(detector, value["key"])
+        if key in emitted:
+            raise DetectorContractError(
+                f"{detector.full_id} emitted duplicate key after normalization"
+            )
         emitted[key] = (
             _emitted_count(detector, "sessions", value["sessions"]),
             _emitted_count(detector, "events", value["events"]),
@@ -510,6 +640,88 @@ def _collect_session_hits(
     return tuple(sorted(hit for hit in hits if hit[0] in emitted))
 
 
+def _replay_parameters(window_start_utc: str, window_days: int) -> dict[str, object]:
+    if not isinstance(window_start_utc, str) or not window_start_utc.strip():
+        raise ValueError("window_start_utc must be a non-empty string")
+    if isinstance(window_days, bool) or not isinstance(window_days, int):
+        raise ValueError("window_days must be an integer")
+    if window_days < 1:
+        raise ValueError(f"window_days must be at least 1: {window_days}")
+    return {"window_start_utc": window_start_utc, "window_days": window_days}
+
+
+def validate_detector_semantics(
+    connection: sqlite3.Connection, detector: Detector
+) -> None:
+    row = connection.execute(
+        "SELECT semantics_sha, backtest_sha FROM detector_run "
+        "WHERE detector_id = ? AND version = ?",
+        (detector.detector_id, detector.version),
+    ).fetchone()
+    if row is None:
+        return
+    if row[0] != detector.semantics_sha:
+        raise DetectorContractError(_drift_message(detector, str(row[0])))
+    if row[1] != detector.backtest_sha:
+        raise DetectorContractError(_backtest_drift_message(detector, row[1]))
+
+
+def read_clusters(
+    connection: sqlite3.Connection,
+    detector: Detector,
+    *,
+    window_start_utc: str,
+    window_days: int,
+) -> dict[str, tuple[int, int, str, str]]:
+    """Run one detector's cluster query without writing derived state."""
+
+    cursor = connection.execute(
+        detector.cluster_sql,
+        _replay_parameters(window_start_utc, window_days),
+    )
+    return _collect_clusters(detector, cursor)
+
+
+def read_cluster_weeks(
+    connection: sqlite3.Connection,
+    detector: Detector,
+    key: str,
+    *,
+    window_start_utc: str,
+    window_days: int,
+) -> int:
+    """Count qualifying ISO weeks; week SQL may bind ``key``."""
+
+    if detector.week_hits_sql is None:
+        raise DetectorContractError(
+            f"{detector.full_id} does not define week-hit SQL"
+        )
+    target = normalize_detector_key(detector, key)
+    parameters = _replay_parameters(window_start_utc, window_days)
+    parameters["key"] = target
+    cursor = connection.execute(detector.week_hits_sql, parameters)
+    columns = [description[0] for description in cursor.description or ()]
+    missing = [column for column in WEEK_HIT_COLUMNS if column not in columns]
+    if missing:
+        raise DetectorContractError(
+            f"{detector.full_id} week-hit SQL must emit the columns "
+            f"{', '.join(WEEK_HIT_COLUMNS)}; missing {', '.join(missing)} "
+            f"(got {', '.join(columns)})"
+        )
+    weeks: set[str] = set()
+    for row in cursor.fetchall():
+        value = dict(zip(columns, row))
+        week = value["week"]
+        if not _is_iso_week(week):
+            raise DetectorContractError(
+                f"{detector.full_id} emitted a non-ISO week from week-hit SQL"
+            )
+        if _emitted_key(detector, value["key"]) != target:
+            continue
+        weeks.add(week)
+    return len(weeks)
+
+
 _CLUSTER_UPSERT = """
 INSERT INTO cluster(detector_id, key, window_days, sessions, events,
                     first_seen, last_seen, score, covered_by, state)
@@ -522,13 +734,14 @@ ON CONFLICT(detector_id, key) DO UPDATE SET
 
 _RUN_RECORD_UPSERT = """
 INSERT INTO detector_run(detector_id, version, full_id, semantics_sha,
-                         attribution_sha, first_run_at, last_run_at,
+                         attribution_sha, backtest_sha, first_run_at, last_run_at,
                          last_status, last_error, clusters, window_days)
-VALUES (?, ?, ?, ?, ?, ?, ?, 'ok', NULL, ?, ?)
+VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'ok', NULL, ?, ?)
 ON CONFLICT(detector_id, version) DO UPDATE SET
   full_id=excluded.full_id, semantics_sha=excluded.semantics_sha,
   attribution_sha=COALESCE(excluded.attribution_sha,
                            detector_run.attribution_sha),
+  backtest_sha=COALESCE(excluded.backtest_sha, detector_run.backtest_sha),
   last_run_at=excluded.last_run_at, last_status='ok', last_error=NULL,
   clusters=excluded.clusters, window_days=excluded.window_days
 """
@@ -599,6 +812,7 @@ def _run_one(
                 detector.full_id,
                 detector.semantics_sha,
                 detector.attribution_sha,
+                detector.backtest_sha,
                 ran_at,
                 ran_at,
                 len(emitted),
@@ -677,7 +891,7 @@ def run_detectors(
     outcomes: list[DetectorOutcome] = []
     for detector in active:
         row = connection.execute(
-            "SELECT semantics_sha, attribution_sha FROM detector_run "
+            "SELECT semantics_sha, attribution_sha, backtest_sha FROM detector_run "
             "WHERE detector_id = ? AND version = ?",
             (detector.detector_id, detector.version),
         ).fetchone()
@@ -703,6 +917,20 @@ def run_detectors(
                     version=detector.version,
                     status=STATUS_REFUSED,
                     error=_attribution_drift_message(detector, str(row[1])),
+                )
+            )
+            continue
+        if (
+            row is not None
+            and row[2] is not None
+            and row[2] != detector.backtest_sha
+        ):
+            outcomes.append(
+                DetectorOutcome(
+                    detector_id=detector.detector_id,
+                    version=detector.version,
+                    status=STATUS_REFUSED,
+                    error=_backtest_drift_message(detector, str(row[2])),
                 )
             )
             continue

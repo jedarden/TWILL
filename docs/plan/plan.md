@@ -635,6 +635,21 @@ blocking, because genuinely new friction has no history.
 output produces zero lessons and exit 4; `--dry-run` output contains no fixture secret; one real
 weekly run produces ≥ 1 reviewable draft lesson.
 **Does NOT include:** routing, apply, measurement.
+**Backtest decision (2026-09-24):** the replay re-runs the drafting detector's own `cluster_sql`
+over the trailing 180 days, and the block's `sessions`/`first_seen` come from that replay — not
+from raw observation counting, so a key the detector's own ≥2-session bar would not emit over the
+long window shows the empty block even when observations exist. `weeks_present` counts the
+distinct ISO weeks (UTC) of the observations the cluster's membership rule selects inside the
+same window, rather than re-running the detector once per week: a per-week replay inherits the
+`HAVING` bar and would read one-session-per-week chronic friction as "never present". An empty
+replay result renders `sessions: 0, first_seen: null, weeks_present: 0` and the draft still
+ships — genuinely new friction has no history. Week selection is detector-owned, uses ISO UTC
+weeks, and has a separate `backtest_sha` stamp in `detector_run`; changing it under the same
+version is refused rather than silently rewriting lesson history. A detector that cannot be
+replayed, or a replay that errors, fails the whole write: no lesson is drafted from a backtest
+TWILL could not run. The connection-less writer (synthetic sources that never came from the
+database) renders the
+same empty block.
 
 ### Phase 5: Route + apply + review states
 **Delivers:** routing recommendation per lesson, `twill apply <id>` emitting the exact

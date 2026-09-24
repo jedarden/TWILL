@@ -355,6 +355,11 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
                 "ON cluster_session(session_id, detector_id, key)",
             ),
         ),
+        Migration(
+            4,
+            "detector_backtest_semantics",
+            ("ALTER TABLE detector_run ADD COLUMN backtest_sha TEXT",),
+        ),
     )
 )
 

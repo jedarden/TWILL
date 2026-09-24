@@ -7,12 +7,14 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
+import twill_detectors  # noqa: E402
 import twill_explainer  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_config import ConfigError, TwillConfig  # noqa: E402
@@ -33,13 +35,15 @@ class ExplainerTestCase(unittest.TestCase):
         detector_id: str = "D-01",
         state: str = "open",
         covered_by: str | None = None,
+        sessions: int = 3,
+        events: int = 7,
     ) -> RankedCluster:
         return RankedCluster(
             detector_id=detector_id,
             key=key,
             window_days=30,
-            sessions=3,
-            events=7,
+            sessions=sessions,
+            events=events,
             first_seen="2026-09-01T00:00:00+00:00",
             last_seen="2026-09-24T00:00:00+00:00",
             score=4.5,
@@ -77,6 +81,47 @@ class ExplainerTestCase(unittest.TestCase):
         ),
     ):
         return twill_explainer.LessonDraft(cluster_id=cluster_id, summary=summary)
+
+    def seed_cluster_row(
+        self,
+        connection,
+        *,
+        detector_id: str = "D-01",
+        key: str = "command-not-found:sqlite3",
+    ):
+        connection.execute(
+            "INSERT INTO cluster(detector_id, key, window_days, sessions, events, "
+            "first_seen, last_seen, score, covered_by, state) "
+            "VALUES (?, ?, 30, 3, 7, '2026-09-01T00:00:00+00:00', "
+            "'2026-09-24T00:00:00+00:00', 4.5, NULL, 'open')",
+            (detector_id, key),
+        )
+
+    def seed_observation(
+        self,
+        connection,
+        session_id: str,
+        observed_at: datetime,
+        *,
+        kind: str = "run_failed",
+        program: str | None = "sqlite3",
+        signature: str = "sqlite3: command not found",
+        sig_hash: str = "hash-1",
+    ):
+        connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, program, "
+            "signature, sig_hash, excerpt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_id,
+                observed_at.isoformat(),
+                observed_at.isoformat(),
+                kind,
+                program,
+                signature,
+                sig_hash,
+                signature,
+            ),
+        )
 
     def test_prompt_contains_cluster_ids_counts_and_framed_excerpts(self):
         prompt = twill_explainer.build_prompt(
@@ -311,7 +356,11 @@ class ExplainerTestCase(unittest.TestCase):
             "routing: {recommended: null, applied: null, applied_at: null, bead: null}",
             text,
         )
-        self.assertIn("backtest: {window_days: 180, sessions: 0", text)
+        self.assertIn(
+            "backtest: {window_days: 180, sessions: 0, "
+            "first_seen: null, weeks_present: 0}",
+            text,
+        )
         self.assertIn("guard: {layer: null, artifact: null, installed: false}", text)
         self.assertNotIn("private transcript text", text)
         self.assertNotIn("observation_id", text)
@@ -405,6 +454,488 @@ class ExplainerTestCase(unittest.TestCase):
             connection.execute("SELECT state FROM cluster").fetchone()[0],
             "drafted",
         )
+
+    def test_missing_cluster_does_not_leave_the_state_transaction_open(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+
+        with self.assertRaises(ValidationError) as raised:
+            twill_explainer.write_lesson_files(
+                (self.draft(),),
+                (self.candidate(),),
+                self.config(),
+                connection=connection,
+            )
+
+        self.assertIn("cannot mark missing cluster", str(raised.exception))
+        self.assertFalse(connection.in_transaction)
+        self.assertEqual(list(self.root.rglob("L-*.md")), [])
+
+    def test_backtest_replays_drafting_detector_over_the_trailing_180_days(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        self.addCleanup(connection.close)
+        now = datetime.now(timezone.utc)
+        first_week = (now - timedelta(days=160)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        self.seed_cluster_row(connection)
+        for session_id, observed_at in (
+            ("session-a", first_week),
+            ("session-b", first_week + timedelta(days=7)),
+            ("session-c", first_week + timedelta(days=14)),
+            ("session-d", first_week + timedelta(days=21)),
+            ("session-e", first_week + timedelta(days=21, hours=1)),
+            ("session-before-window", first_week - timedelta(days=60)),
+        ):
+            self.seed_observation(connection, session_id, observed_at)
+        self.seed_observation(
+            connection,
+            "session-decoy",
+            first_week + timedelta(days=7, hours=1),
+            kind="tool_error",
+        )
+        connection.commit()
+
+        paths = twill_explainer.write_lesson_files(
+            (self.draft(),),
+            (self.candidate(),),
+            self.config(),
+            connection=connection,
+        )
+
+        text = paths[0].read_text(encoding="utf-8")
+        self.assertIn(
+            "backtest: {window_days: 180, sessions: 5, "
+            f'first_seen: "{first_week.date().isoformat()}", weeks_present: 4}}',
+            text,
+        )
+        self.assertEqual(
+            connection.execute(
+                "SELECT window_days, sessions, events, first_seen, last_seen "
+                "FROM cluster"
+            ).fetchone(),
+            (
+                30,
+                3,
+                7,
+                "2026-09-01T00:00:00+00:00",
+                "2026-09-24T00:00:00+00:00",
+            ),
+        )
+        self.assertEqual(
+            connection.execute("SELECT count(*) FROM detector_run").fetchone()[0],
+            0,
+        )
+        self.assertEqual(
+            connection.execute("SELECT count(*) FROM cluster_session").fetchone()[0],
+            0,
+        )
+
+    def test_backtest_counts_only_the_emitted_d01_group_for_a_long_key(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        now = datetime.now(timezone.utc)
+        first_week = (now - timedelta(days=120)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        program = "p" * 250
+        key = ("command-not-found:" + program)[:240]
+        for session_id, days in (("program-a", 0), ("program-b", 7)):
+            self.seed_observation(
+                connection,
+                session_id,
+                first_week + timedelta(days=days),
+                program=program,
+            )
+        decoy_program = program[:222] + "different-program"
+        self.assertEqual(("command-not-found:" + decoy_program)[:240], key)
+        self.seed_observation(
+            connection,
+            "program-decoy",
+            first_week + timedelta(days=14),
+            program=decoy_program,
+        )
+        connection.commit()
+
+        result = twill_explainer.compute_lesson_backtest(
+            connection,
+            "D-01",
+            key,
+            window_start_utc=(now - timedelta(days=180)).isoformat(),
+        )
+
+        self.assertEqual(result.sessions, 2)
+        self.assertEqual(result.first_seen, first_week.date().isoformat())
+        self.assertEqual(result.weeks_present, 2)
+
+    def test_backtest_replays_recurring_error_signature_detector(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        self.addCleanup(connection.close)
+        now = datetime.now(timezone.utc)
+        first_week = (now - timedelta(days=120)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        signature = "tool rejected: invalid input"
+        signature_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
+        self.seed_cluster_row(connection, detector_id="D-02", key=signature)
+        for session_id, days in (
+            ("signature-a", 0),
+            ("signature-b", 7),
+            ("signature-c", 14),
+        ):
+            self.seed_observation(
+                connection,
+                session_id,
+                first_week + timedelta(days=days),
+                kind="tool_error",
+                program=None,
+                signature=signature,
+                sig_hash=signature_hash,
+            )
+        self.seed_observation(
+            connection,
+            "signature-decoy",
+            first_week + timedelta(days=21),
+            kind="tool_error",
+            program=None,
+            signature=signature,
+            sig_hash="different-hash",
+        )
+        connection.commit()
+        cluster_id = f"D-02:{signature}"
+        candidate = self.candidate(signature, detector_id="D-02")
+        draft = self.draft(
+            cluster_id,
+            "A recurring tool rejection interrupts work. Use the required input shape.",
+        )
+
+        paths = twill_explainer.write_lesson_files(
+            (draft,),
+            (candidate,),
+            self.config(),
+            connection=connection,
+        )
+
+        self.assertIn(
+            "backtest: {window_days: 180, sessions: 3, "
+            f'first_seen: "{first_week.date().isoformat()}", weeks_present: 3}}',
+            paths[0].read_text(encoding="utf-8"),
+        )
+
+    def test_backtest_counts_weeks_for_a_legacy_long_d02_signature(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        now = datetime.now(timezone.utc)
+        first_week = (now - timedelta(days=120)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        signature = "legacy-signature:" + ("x" * 300)
+        signature_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
+        for session_id, days in (("legacy-a", 0), ("legacy-b", 7)):
+            self.seed_observation(
+                connection,
+                session_id,
+                first_week + timedelta(days=days),
+                kind="tool_error",
+                program=None,
+                signature=signature,
+                sig_hash=signature_hash,
+            )
+        connection.commit()
+
+        result = twill_explainer.compute_lesson_backtest(
+            connection,
+            "D-02",
+            signature,
+            window_start_utc=(now - timedelta(days=180)).isoformat(),
+        )
+
+        self.assertEqual(result.sessions, 2)
+        self.assertEqual(result.first_seen, first_week.date().isoformat())
+        self.assertEqual(result.weeks_present, 2)
+
+    def test_backtest_uses_the_registered_detector_week_contract(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        now = datetime.now(timezone.utc)
+        first_week = (now - timedelta(days=30)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        key = "custom-friction"
+        detector = twill_detectors.Detector(
+            "D-03",
+            1,
+            "groups qualifying observations into a custom friction",
+            """
+            SELECT 'custom-friction' AS key,
+                   count(DISTINCT session_id) AS sessions,
+                   count(*) AS events,
+                   min(ts_utc) AS first_seen,
+                   max(ts_utc) AS last_seen
+            FROM observation
+            WHERE ts_utc >= :window_start_utc
+            HAVING count(DISTINCT session_id) >= 2
+            """,
+            week_hits_sql="""
+            SELECT 'custom-friction' AS key,
+                   strftime('%G-W%V', ts_utc) AS week
+            FROM observation
+            WHERE ts_utc >= :window_start_utc
+            GROUP BY strftime('%G-W%V', ts_utc)
+            """,
+        )
+        self.seed_cluster_row(connection, detector_id="D-03", key=key)
+        self.seed_observation(connection, "custom-a", first_week)
+        self.seed_observation(
+            connection, "custom-b", first_week + timedelta(days=7)
+        )
+        connection.commit()
+        cluster_id = f"D-03:{key}"
+        candidate = self.candidate(key, detector_id="D-03")
+        draft = self.draft(
+            cluster_id,
+            "Custom friction interrupts work. Apply the documented remedy instead.",
+        )
+
+        with mock.patch.object(twill_explainer, "REGISTRY", (detector,)):
+            paths = twill_explainer.write_lesson_files(
+                (draft,),
+                (candidate,),
+                self.config(),
+                connection=connection,
+            )
+
+        self.assertIn(
+            "backtest: {window_days: 180, sessions: 2, "
+            f'first_seen: "{first_week.date().isoformat()}", weeks_present: 2}}',
+            paths[0].read_text(encoding="utf-8"),
+        )
+
+    def test_backtest_shows_an_empty_result_when_the_database_has_no_history(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        self.seed_cluster_row(connection)
+        connection.commit()
+
+        paths = twill_explainer.write_lesson_files(
+            (self.draft(),),
+            (self.candidate(),),
+            self.config(),
+            connection=connection,
+        )
+
+        self.assertIn(
+            "backtest: {window_days: 180, sessions: 0, "
+            "first_seen: null, weeks_present: 0}",
+            paths[0].read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            connection.execute("SELECT state FROM cluster").fetchone()[0],
+            "drafted",
+        )
+
+    def test_zero_count_detector_output_renders_the_empty_backtest(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        detector = twill_detectors.Detector(
+            "D-04",
+            1,
+            "emits an allowed zero-count cluster",
+            """
+            SELECT 'empty' AS key, 0 AS sessions, 0 AS events,
+                   '2026-01-01T00:00:00+00:00' AS first_seen,
+                   '2026-01-01T00:00:00+00:00' AS last_seen
+            """,
+            week_hits_sql=(
+                "SELECT 'empty' AS key, '2026-W01' AS week"
+            ),
+        )
+
+        with mock.patch.object(twill_explainer, "REGISTRY", (detector,)):
+            result = twill_explainer.compute_lesson_backtest(
+                connection,
+                "D-04",
+                "empty",
+                window_start_utc="2026-01-01T00:00:00+00:00",
+            )
+
+        self.assertEqual(
+            result,
+            twill_explainer.LessonBacktest(
+                window_days=180,
+                sessions=0,
+                first_seen=None,
+                weeks_present=0,
+            ),
+        )
+
+    def test_backtest_shows_the_empty_block_rather_than_blocking_new_friction(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        self.addCleanup(connection.close)
+        now = datetime.now(timezone.utc)
+        first_week = (now - timedelta(days=120)).replace(
+            hour=0, minute=0, second=0, microsecond=0
+        )
+        self.seed_cluster_row(connection)
+        for days in (0, 30, 60):
+            self.seed_observation(
+                connection, "single-session", first_week + timedelta(days=days)
+            )
+        connection.commit()
+
+        paths = twill_explainer.write_lesson_files(
+            (self.draft(),),
+            (self.candidate(),),
+            self.config(),
+            connection=connection,
+        )
+
+        text = paths[0].read_text(encoding="utf-8")
+        self.assertIn(
+            "backtest: {window_days: 180, sessions: 0, "
+            "first_seen: null, weeks_present: 0}",
+            text,
+        )
+        self.assertEqual(
+            connection.execute("SELECT state FROM cluster").fetchone()[0],
+            "drafted",
+        )
+
+    def test_backtest_fails_closed_without_a_registered_detector(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        self.addCleanup(connection.close)
+        self.seed_cluster_row(connection, detector_id="D-99")
+        connection.commit()
+
+        with self.assertRaises(ValidationError) as raised:
+            twill_explainer.write_lesson_files(
+                (self.draft("D-99:command-not-found:sqlite3"),),
+                (self.candidate(detector_id="D-99"),),
+                self.config(),
+                connection=connection,
+            )
+
+        self.assertIn(
+            "backtest replay requires a detector registered in the shipped catalog",
+            str(raised.exception),
+        )
+        self.assertEqual(list(self.root.rglob("L-*.md")), [])
+        self.assertFalse((self.root / "artifacts" / "lessons").exists())
+        self.assertEqual(
+            connection.execute("SELECT state FROM cluster").fetchone()[0],
+            "open",
+        )
+
+    def test_backtest_fails_closed_when_the_detector_semantics_drifted(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        self.seed_cluster_row(connection)
+        connection.execute(
+            "INSERT INTO detector_run(detector_id, version, full_id, semantics_sha, "
+            "first_run_at, last_run_at, last_status, last_error, clusters, window_days) "
+            "VALUES ('D-01', 1, 'D-01@1', 'different-semantics', ?, ?, 'ok', NULL, 1, 30)",
+            (
+                datetime.now(timezone.utc).isoformat(),
+                datetime.now(timezone.utc).isoformat(),
+            ),
+        )
+        connection.commit()
+
+        with self.assertRaises(ValidationError) as raised:
+            twill_explainer.write_lesson_files(
+                (self.draft(),),
+                (self.candidate(),),
+                self.config(),
+                connection=connection,
+            )
+
+        self.assertIn("semantics changed without a version bump", str(raised.exception))
+        self.assertEqual(
+            connection.execute("SELECT state FROM cluster").fetchone()[0],
+            "open",
+        )
+        self.assertEqual(list(self.root.rglob("L-*.md")), [])
+
+    def test_backtest_fails_closed_when_the_week_semantics_drifted(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        self.seed_cluster_row(connection)
+        detector = twill_detectors.MISSING_BINARY
+        now = datetime.now(timezone.utc).isoformat()
+        connection.execute(
+            "INSERT INTO detector_run(detector_id, version, full_id, semantics_sha, "
+            "backtest_sha, first_run_at, last_run_at, last_status, last_error, "
+            "clusters, window_days) VALUES ('D-01', 1, 'D-01@1', ?, ?, ?, ?, "
+            "'ok', NULL, 1, 30)",
+            (detector.semantics_sha, "different-backtest", now, now),
+        )
+        connection.commit()
+
+        with self.assertRaises(ValidationError) as raised:
+            twill_explainer.write_lesson_files(
+                (self.draft(),),
+                (self.candidate(),),
+                self.config(),
+                connection=connection,
+            )
+
+        self.assertIn("backtest semantics changed", str(raised.exception))
+        self.assertEqual(
+            connection.execute("SELECT state FROM cluster").fetchone()[0],
+            "open",
+        )
+        self.assertEqual(list(self.root.rglob("L-*.md")), [])
+
+    def test_backtest_fails_closed_when_the_week_contract_has_no_match(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        now = datetime.now(timezone.utc)
+        observed_at = now - timedelta(days=30)
+        self.seed_observation(connection, "week-a", observed_at)
+        self.seed_observation(connection, "week-b", observed_at)
+        connection.commit()
+
+        with mock.patch.object(twill_explainer, "read_cluster_weeks", return_value=0):
+            with self.assertRaises(ValidationError) as raised:
+                twill_explainer.compute_lesson_backtest(
+                    connection,
+                    "D-01",
+                    "command-not-found:sqlite3",
+                    window_start_utc=(now - timedelta(days=180)).isoformat(),
+                )
+
+        self.assertIn("emitted a cluster but no matching ISO weeks", str(raised.exception))
+
+    def test_backtest_replay_error_redacts_detector_output(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        self.seed_cluster_row(connection)
+        connection.commit()
+        secret = "ghp_" + "1234567890abcdefghijmnop"
+
+        with mock.patch.object(
+            twill_explainer,
+            "read_clusters",
+            side_effect=twill_detectors.DetectorContractError(
+                f"invalid key: {secret}"
+            ),
+        ):
+            with self.assertRaises(ValidationError) as raised:
+                twill_explainer.write_lesson_files(
+                    (self.draft(),),
+                    (self.candidate(),),
+                    self.config(),
+                    connection=connection,
+                )
+
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertIn("<redacted:github-token>", str(raised.exception))
+        self.assertTrue(raised.exception.__suppress_context__)
+        self.assertEqual(list(self.root.rglob("L-*.md")), [])
 
     def test_writer_refuses_an_in_tree_artifacts_root(self):
         config = TwillConfig(artifacts_root=ROOT / "lessons")
@@ -723,6 +1254,115 @@ class ExplainerTestCase(unittest.TestCase):
 
         self.assertIn("matching evidence", prompt)
         self.assertNotIn("unrelated evidence", prompt)
+
+    def test_db_adapter_loads_only_the_recorded_group_for_a_long_d01_key(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        program = "p" * 250
+        key = ("command-not-found:" + program)[:240]
+        for session_id, day in (("program-a", 5), ("program-b", 15)):
+            self.seed_observation(
+                connection,
+                session_id,
+                datetime(2026, 9, day, tzinfo=timezone.utc),
+                program=program,
+            )
+        decoy_program = program[:222] + "different-program"
+        self.seed_observation(
+            connection,
+            "program-decoy",
+            datetime(2026, 9, 20, tzinfo=timezone.utc),
+            program=decoy_program,
+        )
+        connection.commit()
+
+        prompt = twill_explainer.build_prompt_from_db(
+            connection,
+            (self.cluster(key, sessions=2, events=2),),
+        )
+
+        self.assertEqual(prompt.count(twill_explainer.EXCERPT_BEGIN), 2)
+        self.assertIn('"session_id":"program-a"', prompt)
+        self.assertIn('"session_id":"program-b"', prompt)
+        self.assertNotIn('"session_id":"program-decoy"', prompt)
+
+    def test_db_adapter_loads_evidence_for_a_legacy_long_d02_key(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        signature = "legacy-signature:" + ("x" * 300)
+        signature_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
+        for session_id, day in (("legacy-a", 5), ("legacy-b", 15)):
+            self.seed_observation(
+                connection,
+                session_id,
+                datetime(2026, 9, day, tzinfo=timezone.utc),
+                program=None,
+                signature=signature,
+                sig_hash=signature_hash,
+            )
+        decoy_signature = signature[:240] + "different"
+        self.seed_observation(
+            connection,
+            "legacy-decoy",
+            datetime(2026, 9, 20, tzinfo=timezone.utc),
+            program=None,
+            signature=decoy_signature,
+            sig_hash=hashlib.sha256(decoy_signature.encode("utf-8")).hexdigest()[:12],
+        )
+        connection.commit()
+
+        prompt = twill_explainer.build_prompt_from_db(
+            connection,
+            (
+                self.cluster(
+                    signature[:240],
+                    detector_id="D-02",
+                    sessions=2,
+                    events=2,
+                ),
+            ),
+        )
+
+        self.assertEqual(prompt.count(twill_explainer.EXCERPT_BEGIN), 2)
+        self.assertIn('"session_id":"legacy-a"', prompt)
+        self.assertIn('"session_id":"legacy-b"', prompt)
+        self.assertNotIn('"session_id":"legacy-decoy"', prompt)
+
+    def test_legacy_evidence_refuses_ambiguous_normalized_keys(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        signature = "ambiguous-signature:" + ("x" * 300)
+        signature_hash = hashlib.sha256(signature.encode("utf-8")).hexdigest()[:12]
+        decoy_signature = signature[:240] + "different"
+        decoy_hash = hashlib.sha256(decoy_signature.encode("utf-8")).hexdigest()[:12]
+        for prefix, value, value_hash in (
+            ("signature", signature, signature_hash),
+            ("decoy", decoy_signature, decoy_hash),
+        ):
+            for suffix, day in (("a", 5), ("b", 15)):
+                self.seed_observation(
+                    connection,
+                    f"{prefix}-{suffix}",
+                    datetime(2026, 9, day, tzinfo=timezone.utc),
+                    program=None,
+                    signature=value,
+                    sig_hash=value_hash,
+                )
+        connection.commit()
+
+        prompt = twill_explainer.build_prompt_from_db(
+            connection,
+            (
+                self.cluster(
+                    signature[:240],
+                    detector_id="D-02",
+                    sessions=2,
+                    events=2,
+                ),
+            ),
+        )
+
+        self.assertNotIn(twill_explainer.EXCERPT_BEGIN, prompt)
 
     def test_unknown_detector_is_metadata_only(self):
         state_dir = self.root / "state"

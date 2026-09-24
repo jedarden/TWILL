@@ -9,7 +9,8 @@ in the `detector_run` table (schema migration 2). Exercised by
 ## Identity: `D-NN@N`, one active version
 
 A detector is a name (`D-01` … `D-10` in the Phase 2 catalog), an integer
-version starting at 1, a prose description, and one SQL query. The versioned
+version starting at 1, a prose description, one cluster query, and optional
+session-hit and week-hit queries used by attribution and lesson backtests. The versioned
 identity `D-01@2` is what run records and measurements cite; the *base* id is
 what `cluster` rows and lesson frontmatter cite, because the cluster is the
 real-world problem and must stay stable across version bumps — a bump refreshes
@@ -34,6 +35,14 @@ The query must emit the columns `key`, `sessions`, `events`, `first_seen`,
 `last_seen` (any order; extras ignored). `sessions` and `events` must be
 integers ≥ 0; `key` must be non-empty text. A violation is isolated exactly
 like a SQL error — it is the detector self-test failing at run time.
+
+A detector that can draft lessons also supplies `week_hits_sql`. It binds the
+same window parameters plus an optional `key`, and emits `key` and an ISO
+`week` (`YYYY-Www`). Its rows identify observations belonging to groups the
+cluster query emits over the full window; it does not apply the distinct-session
+threshold once per week, because one chronic hit per week is still a standing
+problem. The backtest counts the distinct weeks for the requested key. A missing
+or invalid week query fails the draft; it never silently renders zero history.
 
 ## What the runner does with the output
 
@@ -86,6 +95,12 @@ clusters**. Consequences, each deliberate:
   `D-01@2`), which is how §8.3's "a measurement always records the detector
   version it ran" is satisfied downstream.
 
+`week_hits_sql` has its own normalized `backtest_sha` in `detector_run`, leaving
+`semantics_sha` and the attribution series stable. A successful detect stamps it;
+changing it later under the same version is refused, and a run predating the
+stamp must be refreshed before lesson drafting. This keeps `weeks_present`
+versioned without redefining ordinary cluster counts.
+
 The stamp lives in the state DB, which is derived and disposable: after a
 `doctor --rebuild` the first run of each version re-stamps from the registry.
 The durable cross-rebuild record of what a version meant is the registry's own
@@ -114,6 +129,7 @@ ranker owns the global score built from these fields.
 
 To add one (the D-01 … D-10 beads): append a `Detector` to
 `twill_detectors.REGISTRY` at version 1, with a fixture-driven test asserting a
-known expected count. To change what an existing detector means: bump its
+known expected count. A detector eligible for Explain lessons also supplies the
+`week_hits_sql` contract above. To change what an existing detector means: bump its
 version in the same edit, and leave a note in the description of what changed;
 never register two versions of one name. To change only prose: no bump needed.
