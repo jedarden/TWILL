@@ -23,6 +23,7 @@ import sys
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+from time import perf_counter
 from typing import Iterator, Sequence
 
 import twill_detectors
@@ -47,6 +48,7 @@ from twill_contract import (
 )
 from twill_lock import StateLock
 from twill_redactor import Redactor, redact as _redact, redact_text
+from twill_status import read_status, record_stage
 
 
 MAX_EXCERPT_LENGTH = 240
@@ -819,27 +821,53 @@ def settled_files(
     )
 
 
+def _has_candidate_files(roots: Sequence[Path | str]) -> bool:
+    return any(
+        path.is_file() and path.suffix == ".jsonl"
+        for root in roots
+        for path in _candidate_paths(root)
+    )
+
+
+def _has_missing_source_root(roots: Sequence[Path | str]) -> bool:
+    return any(
+        not glob.has_magic(str(Path(root).expanduser()))
+        and not Path(root).expanduser().exists()
+        for root in roots
+    )
+
+
 def ingest_command(args: argparse.Namespace) -> int:
     # Loaded before anything is read or written so a wrong config fails fast
     # (plan §3: bad config is a startup error, never a convenient fallback).
     config = load_config()
+    state_dir = _state_dir(args.state_dir)
+    started = perf_counter()
     settle = args.settle if args.settle is not None else config.settle_window
+    source_patterns = _source_patterns(args.source, config)
     try:
         files = settled_files(
-            _source_patterns(args.source, config),
+            source_patterns,
             settle,
             Path(args.file) if args.file else None,
         )
     except (OSError, ValueError) as exc:
         raise CliError(EXIT_RUNTIME_ERROR, str(exc), "check the transcript path and try again") from exc
-    store = Store(_state_dir(args.state_dir), content_fences=config.content_fences)
+    store = Store(state_dir, content_fences=config.content_fences)
     try:
         # EC-05: on every enumerated run, flag upstream files that vanished.
         # The sweep runs before the no-settled-files error so a fully cleaned
         # transcript tree still records its missing paths (evidence survives).
         if args.file is None:
             store.mark_missing_paths()
-        if not files:
+        if not files and (
+            args.file is not None
+            or (args.source is not None and _has_missing_source_root(source_patterns))
+            or _has_candidate_files(source_patterns)
+            or store.connection.execute(
+                "SELECT count(*) FROM cursor WHERE path_missing = 1"
+            ).fetchone()[0]
+        ):
             raise CliError(
                 EXIT_RUNTIME_ERROR,
                 "no settled JSONL sessions found",
@@ -858,8 +886,24 @@ def ingest_command(args: argparse.Namespace) -> int:
         "events": total_events,
         "observations": total_observations,
     }
+    record_stage(
+        state_dir,
+        "ingest",
+        perf_counter() - started,
+        {
+            "files": len(processed),
+            "sessions": len(processed),
+            "events": total_events,
+            "observations": total_observations,
+        },
+    )
     if args.json:
         emit_success(result, json_mode=True)
+    elif total_events == 0:
+        print(
+            f"no work; checked {len(processed)} session(s); "
+            f"detector holds {total_observations} observation(s)"
+        )
     else:
         print(
             f"ingested {len(processed)} session(s); "
@@ -912,6 +956,7 @@ def detect_command(args: argparse.Namespace) -> int:
             raise UsageError(str(exc)) from exc
 
     state_dir = _state_dir(args.state_dir)
+    started = perf_counter()
     connection = twill_schema.connect(state_dir)
     try:
         report = twill_detectors.run_detectors(
@@ -939,6 +984,15 @@ def detect_command(args: argparse.Namespace) -> int:
         )
 
     warnings: list[str] = []
+    record_stage(
+        state_dir,
+        "detect",
+        perf_counter() - started,
+        {
+            "detectors": len(report.outcomes),
+            "clusters": sum(outcome.clusters for outcome in report.outcomes),
+        },
+    )
     if not report.outcomes:
         warnings.append(
             "no detectors registered; 'twill detect' had nothing to run"
@@ -974,6 +1028,36 @@ def detect_command(args: argparse.Namespace) -> int:
         print(f"{outcome.full_id}: {outcome.clusters} cluster(s)")
     total_clusters = sum(outcome.clusters for outcome in report.outcomes)
     print(f"{len(report.outcomes)} detector(s) ran; {total_clusters} cluster(s)")
+    return EXIT_SUCCESS
+
+
+def status_command(args: argparse.Namespace) -> int:
+    payload = read_status(_state_dir(args.state_dir))
+    if args.json:
+        emit_success(
+            payload["data"],
+            json_mode=True,
+            warnings=payload["warnings"],
+        )
+        return EXIT_SUCCESS
+
+    print("TWILL status")
+    stages = payload["data"]["stages"]
+    if not stages:
+        print("no stage records")
+    else:
+        print("stage\tlast_success\tduration_seconds\tcounts")
+        for name in sorted(stages):
+            record = stages[name]
+            counts = ", ".join(
+                f"{key}={value}" for key, value in record["counts"].items()
+            ) or "-"
+            last_success = record["last_success"] or "never"
+            print(
+                f"{name}\t{last_success}\t{record['duration']:.6f}\t{counts}"
+            )
+    for warning in payload["warnings"]:
+        print(f"warning: {redact_text(warning)}", file=sys.stderr)
     return EXIT_SUCCESS
 
 
@@ -1059,6 +1143,11 @@ def build_parser() -> argparse.ArgumentParser:
     detect.add_argument("--state-dir")
     detect.add_argument("--json", action="store_true")
     detect.set_defaults(handler=detect_command)
+
+    status = subparsers.add_parser("status", help="show stage status records")
+    status.add_argument("--state-dir")
+    status.add_argument("--json", action="store_true")
+    status.set_defaults(handler=status_command)
 
     digest = subparsers.add_parser("digest", help="render the stored Phase 0 digest")
     digest.add_argument("--stdout", action="store_true", help="render to stdout")
