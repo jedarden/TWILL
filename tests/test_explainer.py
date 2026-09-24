@@ -1,10 +1,13 @@
-"""Tests for the bounded Explain prompt builder."""
+"""Tests for Explain prompt construction and Claude invocation."""
 
 import hashlib
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -191,6 +194,93 @@ class ExplainerTestCase(unittest.TestCase):
         self.assertEqual(first, second)
         self.assertEqual(first.count(twill_explainer.EXCERPT_BEGIN), 1)
         self.assertIn('"observation_id":3', first)
+
+    def test_invokes_claude_with_session_variables_removed_from_child_environment(self):
+        prompt = "bounded prompt"
+        completed = subprocess.CompletedProcess(
+            args=["claude", "-p", "--model", "claude-haiku-4-5"],
+            returncode=0,
+            stdout='{"lesson":"ok"}',
+            stderr="",
+        )
+        parent_env = {
+            "CLAUDE_CODE_CHILD_SESSION": "child-session",
+            "CLAUDE_CODE_SESSION_ID": "parent-session",
+            "TWILL_INVOKE_TEST": "preserved",
+        }
+
+        with mock.patch.dict(os.environ, parent_env, clear=False):
+            with mock.patch.object(
+                twill_explainer.subprocess,
+                "run",
+                return_value=completed,
+            ) as run:
+                output = twill_explainer.invoke_claude(
+                    prompt,
+                    model="claude-haiku-4-5",
+                )
+
+            run.assert_called_once()
+            self.assertEqual(
+                run.call_args.args[0],
+                ["claude", "-p", "--model", "claude-haiku-4-5"],
+            )
+            self.assertEqual(run.call_args.kwargs["input"], prompt)
+            self.assertTrue(run.call_args.kwargs["text"])
+            self.assertTrue(run.call_args.kwargs["capture_output"])
+            self.assertFalse(run.call_args.kwargs["check"])
+            self.assertFalse(run.call_args.kwargs["shell"])
+            child_env = run.call_args.kwargs["env"]
+            self.assertNotIn("CLAUDE_CODE_CHILD_SESSION", child_env)
+            self.assertNotIn("CLAUDE_CODE_SESSION_ID", child_env)
+            self.assertEqual(child_env["TWILL_INVOKE_TEST"], "preserved")
+            self.assertEqual(
+                os.environ["CLAUDE_CODE_CHILD_SESSION"],
+                parent_env["CLAUDE_CODE_CHILD_SESSION"],
+            )
+            self.assertEqual(
+                os.environ["CLAUDE_CODE_SESSION_ID"],
+                parent_env["CLAUDE_CODE_SESSION_ID"],
+            )
+
+        self.assertEqual(output, completed.stdout)
+
+    def test_unavailable_claude_fails_closed_without_exposing_os_error(self):
+        with mock.patch.object(
+            twill_explainer.subprocess,
+            "run",
+            side_effect=FileNotFoundError("sensitive spawn detail"),
+        ) as run:
+            with self.assertRaises(twill_explainer.ClaudeInvocationError) as raised:
+                twill_explainer.invoke_claude("prompt", model="claude-haiku-4-5")
+
+        run.assert_called_once()
+        self.assertEqual(str(raised.exception), "claude CLI is unavailable")
+        self.assertNotIn("sensitive spawn detail", str(raised.exception))
+
+    def test_rate_limited_claude_fails_closed_without_exposing_output(self):
+        secret = "ghp_" + "1234567890abcdefghijklmnop"
+        completed = subprocess.CompletedProcess(
+            args=["claude", "-p"],
+            returncode=1,
+            stdout="partial output",
+            stderr=f"rate limit reached with {secret}",
+        )
+        with mock.patch.object(
+            twill_explainer.subprocess,
+            "run",
+            return_value=completed,
+        ) as run:
+            with self.assertRaises(twill_explainer.ClaudeInvocationError) as raised:
+                twill_explainer.invoke_claude("prompt", model="claude-haiku-4-5")
+
+        run.assert_called_once()
+        self.assertEqual(
+            str(raised.exception),
+            "claude -p failed with exit status 1",
+        )
+        self.assertNotIn(secret, str(raised.exception))
+        self.assertNotIn("partial output", str(raised.exception))
 
     def test_db_adapter_selects_only_matching_observation_fields(self):
         state_dir = self.root / "state"

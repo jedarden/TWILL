@@ -1,4 +1,4 @@
-"""Build the bounded, untrusted-data-framed input for TWILL Explain.
+"""Build bounded Explain prompts and invoke the local Claude CLI.
 
 The builder consumes ranked clusters and their already-associated observations. It never accepts a
 transcript path or a session record, and it redacts every value again at the prompt boundary.
@@ -8,8 +8,10 @@ from __future__ import annotations
 
 import hashlib
 import json
+import os
 import re
 import sqlite3
+import subprocess
 from collections.abc import Iterable, Mapping, Sequence
 from datetime import datetime, timezone
 from dataclasses import dataclass
@@ -27,6 +29,7 @@ MAX_TOTAL_BYTES = MAX_TOTAL_PROMPT_BYTES
 MAX_EVIDENCE_ROWS_PER_CLUSTER = 256
 MAX_IDENTIFIER_LENGTH = MAX_EXCERPT_LENGTH
 _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,239}$")
+_CLAUDE_SESSION_ENV_VARS = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID")
 
 CLUSTER_DATA_BEGIN = "BEGIN_UNTRUSTED_DATA"
 CLUSTER_DATA_END = "END_UNTRUSTED_DATA"
@@ -50,6 +53,10 @@ _FRAME_MARKER_RE = re.compile(
     re.IGNORECASE,
 )
 _FRAME_MARKER_REPLACEMENT = "<untrusted-marker>"
+
+
+class ClaudeInvocationError(RuntimeError):
+    """A Claude invocation that did not produce usable output."""
 
 
 @dataclass(frozen=True)
@@ -352,6 +359,33 @@ def _limit(value: int, default: int, maximum: int, name: str) -> int:
     return min(value, maximum)
 
 
+def invoke_claude(prompt: str, *, model: str) -> str:
+    """Run one print-mode Claude invocation without inheriting its parent session."""
+
+    child_env = os.environ.copy()
+    for name in _CLAUDE_SESSION_ENV_VARS:
+        child_env.pop(name, None)
+
+    try:
+        completed = subprocess.run(
+            ["claude", "-p", "--model", model],
+            input=prompt,
+            env=child_env,
+            text=True,
+            capture_output=True,
+            check=False,
+            shell=False,
+        )
+    except OSError:
+        raise ClaudeInvocationError("claude CLI is unavailable") from None
+
+    if completed.returncode != 0:
+        raise ClaudeInvocationError(
+            f"claude -p failed with exit status {completed.returncode}"
+        )
+    return completed.stdout
+
+
 def _build(
     source: object,
     redactor: Redactor,
@@ -608,6 +642,7 @@ def load_candidate_clusters(
 
 __all__ = [
     "CLUSTER_BEGIN",
+    "ClaudeInvocationError",
     "CLUSTER_DATA_BEGIN",
     "CLUSTER_DATA_END",
     "CLUSTER_END",
@@ -627,5 +662,6 @@ __all__ = [
     "build_explain_prompt",
     "build_prompt",
     "build_prompt_from_db",
+    "invoke_claude",
     "load_candidate_clusters",
 ]
