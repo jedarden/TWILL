@@ -80,11 +80,21 @@ def seed_observation(
     kind: str = "run_failed",
     tool: str | None = None,
     command: str | None = None,
+    signature: str | None = None,
+    sig_hash: str | None = None,
+    excerpt: str | None = None,
 ) -> None:
     observed_at = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    stored_excerpt = excerpt if excerpt is not None else (
+        f"{program}: command not found" if program else "tool failed"
+    )
+    stored_sig_hash = sig_hash
+    if stored_sig_hash is None and signature is not None:
+        stored_sig_hash = twill_app.h12(signature)
     connection.execute(
         "INSERT INTO observation(session_id, ts_utc, ts_local, kind, program, "
-        "command, tool, excerpt) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+        "command, tool, signature, sig_hash, excerpt) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             session_id,
             observed_at.isoformat(),
@@ -95,7 +105,9 @@ def seed_observation(
                 f"{program} --flag" if program else None
             ),
             tool,
-            f"{program}: command not found" if program else "tool failed",
+            signature,
+            stored_sig_hash,
+            stored_excerpt,
         ),
     )
     connection.commit()
@@ -562,6 +574,133 @@ class DetectorRunTests(unittest.TestCase):
         self.assertEqual(secret_key, "<redacted:github-token>")
 
 
+class RecurringErrorSignatureDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def test_d02_requires_two_sessions_and_ranks_by_sessions_then_recency(self):
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            days_ago=5,
+            signature="shared failure",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            days_ago=4,
+            signature="shared failure",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s2",
+            days_ago=3,
+            signature="shared failure",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s3",
+            days_ago=1,
+            signature="shared failure",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            kind="tool_error",
+            tool="Edit",
+            signature="tool failure",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s2",
+            kind="tool_error",
+            tool="Edit",
+            signature="tool failure",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            days_ago=2,
+            signature="one session only",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            days_ago=2,
+            signature="one session only",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            days_ago=40,
+            signature="outside window",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s2",
+            days_ago=40,
+            signature="outside window",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            kind="session_activity",
+            signature="not an error",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s2",
+            kind="session_activity",
+            signature="not an error",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            signature=" ",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s2",
+            signature=" ",
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.RECURRING_ERROR_SIGNATURE,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-02@1", "ok", 2)],
+        )
+        rows = cluster_rows(self.connection, "D-02")
+        self.assertEqual([row[1] for row in rows], ["shared failure", "tool failure"])
+        shared = next(row for row in rows if row[1] == "shared failure")
+        self.assertEqual(shared[3], 3)
+        self.assertEqual(shared[4], 4)
+        self.assertLess(shared[5], shared[6])
+        tool = next(row for row in rows if row[1] == "tool failure")
+        self.assertEqual(tool[3], 2)
+        self.assertEqual(tool[4], 2)
+
+        parameters = {
+            "window_start_utc": (
+                datetime.now(timezone.utc) - timedelta(days=30)
+            ).isoformat(),
+            "window_days": 30,
+        }
+        ordered = self.connection.execute(
+            twill_detectors.RECURRING_ERROR_SIGNATURE.cluster_sql, parameters
+        ).fetchall()
+        self.assertEqual([row[0] for row in ordered], ["shared failure", "tool failure"])
+
+
 class DetectCommandTests(unittest.TestCase):
     """The ``twill detect`` verb surface (§14) over the registry runner."""
 
@@ -706,22 +845,32 @@ class DetectCliTests(unittest.TestCase):
             capture_output=True,
         )
 
-    def test_empty_registry_is_a_clean_loud_run(self):
+    def test_registered_detector_is_a_clean_run(self):
         with tempfile.TemporaryDirectory() as directory:
             state = Path(directory) / "state"
             result = self.run_cli("detect", "--json", "--state-dir", str(state))
             self.assertEqual(result.returncode, 0, result.stderr)
             envelope = json.loads(result.stdout)
-            self.assertEqual(envelope["data"]["detectors"], [])
-            self.assertEqual(envelope["data"]["window_days"], 30)
-            self.assertTrue(
-                any("no detectors registered" in w for w in envelope["warnings"])
+            self.assertEqual(
+                envelope["data"]["detectors"],
+                [
+                    {
+                        "detector_id": "D-02",
+                        "version": 1,
+                        "full_id": "D-02@1",
+                        "status": "ok",
+                        "clusters": 0,
+                        "error": None,
+                    }
+                ],
             )
+            self.assertEqual(envelope["data"]["window_days"], 30)
+            self.assertEqual(envelope["warnings"], [])
             self.assertEqual(result.stderr, "")
 
             human = self.run_cli("detect", "--state-dir", str(state))
             self.assertEqual(human.returncode, 0, human.stderr)
-            self.assertIn("no detectors registered", human.stdout)
+            self.assertIn("D-02@1: 0 cluster(s)", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):
         with tempfile.TemporaryDirectory() as directory:

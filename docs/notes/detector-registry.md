@@ -91,6 +91,16 @@ The stamp lives in the state DB, which is derived and disposable: after a
 The durable cross-rebuild record of what a version meant is the registry's own
 history in git plus the versioned ids recorded in measurements.
 
+## D-02@1: recurring error signature
+
+D-02 emits one cluster for each normalized error signature seen in at least two distinct sessions
+inside the trailing window. It considers `run_failed` and `tool_error` observations with a non-empty
+`signature` and `sig_hash`, groups by both the hash and the normalized text, and returns the
+normalized text as `key`. `sessions` counts distinct session ids, while `events`, `first_seen`, and
+`last_seen` describe all matching observations. Query output is ordered by sessions descending,
+`last_seen` descending, then key ascending. The registry keeps `cluster.score` at zero; Phase 3's
+ranker owns the global score built from these fields.
+
 ## Adding or changing a detector
 
 To add one (the D-01 … D-10 beads): append a `Detector` to

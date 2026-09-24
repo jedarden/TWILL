@@ -534,11 +534,18 @@ the §12 budget and `doctor` is clean.
 **Does NOT include:** detectors beyond a trivial one (Phase 2), coverage (Phase 3).
 
 ### Phase 2: Detectors + digest
-**Delivers:** `D-01` missing binary, `D-02` recurring error signature, `D-03` retry loop,
-`D-04` hook denial, `D-05` rejected tool call, `D-06` interrupt-then-correction, `D-10` ICG gate gap
+**Delivers:** `D-01` missing binary, `D-02` recurring error signature, `D-03` retry loop, `D-04` hook denial, `D-05` rejected tool call, `D-06` interrupt-then-correction, `D-10` ICG gate gap
 (an always/never event from ICG's catalog that executed anyway — reported as a hole in the gate, not
 as a TWILL lesson); `twill detect`, `twill digest`; the `org-rule-guard` denial log and, if present,
 friction receipts wired as inputs (both written by their owners, only read here — §6.5).
+
+**D-02@1 decision (2026-09-23):** recurrence means a normalized error signature appearing in at least
+`N = 2` distinct sessions inside the active trailing window. The detector considers only `run_failed`
+and `tool_error` observations with a non-empty `signature` and `sig_hash`, groups by
+`(sig_hash, signature)`, and orders its output by distinct sessions descending, then latest
+`last_seen` descending, with `key` as a deterministic tie-breaker. Persisted clusters retain
+`score = 0.0`; the Phase 3 ranker consumes these counts and timestamps for global ranking.
+
 
 **Digest shape, from the first version:** every line carries the exact command that re-derives it;
 the report is a week-over-week diff (new / worsening / improving / gone) rather than a standing top

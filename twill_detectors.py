@@ -199,10 +199,34 @@ def select_detectors(
     return tuple(by_id[name] for name in dict.fromkeys(names))
 
 
+RECURRING_ERROR_SIGNATURE_SQL = """
+    SELECT signature AS key,
+           count(DISTINCT session_id) AS sessions,
+           count(*) AS events,
+           min(ts_utc) AS first_seen,
+           max(ts_utc) AS last_seen
+    FROM observation
+    WHERE ts_utc >= :window_start_utc
+      AND kind IN ('run_failed', 'tool_error')
+      AND signature IS NOT NULL
+      AND trim(signature) <> ''
+      AND sig_hash IS NOT NULL
+    GROUP BY sig_hash, signature
+    HAVING count(DISTINCT session_id) >= 2
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+RECURRING_ERROR_SIGNATURE = Detector(
+    "D-02",
+    1,
+    "recurring normalized error signatures across distinct sessions",
+    RECURRING_ERROR_SIGNATURE_SQL,
+)
+
 # The shipped catalog.  Phase 2's detector beads (D-01 missing binary, D-02
 # recurring error signature, ... D-10 ICG gate gap) append their entries here;
 # an entry leaves this tuple when its successor version lands.
-REGISTRY: tuple[Detector, ...] = build_registry()
+REGISTRY: tuple[Detector, ...] = build_registry(RECURRING_ERROR_SIGNATURE)
 
 
 @dataclasses.dataclass(frozen=True)
