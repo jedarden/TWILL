@@ -32,7 +32,8 @@ class MeasurementTests(unittest.TestCase):
         if state.startswith("applied:") or state in {"resolved", "escalated", "retired"}:
             layer = state.split(":", 1)[1] if ":" in state else "environment"
             routing = (
-                f"routing: {{recommended: {layer}, applied: {layer}, "
+                f"routing: {{recommended: {layer}, reason: \"Install or repair the "
+                f"missing command before retrying.\", applied: {layer}, "
                 "applied_at: 2026-09-20T00:00:00Z, bead: twill-measure}"
             )
         else:

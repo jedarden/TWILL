@@ -34,6 +34,7 @@ from twill_detectors import (
 )
 from twill_ranker import RankedCluster, RankReport
 from twill_redactor import MAX_EXCERPT_LENGTH, Redactor, redact_text
+from twill_router import RoutingRecommendation, recommend_routing
 
 
 MAX_CLUSTER_PROMPT_BYTES = 8 * 1024
@@ -997,11 +998,13 @@ def _lesson_text(
     first_seen: str,
     session_ids: Sequence[str],
     backtest: LessonBacktest,
+    routing: RoutingRecommendation,
 ) -> str:
     encoded_summary = json.dumps(summary, ensure_ascii=False)
     encoded_key = json.dumps(key, ensure_ascii=False)
     encoded_date = json.dumps(first_seen, ensure_ascii=False)
     encoded_sessions = json.dumps(list(session_ids), ensure_ascii=False, separators=(",", ":"))
+    encoded_reason = json.dumps(routing.reason, ensure_ascii=False)
     lines = (
         "---",
         f"id: {lesson_id}",
@@ -1013,7 +1016,9 @@ def _lesson_text(
         f"sessions: {sessions}, events: {events}, first_seen: {encoded_date}, "
         f"session_ids: {encoded_sessions}"
         "}",
-        "routing: {recommended: null, applied: null, applied_at: null, bead: null}",
+        "routing: {"
+        f"recommended: {routing.recommended}, reason: {encoded_reason}, "
+        "applied: null, applied_at: null, bead: null}",
         "backtest: {"
         f"window_days: {backtest.window_days}, sessions: {backtest.sessions}, "
         f"first_seen: {json.dumps(backtest.first_seen)}, "
@@ -1068,6 +1073,12 @@ def _prepare_lessons(
         key = metadata["key"]
         if not isinstance(key, str) or not key:
             _invalid_lesson_write(f"{cluster_id}.key", "must be a non-empty string")
+        sessions = _count(metadata["sessions"])
+        routing = recommend_routing(
+            detector=detector,
+            key=key,
+            sessions=sessions,
+        )
         first_seen = _lesson_date(
             metadata["first_seen"], f"{cluster_id}.evidence.first_seen"
         )
@@ -1092,11 +1103,12 @@ def _prepare_lessons(
             summary=summary,
             detector=detector,
             key=key,
-            sessions=_count(metadata["sessions"]),
+            sessions=sessions,
             events=_count(metadata["events"]),
             first_seen=first_seen,
             session_ids=session_ids,
             backtest=backtest,
+            routing=routing,
         )
         prepared.append(
             _PreparedLesson(

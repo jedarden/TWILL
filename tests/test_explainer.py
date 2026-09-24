@@ -19,6 +19,7 @@ import twill_explainer  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_config import ConfigError, TwillConfig  # noqa: E402
 from twill_contract import EXIT_VALIDATION_FAILURE, ValidationError  # noqa: E402
+from twill_lessons import load_lesson  # noqa: E402
 from twill_ranker import RankedCluster  # noqa: E402
 
 
@@ -352,10 +353,9 @@ class ExplainerTestCase(unittest.TestCase):
         self.assertIn('key: "command-not-found:sqlite3"\n', text)
         self.assertIn("sessions: 3, events: 7, first_seen:", text)
         self.assertIn('session_ids: ["session-11","session-12"]', text)
-        self.assertIn(
-            "routing: {recommended: null, applied: null, applied_at: null, bead: null}",
-            text,
-        )
+        self.assertIn("routing: {recommended: environment, reason:", text)
+        self.assertIn("The command was missing across 3 sessions", text)
+        self.assertIn("applied: null, applied_at: null, bead: null}", text)
         self.assertIn(
             "backtest: {window_days: 180, sessions: 0, "
             "first_seen: null, weeks_present: 0}",
@@ -371,6 +371,26 @@ class ExplainerTestCase(unittest.TestCase):
         )
         self.assertEqual(repeated, paths)
         self.assertEqual(path.read_bytes(), text.encode("utf-8"))
+
+    def test_generic_recurrence_lesson_records_retrieval_only_reason(self):
+        key = "tool rejected: invalid input"
+        path = twill_explainer.write_lesson_files(
+            (
+                self.draft(
+                    f"D-02:{key}",
+                    "A tool rejection recurs across sessions. Use its required input shape.",
+                ),
+            ),
+            (self.candidate(key, detector_id="D-02"),),
+            self.config(),
+        )[0]
+
+        record = load_lesson(path)
+        self.assertEqual(record.routing["recommended"], "retrieval_only")
+        self.assertIn(
+            "proves no stronger prevention point",
+            record.routing["reason"],
+        )
 
     def test_writer_revalidates_summary_before_creating_any_file(self):
         with self.assertRaises(ValidationError):

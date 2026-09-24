@@ -96,6 +96,8 @@ class LessonLifecycleTests(unittest.TestCase):
         )
 
         self.assertEqual(applied.state, "applied:environment")
+        self.assertEqual(applied.routing["recommended"], "environment")
+        self.assertIn("installing or repairing", applied.routing["reason"])
         self.assertEqual(applied.routing["applied"], "environment")
         self.assertEqual(applied.routing["applied_at"], "2026-09-24T12:00:00Z")
         self.assertEqual(applied.routing["bead"], "twill-example")
@@ -170,6 +172,15 @@ class LessonLifecycleTests(unittest.TestCase):
         path.write_text(text.replace("backtest: {", "missing_backtest: {", 1))
         with self.assertRaises(ValidationError):
             accept_lesson(self.artifacts, lesson_id)
+
+    def test_recommendation_requires_recorded_reasoning(self):
+        path = self.write_draft()
+        text = path.read_text()
+        path.write_text(text.replace('reason: "', 'unrecorded: "', 1))
+
+        with self.assertRaises(ValidationError) as raised:
+            load_lesson(path)
+        self.assertIn("routing.reason must accompany", str(raised.exception))
 
     def test_body_and_file_mode_survive_a_transition(self):
         path = self.write_draft()

@@ -115,7 +115,11 @@ are binding; in lowercase prose they are descriptive.
 - **Lesson** — a reviewed, redacted, committed markdown document describing one recurring problem,
   its correct handling, its evidence, its routing layer, and its detector.
 - **Routing layer** — where a lesson is enacted, in descending order of strength: environment fix >
-  hook/gate > wrapper script > skill > repo `AGENTS.md` > memory file > retrieval-only.
+  hook/gate > wrapper script > skill > repo `AGENTS.md` > memory file > retrieval-only. This is an
+  ordered precedence, not an unordered set.
+- **Routing recommendation** — the strongest layer that the lesson's structured evidence justifies,
+  plus the bounded `routing.reason` recorded with it. The model-authored summary never chooses the
+  layer.
 - **Coverage** — the property that an existing rule (in MEMORY.md, a memory leaf, CLAUDE.md, a repo
   `AGENTS.md`, or a skill) already addresses a cluster. A covered cluster that still recurs is an
   **escalation**, not a new lesson.
@@ -403,7 +407,7 @@ state: draft            # draft -> accepted -> applied:<layer> -> resolved | esc
 detector: D-01
 key: "command-not-found:sqlite3"
 evidence: {sessions: 1096, events: 1529, first_seen: 2026-08-20, session_ids: [...]}  # ids only
-routing: {recommended: environment, applied: null, applied_at: null, bead: null}
+routing: {recommended: environment, reason: "Install or repair the missing binary.", applied: null, applied_at: null, bead: null}
 backtest: {window_days: 180, sessions: 1096, first_seen: 2026-06-14, weeks_present: 13}
 guard: {layer: hook, artifact: guards/L-3b02ce2a.hook.json, installed: false}
 ```
@@ -670,6 +674,14 @@ with frontmatter — written to `guards/<lesson-id>.*` inside TWILL and installe
 human. Prose describes a rule; an artifact is one someone can actually adopt in a minute.
 **Completion criteria:** state machine tests including the refusal to auto-accept; an applied lesson
 records layer + timestamp + bead id; the open-path test proves no write outside TWILL's two trees.
+**Routing decision (2026-09-24):** the router owns the exact strongest-to-weakest tuple
+`environment`, `hook`, `wrapper`, `skill`, `agents_md`, `memory`, `retrieval_only` and records the
+strongest layer justified by structured cluster identity, never by the model-authored summary. A
+`D-01 command-not-found:*` cluster proves an environment defect and recommends installing or repairing
+the command. Other generic recurrence clusters do not yet identify a deterministic prevention point, so
+they recommend `retrieval_only` rather than inventing a stronger intervention; detector-specific
+policies may strengthen this as their structured evidence becomes available. Every new draft carries
+a non-null recommendation and a bounded `routing.reason`; D-09 and D-10 never become lessons.
 **Does NOT include:** escalation logic.
 
 ### Phase 6: Measure, escalate, retire — and self-measurement
@@ -902,3 +914,4 @@ triage-only summarization while routing stays manual.
 |---|---|---|
 | 2026-09-19 | Initial draft from brief; name, independence, and raw-transcript input decided in session. | plan-author |
 | 2026-09-19 | Adopted 9 of 10 `plan-idea-gen` finalists into the phases that own them (backtest P4, change-point + waste + rule-earnings P3, guard generator P5, reproduction-first digest + dead-man's switch P2, usage/shape extraction P1, `twill brief` P6, receipts as an optional input §6.5). The always/never event catalog was routed to **ICG** instead of being adopted here; `D-10` consumes it. Open Questions 7–8 added. | plan-idea-gen (bead twill-502355a3) |
+| 2026-09-24 | Locked the ordered seven-layer routing precedence, the conservative generic-error fallback, and the per-lesson `routing.reason` contract. | opencode (bead twill-dd6383a5) |

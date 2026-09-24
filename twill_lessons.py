@@ -14,6 +14,7 @@ from pathlib import Path
 from twill_config import ConfigError
 from twill_contract import ValidationError
 from twill_redactor import redact_text
+from twill_router import ROUTING_LAYER_ORDER
 
 
 LESSON_DIRNAME = "lessons"
@@ -22,17 +23,7 @@ LESSON_FILE_MODE = 0o600
 LESSON_ID_RE = re.compile(r"^L-[0-9a-f]{8}$")
 LESSON_STATES = frozenset({"draft", "accepted", "resolved", "escalated", "retired"})
 STATE_FILTERS = frozenset(LESSON_STATES | {"applied"})
-ROUTING_LAYERS = frozenset(
-    {
-        "environment",
-        "hook",
-        "wrapper",
-        "skill",
-        "agents_md",
-        "memory",
-        "retrieval_only",
-    }
-)
+ROUTING_LAYERS = frozenset(ROUTING_LAYER_ORDER)
 TERMINAL_STATES = frozenset({"resolved", "escalated", "retired"})
 VALID_STATES = frozenset(
     LESSON_STATES | {f"applied:{layer}" for layer in ROUTING_LAYERS}
@@ -332,11 +323,17 @@ def _validate_routing(value: object) -> dict[str, object]:
         missing = ", ".join(sorted(_REQUIRED_ROUTING - set(routing)))
         raise _error(f"lesson routing is missing required field(s): {missing}")
     recommended = routing["recommended"]
+    reason = _redacted(routing.get("reason"), "routing.reason")
     applied = routing["applied"]
     if recommended is not None:
         recommended = _validate_layer(recommended)
     if applied is not None:
         applied = _validate_layer(applied)
+    if (recommended is None) != (reason is None):
+        raise _error(
+            "routing.reason must accompany a recommendation",
+            "record why the selected layer is the strongest justified intervention",
+        )
     applied_at = _timestamp(routing["applied_at"], "routing.applied_at")
     bead = _redacted(routing["bead"], "routing.bead")
     if applied is not None and (applied_at is None or bead is None):
@@ -345,6 +342,7 @@ def _validate_routing(value: object) -> dict[str, object]:
         )
     return {
         "recommended": recommended,
+        "reason": reason,
         "applied": applied,
         "applied_at": applied_at,
         "bead": bead,
@@ -1000,6 +998,7 @@ __all__ = [
     "LESSON_ID_RE",
     "LESSON_STATES",
     "LessonRecord",
+    "ROUTING_LAYER_ORDER",
     "ROUTING_LAYERS",
     "STATE_FILTERS",
     "TERMINAL_STATES",
