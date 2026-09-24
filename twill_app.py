@@ -27,6 +27,7 @@ from time import perf_counter
 from typing import Iterator, Sequence
 
 import twill_detectors
+import twill_lessons
 import twill_ranker
 import twill_schema
 import twill_cursor
@@ -57,7 +58,7 @@ from twill_status import read_status, record_stage
 MAX_EXCERPT_LENGTH = 240
 SIGNATURE_INPUT_LIMIT = 400
 SIGNATURE_HASH_LENGTH = 12
-MUTATING_VERBS = frozenset({"ingest", "detect", "rank"})
+MUTATING_VERBS = frozenset({"ingest", "detect", "rank", "accept", "apply"})
 
 _SIGNATURE_SUBSTITUTIONS = (
     (
@@ -1458,6 +1459,76 @@ def rank_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _lesson_data(record: twill_lessons.LessonRecord) -> dict[str, object]:
+    return {"lesson": record.as_dict()}
+
+
+def _print_lesson(record: twill_lessons.LessonRecord, action: str) -> None:
+    print(
+        f"{action} {record.id}: state={record.state} "
+        f"detector={record.detector}"
+    )
+    if record.layer is not None:
+        print(f"layer: {record.layer}")
+        print(f"bead: {record.routing['bead']}")
+        print(f"applied_at: {record.routing['applied_at']}")
+
+
+def accept_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    record = twill_lessons.accept_lesson(
+        config.require_artifacts_root(),
+        args.lesson_id,
+        operator=True,
+    )
+    emit_success(_lesson_data(record), json_mode=args.json)
+    if not args.json:
+        _print_lesson(record, "accepted")
+    return EXIT_SUCCESS
+
+
+def apply_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    if not args.bead:
+        raise UsageError(
+            "--bead is required when recording an applied lesson",
+            "record the bead that owns the fix before applying the lesson",
+        )
+    record = twill_lessons.apply_lesson(
+        config.require_artifacts_root(),
+        args.lesson_id,
+        layer=args.layer,
+        bead=args.bead,
+        operator=True,
+    )
+    emit_success(_lesson_data(record), json_mode=args.json)
+    if not args.json:
+        _print_lesson(record, "applied")
+    return EXIT_SUCCESS
+
+
+def lessons_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    records = twill_lessons.list_lessons(
+        config.require_artifacts_root(),
+        state=args.state,
+    )
+    emit_success(
+        {"lessons": [record.as_dict() for record in records]},
+        json_mode=args.json,
+    )
+    if args.json:
+        return EXIT_SUCCESS
+    if not records:
+        print("no lessons")
+        return EXIT_SUCCESS
+    for record in records:
+        print(
+            f"{record.id}\t{record.state}\t{record.detector}\t{record.key}"
+        )
+    return EXIT_SUCCESS
+
+
 def status_command(args: argparse.Namespace) -> int:
     payload = read_status(_state_dir(args.state_dir))
     if args.json:
@@ -1594,6 +1665,33 @@ def build_parser() -> argparse.ArgumentParser:
     rank.add_argument("--state-dir")
     rank.add_argument("--json", action="store_true")
     rank.set_defaults(handler=rank_command)
+
+    accept = subparsers.add_parser(
+        "accept", help="accept a drafted lesson after operator review"
+    )
+    accept.add_argument("lesson_id", metavar="ID")
+    accept.add_argument("--state-dir")
+    accept.add_argument("--json", action="store_true")
+    accept.set_defaults(handler=accept_command)
+
+    apply = subparsers.add_parser(
+        "apply", help="record an applied lesson and its routing metadata"
+    )
+    apply.add_argument("lesson_id", metavar="ID")
+    apply.add_argument("--layer", required=True)
+    apply.add_argument("--bead")
+    apply.add_argument("--state-dir")
+    apply.add_argument("--json", action="store_true")
+    apply.set_defaults(handler=apply_command)
+
+    lessons = subparsers.add_parser("lessons", help="list lesson files by state")
+    lessons.add_argument(
+        "--state",
+        choices=("draft", "accepted", "applied", "resolved", "escalated", "retired"),
+    )
+    lessons.add_argument("--state-dir")
+    lessons.add_argument("--json", action="store_true")
+    lessons.set_defaults(handler=lessons_command)
 
     status = subparsers.add_parser("status", help="show stage status records")
     status.add_argument("--state-dir")
