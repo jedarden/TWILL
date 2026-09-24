@@ -13,11 +13,17 @@ CONFIG_FILE := $(CONFIG_DIR)/config.toml
 SKELETON := config.toml.skeleton
 LINK := $(BIN_DIR)/twill
 
-# Unit tests; every test module locates the repo root itself, so this works
-# from any checkout.
+# Unit tests under the open-path audit gate (plan §8.3, §10.2).  Putting
+# tests/ on PYTHONPATH makes `site` import tests/sitecustomize.py before
+# unittest loads anything, so the hook is live from interpreter startup, and
+# the inherited variable makes every spawned CLI verb self-install it.  A
+# bare `python3 -m unittest discover -s tests` skips that startup and runs
+# ungated, which tests/test_openpath.py detects and fails: run the suite
+# through this target or pytest.
 .PHONY: test
 test:
-	python3 -m unittest discover -s tests
+	PYTHONPATH="$(CURDIR)/tests$${PYTHONPATH:+:$$PYTHONPATH}" \
+		python3 -m unittest discover -s tests
 
 .DEFAULT_GOAL := install
 .PHONY: install

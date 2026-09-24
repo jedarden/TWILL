@@ -79,6 +79,22 @@ startup until it is set. The three systemd `--user` timers install from
 `systemd/` (§13.1) as their own slices land, each being a unit that invokes
 verbs from a different phase.
 
+## Tests
+
+```sh
+make test        # or: pytest
+```
+
+The suite runs under the open-path audit harness (§8.3, §10.2): an
+`open()`/`os.open` audit hook refuses any write outside this repository
+(never its artifact directories), the state directory, `artifacts_root` and
+test scratch space, and refuses any open under
+`~/agent-transcript-archive` outright. Every Python subprocess the suite
+spawns — each CLI verb — installs the same hook, so the verbs themselves
+are policed. A bare `python3 -m unittest discover` skips the harness's
+startup and deliberately fails; run the suite through `make test` or
+pytest. See `docs/notes/open-path-audit.md`.
+
 ## Phase 0 walking skeleton
 
 The first executable slice reads one settled JSONL session from either local transcript source,
