@@ -116,9 +116,23 @@ twill digest --stdout
 ```
 
 Use `--settle 0` for a deliberately controlled fixture, `--file PATH` to select one session, or
-`--state-dir PATH` and `--source PATH` for an isolated run. This walking skeleton intentionally
-does not implement appended-file cursors, ranking, coverage, LLM explanation, measurement, or
-timers.
+`--state-dir PATH` and `--source PATH` for an isolated run. The initial walking skeleton did not
+implement ranking, coverage, LLM explanation, measurement, or timers; cursor and schema support now
+live in the engine.
+
+## Health checks
+
+`twill doctor` is the read-only Phase 1 health entry point. It checks SQLite integrity and schema
+version, ingest timer freshness, cursor parse or missing-path anomalies, and free disk space:
+
+```sh
+twill doctor
+twill doctor --json --state-dir ~/.local/state/twill
+```
+
+The command exits `0` when healthy, `1` when degraded, and `2` when broken. These health exits are
+reported through the normal JSON envelope; argument errors retain the CLI usage-error contract.
+Later health checks and recovery flags are added independently.
 
 ## CLI output contract
 

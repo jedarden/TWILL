@@ -30,6 +30,7 @@ import twill_detectors
 import twill_ranker
 import twill_schema
 import twill_cursor
+import twill_doctor
 from codex_reader import CodexRolloutLineParser
 from twill_config import (
     ConfigError,
@@ -1153,6 +1154,22 @@ def status_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def doctor_command(args: argparse.Namespace) -> int:
+    report = twill_doctor.run_doctor(_state_dir(args.state_dir))
+    emit_success(
+        report.as_dict(),
+        json_mode=args.json,
+        warnings=report.warnings,
+    )
+    if args.json:
+        return report.exit_code
+    print("TWILL doctor")
+    print(f"status: {report.status}")
+    for check in report.checks:
+        print(f"- {check.name}: {check.status} ({redact_text(check.message)})")
+    return report.exit_code
+
+
 def digest_command(args: argparse.Namespace) -> int:
     state_dir = _state_dir(args.state_dir)
     # A read verb must not bootstrap the state directory or database.  An
@@ -1248,6 +1265,13 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--state-dir")
     status.add_argument("--json", action="store_true")
     status.set_defaults(handler=status_command)
+
+    doctor = subparsers.add_parser(
+        "doctor", help="check Phase 1 pipeline health"
+    )
+    doctor.add_argument("--state-dir")
+    doctor.add_argument("--json", action="store_true")
+    doctor.set_defaults(handler=doctor_command)
 
     digest = subparsers.add_parser("digest", help="render the stored Phase 0 digest")
     digest.add_argument("--stdout", action="store_true", help="render to stdout")
