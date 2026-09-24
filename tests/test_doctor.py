@@ -147,6 +147,18 @@ class DoctorChecksTests(unittest.TestCase):
         )
         self.assertEqual(self.check(report, "db_schema").status, twill_doctor.BROKEN)
 
+    def test_schema_missing_attribution_relation_is_broken(self):
+        self.create_database()
+        connection = twill_schema.connect(self.state)
+        connection.execute("DROP TABLE cluster_session")
+        connection.commit()
+        connection.close()
+        report = twill_doctor.run_doctor(
+            self.state,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+        self.assertEqual(self.check(report, "db_schema").status, twill_doctor.BROKEN)
+
     def test_malformed_cursor_counter_is_broken(self):
         self.create_database()
         connection = twill_schema.connect(self.state)

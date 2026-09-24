@@ -342,6 +342,19 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
                 "PRIMARY KEY(detector_id, version))",
             ),
         ),
+        Migration(
+            3,
+            "cluster_waste_attribution",
+            (
+                "ALTER TABLE detector_run ADD COLUMN attribution_sha TEXT",
+                "CREATE TABLE IF NOT EXISTS cluster_session("
+                "detector_id TEXT NOT NULL, key TEXT NOT NULL, "
+                "session_id TEXT NOT NULL, "
+                "PRIMARY KEY(detector_id, key, session_id))",
+                "CREATE INDEX IF NOT EXISTS cluster_session_by_session "
+                "ON cluster_session(session_id, detector_id, key)",
+            ),
+        ),
     )
 )
 

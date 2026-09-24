@@ -587,6 +587,14 @@ a human actually reads:
 - **Waste attribution** — `session_usage` joined to clusters, so the digest ranks by estimated
   tokens and dollars burned rather than by raw count. Attribution across a session that hit several
   frictions is proportional and is labelled an estimate wherever it is shown.
+- **Waste-attribution decision (2026-09-24):** each successful detector run persists the distinct
+  sessions that contributed to each current cluster. A session's aggregate input, output, and
+  cache-read tokens plus source-reported dollar cost are divided equally across every distinct
+  cluster it hit, across all detectors; repeated observations of one cluster do not increase its
+  share. The global denominator includes hit clusters whose usage is unavailable. A token component
+  or dollar estimate is unavailable when any contributing session lacks that measure, rather than
+  treating missing usage as zero. JSON fields carry an `estimated_` prefix and human output repeats
+  `estimated`; neither surface presents an allocated figure as observed spend.
 - **Change-point detection** (`trend`) — weekly rates per signature in `cluster_week`, flagging new
   and accelerating friction against its own trailing band. **EWMA, not CUSUM** — the decision is
   made here so an implementer does not have to: CUSUM needs a tuned reference shift per signature,

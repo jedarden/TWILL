@@ -60,7 +60,7 @@ import hashlib
 import re
 import sqlite3
 from datetime import datetime, timedelta, timezone
-from typing import Sequence
+from typing import Mapping, Sequence
 
 from twill_contract import (
     EXIT_RUNTIME_ERROR,
@@ -79,6 +79,7 @@ MAX_ERROR_LENGTH = 500
 
 # The columns a detector's SQL must emit, and the parameters the runner binds.
 CLUSTER_COLUMNS = ("key", "sessions", "events", "first_seen", "last_seen")
+SESSION_HIT_COLUMNS = ("key", "session_id")
 SQL_PARAMETERS = ("window_start_utc", "window_days")
 
 STATUS_OK = "ok"
@@ -112,6 +113,7 @@ class Detector:
     version: int
     description: str
     cluster_sql: str
+    session_hits_sql: str | None = None
 
     @property
     def full_id(self) -> str:
@@ -126,6 +128,19 @@ class Detector:
                 f"detector={self.detector_id}",
                 f"version={self.version}",
                 f"sql={' '.join(self.cluster_sql.split())}",
+            )
+        )
+        return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
+
+    @property
+    def attribution_sha(self) -> str | None:
+        if self.session_hits_sql is None:
+            return None
+        canonical = "\n".join(
+            (
+                f"detector={self.detector_id}",
+                f"version={self.version}",
+                f"hits_sql={' '.join(self.session_hits_sql.split())}",
             )
         )
         return hashlib.sha256(canonical.encode("utf-8")).hexdigest()
@@ -172,6 +187,23 @@ def build_registry(*detectors: Detector) -> tuple[Detector, ...]:
                 f"read-only SELECT (or WITH ... SELECT): "
                 f"{detector.cluster_sql!r}"
             )
+        if detector.session_hits_sql is not None:
+            hits_statement = detector.session_hits_sql.strip().rstrip(";").strip()
+            if not hits_statement:
+                raise ValueError(
+                    f"detector {detector.full_id} has empty session-hit SQL"
+                )
+            if ";" in hits_statement:
+                raise ValueError(
+                    f"detector {detector.full_id} session-hit SQL must be one "
+                    f"statement: {detector.session_hits_sql!r}"
+                )
+            if not _QUERY_SHAPE.match(hits_statement):
+                raise ValueError(
+                    f"detector {detector.full_id} session-hit SQL must be a "
+                    f"single read-only SELECT (or WITH ... SELECT): "
+                    f"{detector.session_hits_sql!r}"
+                )
         previous = seen.get(detector.detector_id)
         if previous is not None:
             raise ValueError(
@@ -219,11 +251,27 @@ MISSING_BINARY_SQL = """
     ORDER BY sessions DESC, last_seen DESC, key ASC
 """
 
+MISSING_BINARY_HIT_SQL = """
+    SELECT 'command-not-found:' || program AS key, session_id
+    FROM observation
+    WHERE ts_utc >= :window_start_utc
+      AND kind = 'run_failed'
+      AND program IS NOT NULL
+      AND trim(program) <> ''
+      AND signature IS NOT NULL
+      AND trim(signature) <> ''
+      AND sig_hash IS NOT NULL
+      AND lower(signature) LIKE '%command not found%'
+    GROUP BY program, session_id
+    ORDER BY key ASC, session_id ASC
+"""
+
 MISSING_BINARY = Detector(
     "D-01",
     1,
     "missing binaries reported as command-not-found across distinct sessions",
     MISSING_BINARY_SQL,
+    MISSING_BINARY_HIT_SQL,
 )
 
 
@@ -244,11 +292,24 @@ RECURRING_ERROR_SIGNATURE_SQL = """
     ORDER BY sessions DESC, last_seen DESC, key ASC
 """
 
+RECURRING_ERROR_SIGNATURE_HIT_SQL = """
+    SELECT signature AS key, session_id
+    FROM observation
+    WHERE ts_utc >= :window_start_utc
+      AND kind IN ('run_failed', 'tool_error')
+      AND signature IS NOT NULL
+      AND trim(signature) <> ''
+      AND sig_hash IS NOT NULL
+    GROUP BY sig_hash, signature, session_id
+    ORDER BY key ASC, session_id ASC
+"""
+
 RECURRING_ERROR_SIGNATURE = Detector(
     "D-02",
     1,
     "recurring normalized error signatures across distinct sessions",
     RECURRING_ERROR_SIGNATURE_SQL,
+    RECURRING_ERROR_SIGNATURE_HIT_SQL,
 )
 
 # The shipped catalog.  Phase 2's detector beads (D-01 missing binary, D-02
@@ -325,6 +386,16 @@ def _drift_message(detector: Detector, recorded_sha: str) -> str:
     )
 
 
+def _attribution_drift_message(detector: Detector, recorded_sha: str) -> str:
+    registered_sha = detector.attribution_sha or ""
+    return (
+        f"waste-attribution semantics changed without a version bump "
+        f"(recorded {_short_sha(recorded_sha)}, registered "
+        f"{_short_sha(registered_sha)}); bump the version so estimates remain "
+        "reproducible"
+    )
+
+
 def _emitted_key(detector: Detector, raw: object) -> str:
     if not isinstance(raw, str) or not raw.strip():
         raise DetectorContractError(
@@ -389,6 +460,56 @@ def _collect_clusters(
     return emitted
 
 
+def _emitted_session(detector: Detector, raw: object) -> str:
+    if not isinstance(raw, str) or not raw.strip():
+        raise DetectorContractError(
+            f"{detector.full_id} emitted a non-text or empty session_id"
+        )
+    session_id = redact_text(raw)
+    if not session_id.strip():
+        raise DetectorContractError(
+            f"{detector.full_id} emitted a session_id that redacts to nothing"
+        )
+    return session_id
+
+
+def _collect_session_hits(
+    detector: Detector,
+    cursor: sqlite3.Cursor,
+    emitted: Mapping[str, tuple[int, int, str, str]],
+) -> tuple[tuple[str, str], ...]:
+    columns = [description[0] for description in cursor.description or ()]
+    missing = [column for column in SESSION_HIT_COLUMNS if column not in columns]
+    if missing:
+        raise DetectorContractError(
+            f"{detector.full_id} session-hit SQL must emit "
+            f"{', '.join(SESSION_HIT_COLUMNS)}; missing {', '.join(missing)} "
+            f"(got {', '.join(columns)})"
+        )
+    hits: set[tuple[str, str]] = set()
+    counts: dict[str, int] = {}
+    for row in cursor.fetchall():
+        value = dict(zip(columns, row))
+        key = _emitted_key(detector, value["key"])
+        session_id = _emitted_session(detector, value["session_id"])
+        hit = (key, session_id)
+        if hit in hits:
+            raise DetectorContractError(
+                f"{detector.full_id} emitted duplicate session hit for {key!r}"
+            )
+        hits.add(hit)
+        counts[key] = counts.get(key, 0) + 1
+    for key, values in emitted.items():
+        observed = counts.get(key, 0)
+        expected = values[0]
+        if observed != expected:
+            raise DetectorContractError(
+                f"{detector.full_id} emitted {observed} session hit(s) for "
+                f"{key!r}; cluster SQL reports {expected}"
+            )
+    return tuple(sorted(hit for hit in hits if hit[0] in emitted))
+
+
 _CLUSTER_UPSERT = """
 INSERT INTO cluster(detector_id, key, window_days, sessions, events,
                     first_seen, last_seen, score, covered_by, state)
@@ -401,11 +522,13 @@ ON CONFLICT(detector_id, key) DO UPDATE SET
 
 _RUN_RECORD_UPSERT = """
 INSERT INTO detector_run(detector_id, version, full_id, semantics_sha,
-                         first_run_at, last_run_at, last_status, last_error,
-                         clusters, window_days)
-VALUES (?, ?, ?, ?, ?, ?, 'ok', NULL, ?, ?)
+                         attribution_sha, first_run_at, last_run_at,
+                         last_status, last_error, clusters, window_days)
+VALUES (?, ?, ?, ?, ?, ?, ?, 'ok', NULL, ?, ?)
 ON CONFLICT(detector_id, version) DO UPDATE SET
   full_id=excluded.full_id, semantics_sha=excluded.semantics_sha,
+  attribution_sha=COALESCE(excluded.attribution_sha,
+                           detector_run.attribution_sha),
   last_run_at=excluded.last_run_at, last_status='ok', last_error=NULL,
   clusters=excluded.clusters, window_days=excluded.window_days
 """
@@ -429,6 +552,10 @@ def _run_one(
     try:
         cursor = connection.execute(detector.cluster_sql, parameters)
         emitted = _collect_clusters(detector, cursor)
+        session_hits: tuple[tuple[str, str], ...] = ()
+        if detector.session_hits_sql is not None:
+            cursor = connection.execute(detector.session_hits_sql, parameters)
+            session_hits = _collect_session_hits(detector, cursor, emitted)
         open_keys = {
             row[0]
             for row in connection.execute(
@@ -453,12 +580,25 @@ def _run_one(
                 ((detector.detector_id, key) for key in sorted(stale)),
             )
         connection.execute(
+            "DELETE FROM cluster_session WHERE detector_id = ?",
+            (detector.detector_id,),
+        )
+        connection.executemany(
+            "INSERT INTO cluster_session(detector_id, key, session_id) "
+            "VALUES (?, ?, ?)",
+            (
+                (detector.detector_id, key, session_id)
+                for key, session_id in session_hits
+            ),
+        )
+        connection.execute(
             _RUN_RECORD_UPSERT,
             (
                 detector.detector_id,
                 detector.version,
                 detector.full_id,
                 detector.semantics_sha,
+                detector.attribution_sha,
                 ran_at,
                 ran_at,
                 len(emitted),
@@ -537,7 +677,7 @@ def run_detectors(
     outcomes: list[DetectorOutcome] = []
     for detector in active:
         row = connection.execute(
-            "SELECT semantics_sha FROM detector_run "
+            "SELECT semantics_sha, attribution_sha FROM detector_run "
             "WHERE detector_id = ? AND version = ?",
             (detector.detector_id, detector.version),
         ).fetchone()
@@ -548,6 +688,21 @@ def run_detectors(
                     version=detector.version,
                     status=STATUS_REFUSED,
                     error=_drift_message(detector, str(row[0])),
+                )
+            )
+            continue
+        if (
+            row is not None
+            and detector.attribution_sha is not None
+            and row[1] is not None
+            and row[1] != detector.attribution_sha
+        ):
+            outcomes.append(
+                DetectorOutcome(
+                    detector_id=detector.detector_id,
+                    version=detector.version,
+                    status=STATUS_REFUSED,
+                    error=_attribution_drift_message(detector, str(row[1])),
                 )
             )
             continue

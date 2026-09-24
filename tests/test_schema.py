@@ -159,6 +159,24 @@ class SchemaContractTests(unittest.TestCase):
         for table in V1_TABLES:
             self.assertIn(table, names)
 
+    def test_cluster_session_relation_is_available_for_attribution(self):
+        columns = self.table_columns("cluster_session")
+        self.assertEqual(
+            columns,
+            [
+                ("detector_id", "TEXT", 1, None, 1),
+                ("key", "TEXT", 1, None, 2),
+                ("session_id", "TEXT", 1, None, 3),
+            ],
+        )
+        observed = tuple(
+            row[2]
+            for row in self.connection.execute(
+                "PRAGMA index_info(cluster_session_by_session)"
+            )
+        )
+        self.assertEqual(observed, ("session_id", "detector_id", "key"))
+
     def test_rule_fts_is_fts5_with_unindexed_path(self):
         row = self.connection.execute(
             "SELECT sql FROM sqlite_master WHERE name = 'rule_fts'"
@@ -335,9 +353,8 @@ class MigrationRunnerTests(unittest.TestCase):
     """Plan §8.4: additive-only, version-stamped, downgrade-tolerant migrations.
 
     The shipped registry carries the additive tables later phases add on top
-    of the v1 baseline (currently version 2, ``detector_run``); the apply path
-    beyond it is exercised by registering the kind of migrations those phases
-    will add.
+    of the v1 baseline (currently version 3); the apply path beyond it is
+    exercised by registering the kind of migrations those phases will add.
     """
 
     def setUp(self):
@@ -371,6 +388,11 @@ class MigrationRunnerTests(unittest.TestCase):
             )
         }
         self.assertIn("detector_run", tables)
+        self.assertIn("cluster_session", tables)
+        self.assertIn(
+            "attribution_sha",
+            [row[1] for row in connection.execute("PRAGMA table_info(detector_run)")],
+        )
         newest = str(versions[-1])
         self.assertEqual(self.stamped_version(connection), newest)
         # Reopening neither duplicates nor bumps the stamp.

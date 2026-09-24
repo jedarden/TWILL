@@ -231,6 +231,42 @@ class CoverageTestCase(unittest.TestCase):
         self.assertEqual(
             payload["coverage"], {"total": 2, "covered": 1, "uncovered": 1}
         )
+        for lane in ("clusters", "covered_clusters", "escalations"):
+            for row in payload[lane]:
+                self.assertIn("estimated_tokens", row)
+                self.assertIn("estimated_waste_usd", row)
+
+    def test_rank_command_labels_every_human_waste_figure_as_estimated(self):
+        self.add_cluster("command-not-found:sqlite3")
+        self.connection.execute(
+            "INSERT INTO cluster_session(detector_id, key, session_id) "
+            "VALUES ('D-01', 'command-not-found:sqlite3', 's1')"
+        )
+        self.connection.execute(
+            "INSERT INTO session_usage(session_id, input_tokens, output_tokens, "
+            "cache_read_tokens, cost_usd) VALUES ('s1', 10, 20, 30, 0.125)"
+        )
+        self.connection.commit()
+        self.connection.close()
+        config = TwillConfig(
+            artifacts_root=self.root / "artifacts",
+            rule_globs=(),
+            top_k=1,
+        )
+        args = argparse.Namespace(
+            top=None,
+            state_dir=str(self.state_dir),
+            json=False,
+        )
+        output = io.StringIO()
+        with mock.patch.object(twill_app, "load_config", return_value=config):
+            with redirect_stdout(output):
+                code = twill_app.rank_command(args)
+
+        rendered = output.getvalue()
+        self.assertEqual(code, 0)
+        self.assertIn("estimated tokens: 60.00", rendered)
+        self.assertIn("estimated waste: 0.125000 USD", rendered)
 
 
 if __name__ == "__main__":

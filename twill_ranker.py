@@ -14,7 +14,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
-from math import log1p
+from math import isfinite, log1p
 from typing import Mapping, Sequence
 
 from twill_rulecorpus import IndexReport, index_corpus
@@ -45,6 +45,36 @@ class ClusterCoverage:
     rule_stale: bool = False
     changed: bool = False
     rule_sha: str | None = None
+
+
+@dataclass(frozen=True)
+class EstimatedWaste:
+    """Whole-session usage proportionally attributed to one cluster."""
+
+    input_tokens: float | None
+    output_tokens: float | None
+    cache_read_tokens: float | None
+    waste_usd: float | None
+
+    @property
+    def tokens(self) -> float | None:
+        if (
+            self.input_tokens is None
+            or self.output_tokens is None
+            or self.cache_read_tokens is None
+        ):
+            return None
+        return self.input_tokens + self.output_tokens + self.cache_read_tokens
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "estimated_input_tokens": self.input_tokens,
+            "estimated_output_tokens": self.output_tokens,
+            "estimated_cache_read_tokens": self.cache_read_tokens,
+            "estimated_tokens": self.tokens,
+            "estimated_waste_usd": self.waste_usd,
+            "waste_attribution_method": "equal_split_across_distinct_cluster_hits",
+        }
 
 
 @dataclass(frozen=True)
@@ -90,6 +120,7 @@ class RankedCluster:
     state: str
     rule_sha: str | None = None
     rule_stale: bool = False
+    estimated_waste: EstimatedWaste | None = None
 
     @property
     def covered(self) -> bool:
@@ -106,6 +137,7 @@ class RankedCluster:
         )
 
     def as_dict(self) -> dict[str, object]:
+        estimate = self.estimated_waste or EstimatedWaste(None, None, None, None)
         return {
             "detector_id": self.detector_id,
             "key": self.key,
@@ -122,6 +154,7 @@ class RankedCluster:
             "covered": self.covered,
             "new_lesson_candidate": self.new_lesson_candidate,
             "escalation_candidate": self.escalation_candidate,
+            **estimate.as_dict(),
         }
 
 
@@ -406,9 +439,87 @@ def refresh_coverage(
     return CoverageReport(tuple(results))
 
 
+def _known_token(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _known_cost(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    resolved = float(value)
+    if resolved < 0 or not isfinite(resolved):
+        return None
+    return resolved
+
+
+def attribute_waste(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, str], EstimatedWaste]:
+    rows = connection.execute(
+        "WITH session_cluster_counts AS ("
+        "  SELECT session_id, count(*) AS cluster_hits "
+        "  FROM cluster_session GROUP BY session_id"
+        ") "
+        "SELECT cs.detector_id, cs.key, counts.cluster_hits, "
+        "       u.input_tokens, u.output_tokens, u.cache_read_tokens, u.cost_usd "
+        "FROM cluster_session AS cs "
+        "JOIN session_cluster_counts AS counts ON counts.session_id = cs.session_id "
+        "LEFT JOIN session_usage AS u ON u.session_id = cs.session_id "
+        "ORDER BY cs.detector_id, cs.key, cs.session_id"
+    ).fetchall()
+    hit_counts: dict[tuple[str, str], int] = {}
+    token_values: dict[tuple[str, str], dict[str, float]] = {}
+    token_counts: dict[tuple[str, str], dict[str, int]] = {}
+    cost_values: dict[tuple[str, str], float] = {}
+    cost_counts: dict[tuple[str, str], int] = {}
+    token_columns = ("input_tokens", "output_tokens", "cache_read_tokens")
+    for detector_id, key, cluster_hits, *usage in rows:
+        cluster = (str(detector_id), str(key))
+        hits = int(cluster_hits)
+        hit_counts[cluster] = hit_counts.get(cluster, 0) + 1
+        values = token_values.setdefault(
+            cluster, {column: 0.0 for column in token_columns}
+        )
+        counts = token_counts.setdefault(cluster, {column: 0 for column in token_columns})
+        for index, column in enumerate(token_columns):
+            token = _known_token(usage[index])
+            if token is None:
+                continue
+            values[column] += token / hits
+            counts[column] += 1
+        cost = _known_cost(usage[3])
+        if cost is not None:
+            cost_values[cluster] = cost_values.get(cluster, 0.0) + cost / hits
+            cost_counts[cluster] = cost_counts.get(cluster, 0) + 1
+
+    estimates: dict[tuple[str, str], EstimatedWaste] = {}
+    for cluster, hits in hit_counts.items():
+        values = token_values[cluster]
+        counts = token_counts[cluster]
+        components = {
+            column: values[column] if counts[column] == hits else None
+            for column in token_columns
+        }
+        cost = (
+            cost_values[cluster]
+            if cost_counts.get(cluster, 0) == hits
+            else None
+        )
+        estimates[cluster] = EstimatedWaste(
+            components["input_tokens"],
+            components["output_tokens"],
+            components["cache_read_tokens"],
+            cost,
+        )
+    return estimates
+
+
 def _ranked_row(
     row: tuple[object, ...],
     coverage: ClusterCoverage | None = None,
+    estimated_waste: EstimatedWaste | None = None,
 ) -> RankedCluster:
     return RankedCluster(
         detector_id=str(row[0]),
@@ -423,12 +534,14 @@ def _ranked_row(
         state=str(row[9]),
         rule_sha=coverage.rule_sha if coverage is not None else None,
         rule_stale=coverage.rule_stale if coverage is not None else False,
+        estimated_waste=estimated_waste,
     )
 
 
 def _cluster_rows(
     connection: sqlite3.Connection,
     coverage_by_cluster: dict[tuple[str, str], ClusterCoverage],
+    estimates: Mapping[tuple[str, str], EstimatedWaste],
 ) -> tuple[RankedCluster, ...]:
     rows = connection.execute(
         "SELECT detector_id, key, window_days, sessions, events, first_seen, "
@@ -440,6 +553,7 @@ def _cluster_rows(
         _ranked_row(
             row,
             coverage_by_cluster.get((str(row[0]), str(row[1]))),
+            estimates.get((str(row[0]), str(row[1]))),
         )
         for row in rows
     )
@@ -483,7 +597,8 @@ def rank_clusters(
     coverage_by_cluster = {
         (row.detector_id, row.key): row for row in coverage.rows
     }
-    all_rows = _cluster_rows(connection, coverage_by_cluster)
+    estimates = attribute_waste(connection)
+    all_rows = _cluster_rows(connection, coverage_by_cluster, estimates)
     candidates = tuple(
         row for row in all_rows if row.new_lesson_candidate
     )[:top_k]

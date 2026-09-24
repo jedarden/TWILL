@@ -65,9 +65,14 @@ def make_detector(
     version: int = 1,
     sql: str | None = None,
     description: str = "groups run failures",
+    session_hits_sql: str | None = None,
 ) -> twill_detectors.Detector:
     return twill_detectors.Detector(
-        detector_id, version, description, sql or program_failure_sql()
+        detector_id,
+        version,
+        description,
+        sql or program_failure_sql(),
+        session_hits_sql,
     )
 
 
@@ -152,6 +157,26 @@ class RegistryContractTests(unittest.TestCase):
             base.semantics_sha, make_detector(sql=program_failure_sql("command")).semantics_sha
         )
         self.assertNotEqual(base.semantics_sha, make_detector(version=2).semantics_sha)
+
+    def test_attribution_hash_tracks_only_session_hit_semantics(self):
+        base = make_detector()
+        self.assertIsNone(base.attribution_sha)
+        hit_sql = "SELECT program AS key, session_id FROM observation"
+        with_hits = make_detector(session_hits_sql=hit_sql)
+        self.assertIsNotNone(with_hits.attribution_sha)
+        self.assertEqual(base.semantics_sha, with_hits.semantics_sha)
+        self.assertNotEqual(
+            with_hits.attribution_sha,
+            make_detector(
+                session_hits_sql=hit_sql.replace("session_id", "session_id || '-x'")
+            ).attribution_sha,
+        )
+
+    def test_build_registry_rejects_malformed_session_hit_sql(self):
+        for bad in ("", "   ", "UPDATE cluster_session SET session_id = 'x'",
+                    "SELECT 1; SELECT 2"):
+            with self.subTest(bad=bad), self.assertRaises(ValueError):
+                twill_detectors.build_registry(make_detector(session_hits_sql=bad))
 
     def test_build_registry_rejects_malformed_ids(self):
         for bad in ("D-1", "d-01", "D01", "D-01x", "X-01", "D-", "01"):
@@ -262,6 +287,100 @@ class DetectorRunTests(unittest.TestCase):
         self.assertIsNone(record[7])
         self.assertEqual(record[8], 1)
         self.assertEqual(record[9], 30)
+
+    def test_session_hits_commit_and_refresh_with_the_cluster(self):
+        seed_observation(self.connection, program="sqlite3", session_id="s1")
+        seed_observation(self.connection, program="sqlite3", session_id="s2")
+        hits_sql = (
+            "SELECT program AS key, session_id FROM observation "
+            "WHERE kind = 'run_failed' AND ts_utc >= :window_start_utc "
+            "GROUP BY program, session_id"
+        )
+        cluster_sql = program_failure_sql().replace(
+            "GROUP BY program",
+            "GROUP BY program HAVING count(DISTINCT session_id) >= 2",
+        )
+        detector = make_detector(sql=cluster_sql, session_hits_sql=hits_sql)
+
+        first = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+
+        self.assertEqual(first.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT detector_id, key, session_id FROM cluster_session "
+                "ORDER BY session_id"
+            ).fetchall(),
+            [("D-01", "sqlite3", "s1"), ("D-01", "sqlite3", "s2")],
+        )
+        self.connection.execute(
+            "DELETE FROM observation WHERE session_id = 's2'"
+        )
+        self.connection.commit()
+        second = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+        self.assertEqual(second.exit_code, EXIT_SUCCESS)
+        self.assertEqual(cluster_rows(self.connection, "D-01"), [])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM cluster_session"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_session_hit_contract_failure_rolls_back_clusters_and_hits(self):
+        seed_observation(self.connection, program="sqlite3", session_id="s1")
+        seed_observation(self.connection, program="sqlite3", session_id="s2")
+        detector = make_detector(
+            session_hits_sql=(
+                "SELECT program AS key, session_id FROM observation "
+                "WHERE kind = 'run_failed' AND ts_utc >= :window_start_utc "
+                "GROUP BY program, session_id LIMIT 1"
+            )
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+
+        self.assertEqual(report.exit_code, EXIT_RUNTIME_ERROR)
+        self.assertEqual(cluster_rows(self.connection, "D-01"), [])
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM cluster_session"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_session_hit_drift_requires_a_version_bump(self):
+        seed_observation(self.connection, program="sqlite3", session_id="s1")
+        seed_observation(self.connection, program="sqlite3", session_id="s2")
+        hits_sql = (
+            "SELECT program AS key, session_id FROM observation "
+            "WHERE kind = 'run_failed' AND ts_utc >= :window_start_utc "
+            "GROUP BY program, session_id"
+        )
+        first = make_detector(session_hits_sql=hits_sql)
+        twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(first,)
+        )
+        changed = make_detector(session_hits_sql=hits_sql + " LIMIT 1")
+
+        report = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(changed,)
+        )
+
+        self.assertEqual(report.exit_code, EXIT_VALIDATION_FAILURE)
+        self.assertEqual(report.outcomes[0].status, "refused")
+        self.assertIn("waste-attribution", report.outcomes[0].error)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM cluster_session"
+            ).fetchone()[0],
+            2,
+        )
 
     def test_run_requires_a_positive_whole_day_window(self):
         for bad in (0, -3, 1.5, True):
@@ -684,6 +803,18 @@ class MissingBinaryDetectorTests(unittest.TestCase):
         bf = next(row for row in rows if row[1].endswith(":bf"))
         self.assertEqual(bf[3], 2)
         self.assertEqual(bf[4], 2)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT key, session_id FROM cluster_session "
+                "WHERE detector_id = 'D-01' AND key = ? ORDER BY session_id",
+                ("command-not-found:sqlite3",),
+            ).fetchall(),
+            [
+                ("command-not-found:sqlite3", "s1"),
+                ("command-not-found:sqlite3", "s2"),
+                ("command-not-found:sqlite3", "s3"),
+            ],
+        )
 
         parameters = {
             "window_start_utc": (
@@ -814,6 +945,14 @@ class RecurringErrorSignatureDetectorTests(unittest.TestCase):
         tool = next(row for row in rows if row[1] == "tool failure")
         self.assertEqual(tool[3], 2)
         self.assertEqual(tool[4], 2)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT key, session_id FROM cluster_session "
+                "WHERE detector_id = 'D-02' AND key = 'shared failure' "
+                "ORDER BY session_id"
+            ).fetchall(),
+            [("shared failure", "s1"), ("shared failure", "s2"), ("shared failure", "s3")],
+        )
 
         parameters = {
             "window_start_utc": (

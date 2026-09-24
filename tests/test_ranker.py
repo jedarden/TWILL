@@ -66,6 +66,106 @@ class RankerTestCase(unittest.TestCase):
             "SELECT score FROM cluster WHERE key = ?", (key,)
         ).fetchone()[0]
 
+    def add_hit(self, key: str, session_id: str, detector_id: str = "D-01") -> None:
+        self.connection.execute(
+            "INSERT INTO cluster_session(detector_id, key, session_id) "
+            "VALUES (?, ?, ?)",
+            (detector_id, key, session_id),
+        )
+        self.connection.commit()
+
+    def add_usage(
+        self,
+        session_id: str,
+        *,
+        input_tokens: int | None = 0,
+        output_tokens: int | None = 0,
+        cache_read_tokens: int | None = 0,
+        cost_usd: float | None = 0.0,
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO session_usage(session_id, input_tokens, output_tokens, "
+            "cache_read_tokens, cost_usd) VALUES (?, ?, ?, ?, ?)",
+            (session_id, input_tokens, output_tokens, cache_read_tokens, cost_usd),
+        )
+        self.connection.commit()
+
+    def test_session_usage_is_split_equally_across_all_hit_clusters(self):
+        self.add_cluster("missing", sessions=2, events=3)
+        self.add_cluster("recurring", sessions=2, events=4, detector_id="D-02")
+        self.add_cluster("other", sessions=2, events=2)
+        self.add_hit("missing", "s1")
+        self.add_hit("recurring", "s1", "D-02")
+        self.add_hit("other", "s1")
+        self.add_usage(
+            "s1",
+            input_tokens=300,
+            output_tokens=600,
+            cache_read_tokens=900,
+            cost_usd=1.5,
+        )
+
+        report = self.rank()
+
+        for cluster in report.ranking.all_clusters:
+            self.assertIsNotNone(cluster.estimated_waste)
+            self.assertAlmostEqual(cluster.estimated_waste.input_tokens, 100.0)
+            self.assertAlmostEqual(cluster.estimated_waste.output_tokens, 200.0)
+            self.assertAlmostEqual(cluster.estimated_waste.cache_read_tokens, 300.0)
+            self.assertAlmostEqual(cluster.estimated_waste.tokens, 600.0)
+            self.assertAlmostEqual(cluster.estimated_waste.waste_usd, 0.5)
+        rendered = report.ranking.all_clusters[0].as_dict()
+        self.assertEqual(rendered["estimated_tokens"], 600.0)
+        self.assertEqual(rendered["estimated_waste_usd"], 0.5)
+        self.assertEqual(
+            rendered["waste_attribution_method"],
+            "equal_split_across_distinct_cluster_hits",
+        )
+
+    def test_missing_usage_components_remain_unavailable_not_zero(self):
+        self.add_cluster("known")
+        self.add_cluster("unknown")
+        self.add_hit("known", "s1")
+        self.add_hit("unknown", "s1")
+        self.add_usage(
+            "s1",
+            input_tokens=100,
+            output_tokens=None,
+            cache_read_tokens=20,
+            cost_usd=None,
+        )
+
+        estimates = twill_ranker.attribute_waste(self.connection)
+
+        for estimate in estimates.values():
+            self.assertEqual(estimate.input_tokens, 50.0)
+            self.assertIsNone(estimate.output_tokens)
+            self.assertEqual(estimate.cache_read_tokens, 10.0)
+            self.assertIsNone(estimate.tokens)
+            self.assertIsNone(estimate.waste_usd)
+
+    def test_cost_is_unavailable_when_any_contributing_session_is_unknown(self):
+        self.add_cluster("known", sessions=2)
+        self.add_cluster("other", sessions=2, detector_id="D-02")
+        self.add_hit("known", "s1")
+        self.add_hit("known", "s2")
+        self.add_hit("other", "s1", "D-02")
+        self.add_usage("s1", input_tokens=10, cost_usd=0.0)
+        self.add_usage("s2", input_tokens=20, cost_usd=None)
+
+        estimates = twill_ranker.attribute_waste(self.connection)
+
+        self.assertIsNone(estimates[("D-01", "known")].waste_usd)
+        self.assertEqual(estimates[("D-02", "other")].waste_usd, 0.0)
+
+    def test_unattributed_cluster_exposes_explicitly_unavailable_estimates(self):
+        self.add_cluster("old")
+
+        rendered = self.rank().ranking.all_clusters[0].as_dict()
+
+        self.assertIsNone(rendered["estimated_tokens"])
+        self.assertIsNone(rendered["estimated_waste_usd"])
+
     def test_score_combines_sessions_events_and_recency(self):
         reference = datetime(2026, 9, 24, tzinfo=timezone.utc)
         base = twill_ranker.score_cluster(2, 2, NOW, 30, as_of=NOW)

@@ -1438,6 +1438,10 @@ def rank_command(args: argparse.Namespace) -> int:
             f"- {cluster.detector_id} {cluster.key}: "
             f"{cluster.sessions} session(s), {cluster.events} event(s)"
         )
+        waste = cluster.estimated_waste
+        tokens = "unavailable" if waste is None or waste.tokens is None else f"{waste.tokens:,.2f}"
+        dollars = "unavailable" if waste is None or waste.waste_usd is None else f"{waste.waste_usd:.6f}"
+        print(f"  estimated tokens: {tokens}; estimated waste: {dollars} USD")
     if result.ranking.escalations:
         print("escalations:")
         for cluster in result.ranking.escalations:

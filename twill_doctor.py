@@ -243,6 +243,8 @@ def _check_database_schema(
         required_tables = [*REQUIRED_TABLES]
         if expected >= 2:
             required_tables.append("detector_run")
+        if expected >= 3:
+            required_tables.append("cluster_session")
         for table in required_tables:
             connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
     except Exception as exc:
