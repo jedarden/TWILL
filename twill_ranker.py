@@ -1,18 +1,29 @@
-"""Refresh cluster coverage and expose the new-lesson candidate path.
+"""Refresh cluster coverage and score, then expose the review paths.
 
 The rule index is read through FTS5, while a successful move is resolved to
 its live path using the indexed content hash. Coverage is a marker on the
 cluster, not a new review state: a covered cluster remains available for the
 later measurement/escalation path but is excluded from new-lesson candidates.
+The persisted score combines distinct-session breadth, event volume and
+window-relative recency; coverage and review state decide which review lane a
+scored row belongs to.
 """
 
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from math import log1p
 from typing import Mapping, Sequence
 
 from twill_rulecorpus import IndexReport, index_corpus
+
+
+_SCORE_SESSION_WEIGHT = 4.0
+_SCORE_EVENT_WEIGHT = 1.0
+_SCORE_RECENCY_WEIGHT = 1.0
+_SECONDS_PER_DAY = 86400.0
 
 
 @dataclass(frozen=True)
@@ -137,6 +148,140 @@ class RankRun:
 
     index: IndexReport
     ranking: RankReport
+
+
+def _timestamp(value: object) -> datetime | None:
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def _clock(as_of: str | datetime | None) -> datetime:
+    if as_of is None:
+        return datetime.now(timezone.utc)
+    resolved = _timestamp(as_of)
+    if resolved is None:
+        raise ValueError("as_of must be an ISO-8601 timestamp")
+    return resolved
+
+
+def _resolve_clock(
+    as_of: str | datetime | None,
+    now: str | datetime | None,
+) -> datetime:
+    if as_of is not None and now is not None:
+        raise ValueError("pass only one of as_of and now")
+    return _clock(as_of if as_of is not None else now)
+
+
+def score_cluster(
+    sessions: int,
+    events: int,
+    last_seen: str,
+    window_days: int,
+    *,
+    as_of: str | datetime | None = None,
+    now: str | datetime | None = None,
+) -> float:
+    """Return the deterministic priority score for one cluster.
+
+    Breadth is the strongest signal because a recurrence across independent
+    sessions is more actionable than repeated events in one session. Log
+    scaling keeps either count from overwhelming the other, while a window-
+    relative half-life lets a newer recurrence rise without erasing evidence
+    from older sessions. A malformed timestamp contributes no recency rather
+    than making the whole rank pass fail; detector timestamps are text, while
+    the score is a prioritization hint.
+    """
+
+    if isinstance(sessions, bool) or not isinstance(sessions, int) or sessions < 0:
+        raise ValueError("sessions must be a non-negative integer")
+    if isinstance(events, bool) or not isinstance(events, int) or events < 0:
+        raise ValueError("events must be a non-negative integer")
+    if isinstance(window_days, bool) or not isinstance(window_days, int) or window_days < 1:
+        raise ValueError("window_days must be a positive integer")
+    reference = _resolve_clock(as_of, now)
+    observed = _timestamp(last_seen)
+    if observed is None:
+        recency = 0.0
+    else:
+        age_days = max(
+            0.0,
+            (reference - observed).total_seconds() / _SECONDS_PER_DAY,
+        )
+        recency = 2.0 ** (-age_days / window_days)
+    return (
+        _SCORE_SESSION_WEIGHT * log1p(sessions)
+        + _SCORE_EVENT_WEIGHT * log1p(events)
+        + _SCORE_RECENCY_WEIGHT * recency
+    )
+
+
+def _score_updates(
+    connection: sqlite3.Connection,
+    *,
+    as_of: datetime,
+) -> tuple[tuple[float, str, str], ...]:
+    rows = connection.execute(
+        "SELECT detector_id, key, sessions, events, last_seen, window_days, score "
+        "FROM cluster ORDER BY detector_id, key"
+    ).fetchall()
+    updates: list[tuple[float, str, str]] = []
+    for detector_id, key, sessions, events, last_seen, window_days, old_score in rows:
+        score = score_cluster(
+            int(sessions),
+            int(events),
+            str(last_seen),
+            int(window_days),
+            as_of=as_of,
+        )
+        if float(old_score) != score:
+            updates.append((score, str(detector_id), str(key)))
+    return tuple(updates)
+
+
+def _persist_score_updates(
+    connection: sqlite3.Connection,
+    updates: Sequence[tuple[float, str, str]],
+    *,
+    manage_transaction: bool,
+) -> None:
+    if not updates:
+        return
+    statement = "UPDATE cluster SET score = ? WHERE detector_id = ? AND key = ?"
+    if manage_transaction:
+        with connection:
+            connection.executemany(statement, updates)
+    else:
+        connection.executemany(statement, updates)
+
+
+def refresh_scores(
+    connection: sqlite3.Connection,
+    *,
+    as_of: str | datetime | None = None,
+    now: str | datetime | None = None,
+    manage_transaction: bool = True,
+) -> None:
+    """Refresh persisted scores for every cluster without changing review state."""
+
+    reference = _resolve_clock(as_of, now)
+    updates = _score_updates(connection, as_of=reference)
+    _persist_score_updates(connection, updates, manage_transaction=manage_transaction)
 
 
 def _quote_fts(value: str) -> str:
@@ -288,7 +433,8 @@ def _cluster_rows(
     rows = connection.execute(
         "SELECT detector_id, key, window_days, sessions, events, first_seen, "
         "last_seen, score, covered_by, state FROM cluster "
-        "ORDER BY sessions DESC, last_seen DESC, detector_id ASC, key ASC"
+        "ORDER BY score DESC, sessions DESC, events DESC, last_seen DESC, "
+        "detector_id ASC, key ASC"
     ).fetchall()
     return tuple(
         _ranked_row(
@@ -310,15 +456,30 @@ def rank_clusters(
     *,
     preferred_shas: Mapping[tuple[str, str], str] | None = None,
     manage_transaction: bool = True,
+    as_of: str | datetime | None = None,
+    now: str | datetime | None = None,
 ) -> RankReport:
-    """Refresh coverage and return the separate review paths."""
+    """Refresh coverage and scores, then return the separate review paths."""
 
     _validate_top_k(top_k)
-    coverage = refresh_coverage(
-        connection,
-        preferred_shas=preferred_shas,
-        manage_transaction=manage_transaction,
-    )
+    reference = _resolve_clock(as_of, now)
+    if manage_transaction:
+        with connection:
+            coverage = refresh_coverage(
+                connection,
+                preferred_shas=preferred_shas,
+                manage_transaction=False,
+            )
+            updates = _score_updates(connection, as_of=reference)
+            _persist_score_updates(connection, updates, manage_transaction=False)
+    else:
+        coverage = refresh_coverage(
+            connection,
+            preferred_shas=preferred_shas,
+            manage_transaction=False,
+        )
+        updates = _score_updates(connection, as_of=reference)
+        _persist_score_updates(connection, updates, manage_transaction=False)
     coverage_by_cluster = {
         (row.detector_id, row.key): row for row in coverage.rows
     }
@@ -359,10 +520,13 @@ def run_rank(
     patterns: Sequence[str],
     *,
     top_k: int = 10,
+    as_of: str | datetime | None = None,
+    now: str | datetime | None = None,
 ) -> RankRun:
     """Index the configured corpus and rank the persisted clusters."""
 
     _validate_top_k(top_k)
+    reference = _resolve_clock(as_of, now)
     connection.execute("BEGIN IMMEDIATE")
     try:
         preferred_shas = _covered_rule_hashes(connection)
@@ -376,6 +540,7 @@ def run_rank(
             top_k=top_k,
             preferred_shas=preferred_shas,
             manage_transaction=False,
+            as_of=reference,
         )
         connection.commit()
     except BaseException:

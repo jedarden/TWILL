@@ -591,6 +591,16 @@ a human actually reads:
   clusters it covers, whether those recurrences went up or down, when it was last read, and a
   deletion candidate list. This is the only output that *shrinks* the context budget, and it is why
   `D-09` exists: 424 of 562 memory files went unread in the month before TWILL was planned.
+
+**Ranking decision (2026-09-24):** after coverage refresh, persist
+`score = 4 * log1p(sessions) + log1p(events) + 2 ** (-age_days / window_days)` for every
+cluster. The fourfold breadth term keeps distinct sessions primary without letting one
+pathological session's event count dominate; the recency term gives a one-window half-life.
+A malformed `last_seen` contributes zero recency rather than failing a review pass. Sort by
+that score, then by sessions, events, `last_seen`, detector id, and key for deterministic ties.
+Coverage and review state are hard gates, not score weights: top-K is applied only to open,
+uncovered clusters; covered clusters remain in the escalation lane; and a `dismissed` row
+never returns to the candidate lane, regardless of its score or later detector refresh.
 **Completion criteria:** `twill rank --json` marks a seeded cluster as covered by a seeded rule file
 and leaves an uncovered one open; `D-08` finds the known live contradiction (MEMORY.md still tells
 agents `bf`, never `br`, while CLAUDE.md made `bead` canonical on 2026-08-14).
