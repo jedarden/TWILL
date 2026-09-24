@@ -199,6 +199,34 @@ def select_detectors(
     return tuple(by_id[name] for name in dict.fromkeys(names))
 
 
+MISSING_BINARY_SQL = """
+    SELECT 'command-not-found:' || program AS key,
+           count(DISTINCT session_id) AS sessions,
+           count(*) AS events,
+           min(ts_utc) AS first_seen,
+           max(ts_utc) AS last_seen
+    FROM observation
+    WHERE ts_utc >= :window_start_utc
+      AND kind = 'run_failed'
+      AND program IS NOT NULL
+      AND trim(program) <> ''
+      AND signature IS NOT NULL
+      AND trim(signature) <> ''
+      AND sig_hash IS NOT NULL
+      AND lower(signature) LIKE '%command not found%'
+    GROUP BY program
+    HAVING count(DISTINCT session_id) >= 2
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+MISSING_BINARY = Detector(
+    "D-01",
+    1,
+    "missing binaries reported as command-not-found across distinct sessions",
+    MISSING_BINARY_SQL,
+)
+
+
 RECURRING_ERROR_SIGNATURE_SQL = """
     SELECT signature AS key,
            count(DISTINCT session_id) AS sessions,
@@ -226,7 +254,9 @@ RECURRING_ERROR_SIGNATURE = Detector(
 # The shipped catalog.  Phase 2's detector beads (D-01 missing binary, D-02
 # recurring error signature, ... D-10 ICG gate gap) append their entries here;
 # an entry leaves this tuple when its successor version lands.
-REGISTRY: tuple[Detector, ...] = build_registry(RECURRING_ERROR_SIGNATURE)
+REGISTRY: tuple[Detector, ...] = build_registry(
+    MISSING_BINARY, RECURRING_ERROR_SIGNATURE
+)
 
 
 @dataclasses.dataclass(frozen=True)

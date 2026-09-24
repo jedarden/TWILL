@@ -574,6 +574,132 @@ class DetectorRunTests(unittest.TestCase):
         self.assertEqual(secret_key, "<redacted:github-token>")
 
 
+class MissingBinaryDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def test_d01_groups_command_not_found_by_program_across_sessions(self):
+        for program, session_id, days_ago, signature in (
+            ("sqlite3", "s1", 5, "sqlite3: command not found"),
+            ("sqlite3", "s1", 4, "running sqlite3: command not found"),
+            ("sqlite3", "s2", 3, "sqlite3: command not found"),
+            ("sqlite3", "s3", 2, "sqlite3: command not found"),
+            ("bf", "s2", 2, "bf: command not found"),
+            ("bf", "s3", 1, "bf: command not found"),
+        ):
+            seed_observation(
+                self.connection,
+                program=program,
+                session_id=session_id,
+                days_ago=days_ago,
+                signature=signature,
+            )
+        seed_observation(
+            self.connection,
+            program="go",
+            session_id="s1",
+            signature="go: command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="sqlite3",
+            session_id="s1",
+            signature="permission denied",
+        )
+        seed_observation(
+            self.connection,
+            program="sqlite3",
+            session_id="s2",
+            signature="permission denied",
+        )
+        seed_observation(
+            self.connection,
+            program="tool",
+            session_id="s1",
+            kind="tool_error",
+            tool="Bash",
+            signature="tool: command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="tool",
+            session_id="s2",
+            kind="tool_error",
+            tool="Bash",
+            signature="tool: command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="",
+            session_id="s1",
+            signature=": command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="",
+            session_id="s2",
+            signature=": command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="sqlite3",
+            session_id="s1",
+            days_ago=40,
+            signature="sqlite3: command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="sqlite3",
+            session_id="s2",
+            days_ago=40,
+            signature="sqlite3: command not found",
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.MISSING_BINARY,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-01@1", "ok", 2)],
+        )
+        rows = cluster_rows(self.connection, "D-01")
+        self.assertEqual(
+            [row[1] for row in rows],
+            ["command-not-found:bf", "command-not-found:sqlite3"],
+        )
+        sqlite3 = next(row for row in rows if row[1].endswith(":sqlite3"))
+        self.assertEqual(sqlite3[3], 3)
+        self.assertEqual(sqlite3[4], 4)
+        self.assertLess(sqlite3[5], sqlite3[6])
+        self.assertEqual(sqlite3[7], 0.0)
+        self.assertEqual(sqlite3[9], "open")
+        bf = next(row for row in rows if row[1].endswith(":bf"))
+        self.assertEqual(bf[3], 2)
+        self.assertEqual(bf[4], 2)
+
+        parameters = {
+            "window_start_utc": (
+                datetime.now(timezone.utc) - timedelta(days=30)
+            ).isoformat(),
+            "window_days": 30,
+        }
+        ordered = self.connection.execute(
+            twill_detectors.MISSING_BINARY_SQL, parameters
+        ).fetchall()
+        self.assertEqual(
+            [row[0] for row in ordered],
+            ["command-not-found:sqlite3", "command-not-found:bf"],
+        )
+
+
 class RecurringErrorSignatureDetectorTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -855,13 +981,21 @@ class DetectCliTests(unittest.TestCase):
                 envelope["data"]["detectors"],
                 [
                     {
+                        "detector_id": "D-01",
+                        "version": 1,
+                        "full_id": "D-01@1",
+                        "status": "ok",
+                        "clusters": 0,
+                        "error": None,
+                    },
+                    {
                         "detector_id": "D-02",
                         "version": 1,
                         "full_id": "D-02@1",
                         "status": "ok",
                         "clusters": 0,
                         "error": None,
-                    }
+                    },
                 ],
             )
             self.assertEqual(envelope["data"]["window_days"], 30)
@@ -870,6 +1004,7 @@ class DetectCliTests(unittest.TestCase):
 
             human = self.run_cli("detect", "--state-dir", str(state))
             self.assertEqual(human.returncode, 0, human.stderr)
+            self.assertIn("D-01@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-02@1: 0 cluster(s)", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):

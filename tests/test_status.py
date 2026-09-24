@@ -209,7 +209,7 @@ class StatusCliTests(unittest.TestCase):
             result = self.run_cli("detect", "--json", "--state-dir", str(state))
             self.assertEqual(result.returncode, 0, result.stderr)
             record = read_status(state)["data"]["stages"]["detect"]
-            self.assertEqual(record["counts"]["detectors"], 1)
+            self.assertEqual(record["counts"]["detectors"], 2)
             self.assertEqual(record["counts"]["clusters"], 0)
 
     def test_missing_status_is_a_successful_empty_status(self):

@@ -539,6 +539,15 @@ the §12 budget and `doctor` is clean.
 as a TWILL lesson); `twill detect`, `twill digest`; the `org-rule-guard` denial log and, if present,
 friction receipts wired as inputs (both written by their owners, only read here — §6.5).
 
+**D-01@1 decision (2026-09-24):** a missing binary is a `run_failed` observation in the active
+trailing window with a non-empty `program` and a normalized, non-empty `signature` containing
+`command not found` and a `sig_hash`. The detector requires the failure in at least `N = 2` distinct
+sessions, groups by program name, and returns the normalized key `command-not-found:<program>`.
+`sessions`, `events`, `first_seen`, and `last_seen` cover all qualifying observations. Query output
+is ordered by distinct sessions descending, latest `last_seen` descending, then key ascending.
+Persisted clusters retain `score = 0.0`; the Phase 3 ranker consumes these counts and timestamps for
+global ranking.
+
 **D-02@1 decision (2026-09-23):** recurrence means a normalized error signature appearing in at least
 `N = 2` distinct sessions inside the active trailing window. The detector considers only `run_failed`
 and `tool_error` observations with a non-empty `signature` and `sig_hash`, groups by

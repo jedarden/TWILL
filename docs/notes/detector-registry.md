@@ -91,6 +91,15 @@ The stamp lives in the state DB, which is derived and disposable: after a
 The durable cross-rebuild record of what a version meant is the registry's own
 history in git plus the versioned ids recorded in measurements.
 
+## D-01@1: missing binary
+
+D-01 emits one cluster for each program with a non-empty normalized `run_failed` signature containing
+`command not found` in at least two distinct sessions inside the trailing window. It requires a
+non-empty `program`, groups by that program name, and returns `command-not-found:<program>` as the
+key. `events`, `first_seen`, and `last_seen` describe every qualifying observation; query output is
+ordered by sessions descending, `last_seen` descending, then key ascending. The registry keeps
+`cluster.score` at zero; Phase 3's ranker owns the global score built from these fields.
+
 ## D-02@1: recurring error signature
 
 D-02 emits one cluster for each normalized error signature seen in at least two distinct sessions
