@@ -27,6 +27,7 @@ from time import perf_counter
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import twill_detectors
+import twill_brief
 import twill_digest
 import twill_explainer
 import twill_lessons
@@ -2213,6 +2214,62 @@ def lessons_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def brief_command(args: argparse.Namespace) -> int:
+    """Render the on-demand read-only pre-flight for a repo or launch dir."""
+
+    config = load_config()
+    top_k = config.top_k if args.top is None else args.top
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise UsageError("--top must be a positive integer")
+    artifacts_root = config.require_artifacts_root()
+    records = twill_lessons.list_lessons(artifacts_root, state="accepted")
+    state_dir = _state_dir(args.state_dir)
+    connection = None
+    if twill_schema.state_db_path(state_dir).is_file():
+        connection = twill_schema.connect_read_only(state_dir)
+    try:
+        report = twill_brief.build_brief(
+            connection,
+            args.target,
+            records,
+            top_k=top_k,
+        )
+    finally:
+        if connection is not None:
+            connection.close()
+
+    emit_success(report.as_dict(), json_mode=args.json, warnings=report.warnings)
+    if args.json:
+        return EXIT_SUCCESS
+    print(f"TWILL brief: {report.target}")
+    if report.matched_by:
+        print(f"matched by: {', '.join(report.matched_by)}")
+    else:
+        print("matched by: no stored observations")
+    print("accepted lessons:")
+    if not report.accepted_lessons:
+        print("- none")
+    for lesson in report.accepted_lessons:
+        scope = ", ".join(lesson.matched_by)
+        print(
+            f"- {lesson.lesson_id} [{lesson.detector}] {lesson.summary} "
+            f"({lesson.matched_sessions} matching session(s), "
+            f"{lesson.matched_events} matching event(s); matched by {scope})"
+        )
+    print("open clusters:")
+    if not report.open_clusters:
+        print("- none")
+    for cluster in report.open_clusters:
+        scope = ", ".join(cluster.matched_by)
+        print(
+            f"- {cluster.detector_id} {cluster.key} "
+            f"({cluster.matched_sessions} matching session(s), "
+            f"{cluster.matched_events} matching event(s); matched by {scope}; "
+            f"last seen {cluster.last_seen})"
+        )
+    return EXIT_SUCCESS
+
+
 def status_command(args: argparse.Namespace) -> int:
     payload = read_status(_state_dir(args.state_dir))
     if args.json:
@@ -2456,6 +2513,16 @@ def build_parser() -> argparse.ArgumentParser:
     lessons.add_argument("--state-dir")
     lessons.add_argument("--json", action="store_true")
     lessons.set_defaults(handler=lessons_command)
+
+    brief = subparsers.add_parser(
+        "brief",
+        help="show accepted lessons and open clusters for a repo or launch directory",
+    )
+    brief.add_argument("target", metavar="REPO_OR_LAUNCH_DIR")
+    brief.add_argument("--top", type=int, default=None, help="maximum items per section")
+    brief.add_argument("--state-dir")
+    brief.add_argument("--json", action="store_true")
+    brief.set_defaults(handler=brief_command)
 
     status = subparsers.add_parser("status", help="show stage status records")
     status.add_argument("--state-dir")
