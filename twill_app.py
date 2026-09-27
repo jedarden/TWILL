@@ -35,6 +35,7 @@ import twill_measure
 import twill_prune
 import twill_perf
 import twill_ranker
+import twill_review
 import twill_rules
 import twill_router
 import twill_schema
@@ -78,6 +79,7 @@ MUTATING_VERBS = frozenset(
         "apply",
         "unapply",
         "un-apply",
+        "dismiss",
         "measure",
         "prune",
     }
@@ -2217,6 +2219,30 @@ def unapply_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def dismiss_command(args: argparse.Namespace) -> int:
+    """Permanently suppress a cluster with an operator-owned explanation."""
+
+    config = load_config()
+    state_dir = _state_dir(args.state_dir)
+    connection = twill_schema.connect(state_dir)
+    try:
+        record = twill_review.dismiss_cluster(
+            connection,
+            args.cluster_id,
+            args.reason,
+            content_fences=config.content_fences,
+        )
+    finally:
+        connection.close()
+
+    emit_success({"cluster": record.as_dict()}, json_mode=args.json)
+    if not args.json:
+        print(f"dismissed {record.cluster_id}")
+        print(f"reason: {record.reason}")
+        print(f"dismissed_at: {record.dismissed_at}")
+    return EXIT_SUCCESS
+
+
 def lessons_command(args: argparse.Namespace) -> int:
     config = load_config()
     records = twill_lessons.list_lessons(
@@ -2553,6 +2579,15 @@ def build_parser() -> argparse.ArgumentParser:
     unapply.add_argument("--state-dir")
     unapply.add_argument("--json", action="store_true")
     unapply.set_defaults(handler=unapply_command)
+
+    dismiss = subparsers.add_parser(
+        "dismiss", help="permanently suppress a cluster with an audit reason"
+    )
+    dismiss.add_argument("cluster_id", metavar="ID")
+    dismiss.add_argument("--reason", required=True)
+    dismiss.add_argument("--state-dir")
+    dismiss.add_argument("--json", action="store_true")
+    dismiss.set_defaults(handler=dismiss_command)
 
     lessons = subparsers.add_parser("lessons", help="list lesson files by state")
     lessons.add_argument(

@@ -444,6 +444,42 @@ def _read_window(
         memory.close()
 
 
+def _dismissed_cluster_ids(connection: sqlite3.Connection) -> frozenset[tuple[str, str]]:
+    """Return the durable suppression set for the digest's detector replay."""
+
+    return frozenset(
+        (str(detector_id), str(key))
+        for detector_id, key in connection.execute(
+            "SELECT detector_id, key FROM cluster WHERE state = 'dismissed'"
+        )
+    )
+
+
+def _suppress_dismissed(
+    results: Sequence[_DetectorWindow],
+    dismissed: frozenset[tuple[str, str]],
+) -> tuple[_DetectorWindow, ...]:
+    """Keep permanently dismissed clusters out of both digest windows."""
+
+    if not dismissed:
+        return tuple(results)
+    filtered: list[_DetectorWindow] = []
+    for result in results:
+        detector_id = result.detector.detector_id
+        clusters = {
+            key: value
+            for key, value in result.clusters.items()
+            if (detector_id, key) not in dismissed
+        }
+        estimates = {
+            key: value
+            for key, value in result.estimated_waste.items()
+            if (detector_id, key) not in dismissed
+        }
+        filtered.append(replace(result, clusters=clusters, estimated_waste=estimates))
+    return tuple(filtered)
+
+
 def _known_token(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
@@ -657,8 +693,13 @@ def build_digest(
                 (prior_start, prior_end),
             ).fetchone()[0]
         )
-        current_results = _read_window(source, detectors, start, end)
-        previous_results = _read_window(source, detectors, prior_start, prior_end)
+        dismissed = _dismissed_cluster_ids(source)
+        current_results = _suppress_dismissed(
+            _read_window(source, detectors, start, end), dismissed
+        )
+        previous_results = _suppress_dismissed(
+            _read_window(source, detectors, prior_start, prior_end), dismissed
+        )
     finally:
         source.close()
 

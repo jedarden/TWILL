@@ -359,6 +359,7 @@ CREATE TABLE cluster(
   first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
   score REAL NOT NULL, covered_by TEXT,        -- rule file path, or NULL
   state TEXT NOT NULL DEFAULT 'open',          -- open|drafted|escalation|dismissed
+  dismiss_reason TEXT, dismissed_at TEXT,
   PRIMARY KEY(detector_id, key));
 
 -- the rule corpus TWILL checks coverage against (read-only inputs, hashed for staleness)

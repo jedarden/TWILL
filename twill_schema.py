@@ -105,6 +105,7 @@ CREATE TABLE IF NOT EXISTS cluster(
   first_seen TEXT NOT NULL, last_seen TEXT NOT NULL,
   score REAL NOT NULL, covered_by TEXT,        -- rule file path, or NULL
   state TEXT NOT NULL DEFAULT 'open',          -- open|drafted|escalation|dismissed
+  dismiss_reason TEXT, dismissed_at TEXT,
   PRIMARY KEY(detector_id, key));
 
 -- the rule corpus TWILL checks coverage against (read-only inputs, hashed for staleness)
@@ -364,6 +365,14 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
             5,
             "detector_weekly_semantics",
             ("ALTER TABLE detector_run ADD COLUMN weekly_sha TEXT",),
+        ),
+        Migration(
+            6,
+            "cluster_dismissal_audit",
+            (
+                "ALTER TABLE cluster ADD COLUMN dismiss_reason TEXT",
+                "ALTER TABLE cluster ADD COLUMN dismissed_at TEXT",
+            ),
         ),
     )
 )

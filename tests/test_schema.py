@@ -80,6 +80,8 @@ COLUMN_CONTRACT = {
         ("score", "REAL", 1, None, 0),
         ("covered_by", "TEXT", 0, None, 0),
         ("state", "TEXT", 1, "'open'", 0),
+        ("dismiss_reason", "TEXT", 0, None, 0),
+        ("dismissed_at", "TEXT", 0, None, 0),
     ],
     "rule_doc": [
         ("path", "TEXT", 0, None, 1),
@@ -353,7 +355,7 @@ class MigrationRunnerTests(unittest.TestCase):
     """Plan §8.4: additive-only, version-stamped, downgrade-tolerant migrations.
 
     The shipped registry carries the additive tables later phases add on top
-    of the v1 baseline (currently version 4); the apply path beyond it is
+    of the v1 baseline (currently version 6); the apply path beyond it is
     exercised by registering the kind of migrations those phases will add.
     """
 
