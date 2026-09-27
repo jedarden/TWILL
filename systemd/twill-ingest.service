@@ -5,6 +5,12 @@ Description=Ingest and detect local TWILL observations
 # A timer will not start another activation while this oneshot is active.
 # Each TWILL verb also holds the shared state lock for defense in depth.
 Type=oneshot
+# The timer is the scoped run used by the ingest budget: keep the process in
+# the user slice with the plan's 2 GiB memory ceiling and one CPU worth of
+# scheduling.  TWILL also samples VmHWM and aborts before reporting success
+# when its tighter 500 MiB ingest budget is missed.
+MemoryMax=2G
+CPUQuota=100%
 # Keep the installed path explicit while letting systemd-analyze verify the
 # unit even on a checkout where the user's symlink has not been installed.
 ExecStart=/usr/bin/env %h/.local/bin/twill ingest

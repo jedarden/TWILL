@@ -91,6 +91,8 @@ class InstallTests(unittest.TestCase):
         self.assertIn("Persistent=true", timer)
         self.assertIn("Unit=twill-ingest.service", timer)
         self.assertIn("Type=oneshot", service)
+        self.assertIn("MemoryMax=2G", service)
+        self.assertIn("CPUQuota=100%", service)
         self.assertLess(
             service.index("ExecStart=/usr/bin/env %h/.local/bin/twill ingest"),
             service.index("ExecStart=/usr/bin/env %h/.local/bin/twill detect"),

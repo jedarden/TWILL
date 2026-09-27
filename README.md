@@ -126,11 +126,17 @@ Use `--settle 0` for a deliberately controlled fixture, `--file PATH` to select 
 implement ranking, coverage, LLM explanation, measurement, or timers; cursor and schema support now
 live in the engine.
 
+Ingest records its wall time, the slowest single-file parse time, and the process peak RSS
+(`VmHWM`) in `status.json`. The hourly run aborts with exit 1 when any strict budget is missed
+(120 seconds, 5 seconds, or 500 MiB respectively); `twill ingest --time` also prints the sample.
+`twill doctor` reports a recorded miss as broken so a failed run cannot look healthy merely because
+an older ingest succeeded.
+
 ## Health checks
 
 `twill doctor` is the read-only Phase 1 health entry point. It checks SQLite integrity and schema
-version, ingest timer freshness, cursor parse or missing-path anomalies, rule-corpus hash drift or
-vanished paths, the detector self-test, and free disk space:
+version, ingest timer freshness, ingest performance budgets, cursor parse or missing-path anomalies,
+rule-corpus hash drift or vanished paths, the detector self-test, and free disk space:
 
 The detector self-test (plan §13.3) replays every registered detector's whole query family —
 cluster, session-hit, week-hit, and weekly SQL — against a small in-memory fixture built from the

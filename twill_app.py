@@ -32,6 +32,7 @@ import twill_explainer
 import twill_lessons
 import twill_measure
 import twill_prune
+import twill_perf
 import twill_ranker
 import twill_rules
 import twill_router
@@ -1072,6 +1073,7 @@ class Store:
         row = twill_cursor.load_cursor(self.connection, stored_path)
         facts = twill_cursor.file_facts(path)
         plan = twill_cursor.plan_ingest(row, path, facts)
+        parse_started = perf_counter()
         scan = twill_cursor.scan_lines(path, plan.start_offset)
 
         if plan.action == twill_cursor.ACTION_RESUME and not scan.lines:
@@ -1100,6 +1102,7 @@ class Store:
                 "action": plan.action,
                 "events": 0,
                 "observations": observations,
+                "parse_seconds": 0.0,
             }
 
         fallback_id = (
@@ -1120,6 +1123,7 @@ class Store:
             "action": plan.action,
             "events": len(session.events),
             "observations": observations,
+            "parse_seconds": perf_counter() - parse_started,
         }
 
     def mark_missing_paths(self) -> int:
@@ -1336,27 +1340,60 @@ def ingest_command(
             )
         processed = []
         for path in files[: args.limit]:
-            processed.append(store.ingest_path(path))
+            item = store.ingest_path(path)
+            processed.append(item)
     finally:
         store.close()
 
     total_events = sum(item["events"] for item in processed)
     total_observations = sum(item["observations"] for item in processed)
+    wall_time_seconds = perf_counter() - started
+    single_file_parse_seconds = max(
+        (float(item["parse_seconds"]) for item in processed),
+        default=0.0,
+    )
+    try:
+        peak_rss_bytes = twill_perf.read_peak_rss_bytes()
+    except twill_perf.PerformanceMeasurementError:
+        peak_rss_bytes = None
+    performance = twill_perf.assess_ingest(
+        wall_time_seconds,
+        single_file_parse_seconds,
+        peak_rss_bytes,
+    )
     result = {
         "sessions": len(processed),
         "events": total_events,
         "observations": total_observations,
+        "performance": performance,
     }
+    counts = {
+        "files": len(processed),
+        "sessions": len(processed),
+        "events": total_events,
+        "observations": total_observations,
+    }
+    if performance["misses"]:
+        record_stage(
+            state_dir,
+            "ingest",
+            wall_time_seconds,
+            counts,
+            succeeded=False,
+            performance=performance,
+        )
+        misses = "; ".join(str(miss) for miss in performance["misses"])
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            f"ingest aborted: performance budget miss: {misses}",
+            "run 'twill doctor --json' to inspect the recorded measurements",
+        )
     record_stage(
         state_dir,
         "ingest",
-        perf_counter() - started,
-        {
-            "files": len(processed),
-            "sessions": len(processed),
-            "events": total_events,
-            "observations": total_observations,
-        },
+        wall_time_seconds,
+        counts,
+        performance=performance,
     )
     if args.json:
         emit_success(result, json_mode=True)
@@ -1369,6 +1406,13 @@ def ingest_command(
         print(
             f"ingested {len(processed)} session(s); "
             f"stored {total_events} event(s); detector emitted {total_observations} observation(s)"
+        )
+    if getattr(args, "time", False) and not args.json:
+        print(
+            "timing: "
+            f"wall={performance['wall_time_seconds']:.6f}s, "
+            f"single_file_parse={performance['single_file_parse_seconds']:.6f}s, "
+            f"peak_rss={performance['peak_rss_bytes']} bytes"
         )
     return EXIT_SUCCESS
 
@@ -2191,6 +2235,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     ingest.add_argument("--state-dir")
     ingest.add_argument("--json", action="store_true")
+    ingest.add_argument(
+        "--time",
+        action="store_true",
+        help="print the ingest wall time, single-file parse time and peak RSS",
+    )
     ingest.set_defaults(handler=ingest_command)
 
     detect = subparsers.add_parser(

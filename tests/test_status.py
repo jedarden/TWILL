@@ -140,6 +140,9 @@ class StatusCliTests(unittest.TestCase):
             self.assertEqual(record["counts"]["events"], 1)
             self.assertGreaterEqual(record["duration"], 0)
             self.assertTrue(record["last_success"])
+            self.assertIn("performance", record)
+            self.assertGreater(record["performance"]["peak_rss_bytes"], 0)
+            self.assertEqual(record["performance"]["misses"], [])
 
     def test_empty_source_is_a_successful_no_work_run(self):
         with tempfile.TemporaryDirectory() as directory:

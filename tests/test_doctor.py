@@ -15,6 +15,7 @@ sys.path.insert(0, str(ROOT))
 
 import twill_detectors  # noqa: E402
 import twill_doctor  # noqa: E402
+import twill_perf  # noqa: E402
 import twill_rulecorpus  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_status import record_stage, status_path  # noqa: E402
@@ -53,6 +54,7 @@ class DoctorChecksTests(unittest.TestCase):
                 "db_integrity",
                 "db_schema",
                 "timer_freshness",
+                "performance_budgets",
                 "cursor_health",
                 "rule_corpus",
                 "dead_man_switch",
@@ -61,6 +63,38 @@ class DoctorChecksTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(check.status == twill_doctor.HEALTHY for check in report.checks))
+
+    def test_ingest_budget_miss_is_broken_and_keeps_the_last_success(self):
+        self.create_database()
+        successful = twill_perf.assess_ingest(1.0, 1.0, 100 * 1024)
+        record_stage(
+            self.state,
+            "ingest",
+            1.0,
+            {"events": 1},
+            performance=successful,
+        )
+        miss = twill_perf.assess_ingest(120.0, 1.0, 100 * 1024)
+        record_stage(
+            self.state,
+            "ingest",
+            120.0,
+            {"events": 1},
+            succeeded=False,
+            performance=miss,
+        )
+
+        report = twill_doctor.run_doctor(
+            self.state,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+        check = self.check(report, "performance_budgets")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn("wall_time_seconds", check.message)
+        self.assertTrue(check.details["misses"])
+        status = json.loads(status_path(self.state).read_text())
+        self.assertIsNotNone(status["data"]["stages"]["ingest"]["last_success"])
+        self.assertIn("last_failure", status["data"]["stages"]["ingest"])
 
     def add_cursor(self, *, now, first_seen=None, mtime_ns=None, session_id="s1"):
         first_seen = first_seen or now

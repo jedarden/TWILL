@@ -42,6 +42,19 @@ COUNT_FIELDS = frozenset(
         "sessions",
     }
 )
+PERFORMANCE_FIELDS = frozenset(
+    {
+        "checked_at",
+        "wall_time_seconds",
+        "single_file_parse_seconds",
+        "peak_rss_bytes",
+        "budgets",
+        "misses",
+    }
+)
+PERFORMANCE_BUDGET_FIELDS = frozenset(
+    {"wall_time_seconds", "single_file_parse_seconds", "peak_rss_bytes"}
+)
 
 
 def status_path(state_dir: Path) -> Path:
@@ -107,10 +120,13 @@ def _validate_status(payload: object, path: Path) -> None:
             _invalid_status(path, "stage names must be non-empty strings")
         if not isinstance(record, dict):
             _invalid_status(path, f"stage {name!r} must be an object")
-        if set(record) != {"stage", "duration", "counts", "last_success"}:
+        allowed_fields = {"stage", "duration", "counts", "last_success", "performance", "last_failure"}
+        if not set(record).issubset(allowed_fields) or not {
+            "stage", "duration", "counts", "last_success"
+        }.issubset(record):
             _invalid_status(
                 path,
-                f"stage {name!r} must contain stage, duration, counts and last_success",
+                f"stage {name!r} has an invalid field set",
             )
         if record["stage"] != name:
             _invalid_status(path, f"stage {name!r} does not match its record")
@@ -129,6 +145,67 @@ def _validate_status(payload: object, path: Path) -> None:
         if not isinstance(counts, dict):
             _invalid_status(path, f"stage {name!r} counts must be an object")
         _validate_counts(counts, path, name)
+        if "performance" in record:
+            _validate_performance(record["performance"], path, f"stage {name!r}")
+        if "last_failure" in record:
+            _validate_failure(record["last_failure"], path, f"stage {name!r}")
+
+
+def _validate_performance(value: object, path: Path, context: str) -> None:
+    if not isinstance(value, dict) or set(value) != PERFORMANCE_FIELDS:
+        _invalid_status(path, f"{context} performance has an invalid field set")
+    if not _is_timestamp(value["checked_at"]):
+        _invalid_status(path, f"{context} performance checked_at must be a timestamp")
+    for name in ("wall_time_seconds", "single_file_parse_seconds"):
+        metric = value[name]
+        if (
+            isinstance(metric, bool)
+            or not isinstance(metric, (int, float))
+            or not math.isfinite(metric)
+            or metric < 0
+        ):
+            _invalid_status(path, f"{context} performance {name} must be non-negative numeric")
+    rss = value["peak_rss_bytes"]
+    if rss is not None and (
+        isinstance(rss, bool) or not isinstance(rss, int) or rss < 0
+    ):
+        _invalid_status(path, f"{context} performance peak_rss_bytes must be a non-negative integer or null")
+    budgets = value["budgets"]
+    if not isinstance(budgets, dict) or set(budgets) != PERFORMANCE_BUDGET_FIELDS:
+        _invalid_status(path, f"{context} performance budgets have an invalid field set")
+    for name, budget in budgets.items():
+        if (
+            isinstance(budget, bool)
+            or not isinstance(budget, (int, float))
+            or not math.isfinite(budget)
+            or budget <= 0
+        ):
+            _invalid_status(path, f"{context} performance budget {name} must be positive numeric")
+    misses = value["misses"]
+    if not isinstance(misses, list) or not all(isinstance(miss, str) for miss in misses):
+        _invalid_status(path, f"{context} performance misses must be a list of strings")
+
+
+def _validate_failure(value: object, path: Path, context: str) -> None:
+    if not isinstance(value, dict) or set(value) != {
+        "attempted_at", "duration", "counts", "performance"
+    }:
+        _invalid_status(path, f"{context} last_failure has an invalid field set")
+    if not _is_timestamp(value["attempted_at"]):
+        _invalid_status(path, f"{context} last_failure attempted_at must be a timestamp")
+    duration = value["duration"]
+    if (
+        isinstance(duration, bool)
+        or not isinstance(duration, (int, float))
+        or not math.isfinite(duration)
+        or duration < 0
+    ):
+        _invalid_status(path, f"{context} last_failure duration must be non-negative numeric")
+    counts = value["counts"]
+    if not isinstance(counts, dict):
+        _invalid_status(path, f"{context} last_failure counts must be an object")
+    _validate_counts(counts, path, f"{context} last_failure")
+    _validate_performance(value["performance"], path, f"{context} last_failure")
 
 
 def _validate_counts(
@@ -170,6 +247,35 @@ def _normalise_counts(counts: Mapping[str, object]) -> dict[str, int | float]:
     return dict(sorted(normalised.items()))
 
 
+def _normalise_performance(performance: Mapping[str, object]) -> dict[str, object]:
+    if not isinstance(performance, Mapping):
+        raise ValueError("status performance must be an object")
+    if set(performance) != PERFORMANCE_FIELDS:
+        raise ValueError("status performance has an invalid field set")
+    checked_at = performance["checked_at"]
+    if not _is_timestamp(checked_at):
+        raise ValueError("status performance checked_at must be a timestamp")
+    normalised = {
+        "checked_at": checked_at,
+        "wall_time_seconds": float(performance["wall_time_seconds"]),
+        "single_file_parse_seconds": float(performance["single_file_parse_seconds"]),
+        "peak_rss_bytes": performance["peak_rss_bytes"],
+        "budgets": dict(sorted(performance["budgets"].items()))
+        if isinstance(performance["budgets"], Mapping)
+        else performance["budgets"],
+        "misses": list(performance["misses"])
+        if isinstance(performance["misses"], list)
+        else performance["misses"],
+    }
+    # Reuse the same strict rules used for data loaded from disk.  A temporary
+    # path is not needed: these checks raise ValueError before any write.
+    try:
+        _validate_performance(normalised, Path("status.json"), "status")
+    except CliError as exc:
+        raise ValueError(exc.message) from exc
+    return normalised
+
+
 def _write_status(state_dir: Path, payload: Mapping[str, object]) -> None:
     directory = twill_schema.prepare_state_dir(state_dir)
     descriptor, temporary_name = tempfile.mkstemp(
@@ -204,6 +310,7 @@ def record_stage(
     counts: Mapping[str, object],
     *,
     succeeded: bool = True,
+    performance: Mapping[str, object] | None = None,
 ) -> dict[str, object]:
     if not isinstance(stage, str) or not stage:
         raise ValueError("status stage must be a non-empty string")
@@ -215,30 +322,51 @@ def record_stage(
     ):
         raise ValueError("status duration must be a non-negative number")
     normalised_counts = _normalise_counts(counts)
+    normalised_performance = (
+        _normalise_performance(performance) if performance is not None else None
+    )
     payload, _ = _load_status(state_dir)
     stages = payload["data"]["stages"]
     now = generated_at()
     if not succeeded:
         if stage in stages:
-            return dict(stages[stage])
-        stages[stage] = {
+            if normalised_performance is None:
+                return dict(stages[stage])
+            failed = dict(stages[stage])
+            failed["last_failure"] = {
+                "attempted_at": now,
+                "duration": round(float(duration), 6),
+                "counts": normalised_counts,
+                "performance": normalised_performance,
+            }
+            stages[stage] = failed
+            payload["generated_at"] = now
+            _write_status(state_dir, payload)
+            return dict(failed)
+        failed = {
             "stage": stage,
             "duration": round(float(duration), 6),
             "counts": normalised_counts,
             "last_success": None,
         }
+        if normalised_performance is not None:
+            failed["performance"] = normalised_performance
+        stages[stage] = failed
         payload["generated_at"] = now
         _write_status(state_dir, payload)
-        return dict(stages[stage])
-    stages[stage] = {
+        return dict(failed)
+    succeeded_record: dict[str, object] = {
         "stage": stage,
         "duration": round(float(duration), 6),
         "counts": normalised_counts,
         "last_success": now,
     }
+    if normalised_performance is not None:
+        succeeded_record["performance"] = normalised_performance
+    stages[stage] = succeeded_record
     payload["generated_at"] = now
     _write_status(state_dir, payload)
-    return dict(stages[stage])
+    return dict(succeeded_record)
 
 
 def read_status(state_dir: Path) -> dict[str, object]:

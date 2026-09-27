@@ -1150,6 +1150,62 @@ def _check_disk_space(
     )
 
 
+def _check_ingest_performance(state_dir: Path) -> CheckResult:
+    """Report the latest ingest budget result without changing state."""
+
+    try:
+        payload = read_status(state_dir)
+    except Exception as exc:
+        return _result(
+            "performance_budgets",
+            BROKEN,
+            f"performance status cannot be read: {_exception_text(exc)}",
+            {"error": _exception_text(exc)},
+        )
+
+    stages = payload.get("data", {}).get("stages", {})
+    ingest = stages.get("ingest") if isinstance(stages, Mapping) else None
+    if not isinstance(ingest, Mapping):
+        return _result(
+            "performance_budgets",
+            HEALTHY,
+            "no ingest performance run has been recorded",
+            {"measured": False},
+        )
+
+    # A failed attempt is kept beside the last successful stage so the
+    # operator can still see when ingest last succeeded.  It takes priority
+    # over that older successful measurement for health purposes.
+    performance = ingest.get("last_failure", {}).get("performance")
+    if not isinstance(performance, Mapping):
+        performance = ingest.get("performance")
+    if not isinstance(performance, Mapping):
+        return _result(
+            "performance_budgets",
+            HEALTHY,
+            "ingest has no performance measurement",
+            {"measured": False},
+        )
+
+    details = dict(performance)
+    details["measured"] = True
+    misses = performance.get("misses")
+    if isinstance(misses, list) and misses:
+        return _result(
+            "performance_budgets",
+            BROKEN,
+            "ingest aborted after a performance budget miss: "
+            + "; ".join(str(miss) for miss in misses),
+            details,
+        )
+    return _result(
+        "performance_budgets",
+        HEALTHY,
+        "ingest performance budgets passed",
+        details,
+    )
+
+
 def check_ingest_disk_space(
     state_dir: Path,
     disk_usage: Callable[[Path], Any] | None = None,
@@ -1228,8 +1284,19 @@ def run_doctor(
             connection.close()
 
     timer = _check_timer_freshness(state_dir, reference, effective_intervals)
+    performance = _check_ingest_performance(state_dir)
     self_test = _check_detector_self_test(effective_registry, reference)
     disk = _check_disk_space(state_dir, disk_usage)
     return DoctorReport(
-        (integrity, schema, timer, cursor, rule_corpus, dead_man, self_test, disk)
+        (
+            integrity,
+            schema,
+            timer,
+            performance,
+            cursor,
+            rule_corpus,
+            dead_man,
+            self_test,
+            disk,
+        )
     )
