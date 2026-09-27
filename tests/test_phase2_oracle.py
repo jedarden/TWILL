@@ -33,6 +33,7 @@ PROBE_COUNTS = {
 PROBE_TIMESTAMP = "2026-09-19T12:00:00Z"
 DETECT_NOW = "2026-09-27T00:00:00+00:00"
 PROBE_WEEK = (2026, 38)
+UNGATED_FIXTURE = ROOT / "tests" / "fixtures" / "detectors" / "phase2_ungated.json"
 
 
 def _claude_record(session_id, timestamp, content, *, record_type):
@@ -163,6 +164,94 @@ class Phase2RegressionOracleTests(unittest.TestCase):
                     abs(actual - expected), expected * 0.05,
                     f"digest count drifted for {program}: {actual} vs {expected}",
                 )
+
+    def test_ungated_detector_fixture_has_known_counts(self):
+        fixture = json.loads(UNGATED_FIXTURE.read_text())
+        expected = fixture["expected"]
+        registry = (
+            twill_detectors.RETRY_LOOP,
+            twill_detectors.REJECTED_TOOL_CALL,
+            twill_detectors.INTERRUPT_CORRECTION,
+            twill_detectors.REDISCOVERY,
+            twill_detectors.STALE_RULE,
+            twill_detectors.UNREAD_RULE_DOC,
+        )
+
+        with tempfile.TemporaryDirectory() as directory:
+            connection = twill_schema.connect(Path(directory) / "state")
+            try:
+                connection.executemany(
+                    "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
+                    "program, command, signature, sig_hash, tool, path, excerpt, host) "
+                    "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                    [
+                        (
+                            row["session_id"],
+                            row["ts_utc"],
+                            row["ts_utc"],
+                            row["kind"],
+                            row.get("program"),
+                            row.get("command"),
+                            row.get("signature"),
+                            row.get("sig_hash"),
+                            row.get("tool"),
+                            row.get("path"),
+                            row.get("excerpt"),
+                            row.get("host", "codinghome"),
+                        )
+                        for row in fixture["observations"]
+                    ],
+                )
+                for row in fixture["rule_docs"]:
+                    connection.execute(
+                        "INSERT INTO rule_doc(path, layer, sha, indexed_at, "
+                        "last_read_by_agent, stale) VALUES (?, 'memory', ?, ?, ?, 0)",
+                        (
+                            row["path"],
+                            row["sha"],
+                            row["indexed_at"],
+                            row.get("last_read_by_agent"),
+                        ),
+                    )
+                    connection.execute(
+                        "INSERT INTO rule_fts(text, path) VALUES (?, ?)",
+                        (row["text"], row["path"]),
+                    )
+                connection.commit()
+
+                report = twill_detectors.run_detectors(
+                    connection,
+                    window_days=fixture["window_days"],
+                    registry=registry,
+                    now=fixture["now"],
+                )
+                self.assertEqual(report.exit_code, 0)
+                self.assertEqual(
+                    [outcome.detector_id for outcome in report.outcomes],
+                    list(expected),
+                )
+
+                for detector_id, detector_expected in expected.items():
+                    with self.subTest(detector_id=detector_id):
+                        outcome = next(
+                            outcome
+                            for outcome in report.outcomes
+                            if outcome.detector_id == detector_id
+                        )
+                        self.assertEqual(outcome.status, "ok")
+                        self.assertEqual(outcome.clusters, detector_expected["clusters"])
+                        rows = connection.execute(
+                            "SELECT key, sessions, events FROM cluster "
+                            "WHERE detector_id = ? ORDER BY key",
+                            (detector_id,),
+                        ).fetchall()
+                        actual = {
+                            key: {"sessions": sessions, "events": events}
+                            for key, sessions, events in rows
+                        }
+                        self.assertEqual(actual, detector_expected["rows"])
+            finally:
+                connection.close()
 
 
 if __name__ == "__main__":
