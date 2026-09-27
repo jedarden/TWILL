@@ -360,6 +360,11 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
             "detector_backtest_semantics",
             ("ALTER TABLE detector_run ADD COLUMN backtest_sha TEXT",),
         ),
+        Migration(
+            5,
+            "detector_weekly_semantics",
+            ("ALTER TABLE detector_run ADD COLUMN weekly_sha TEXT",),
+        ),
     )
 )
 

@@ -394,6 +394,7 @@ class MigrationRunnerTests(unittest.TestCase):
         ]
         self.assertIn("attribution_sha", detector_columns)
         self.assertIn("backtest_sha", detector_columns)
+        self.assertIn("weekly_sha", detector_columns)
         newest = str(versions[-1])
         self.assertEqual(self.stamped_version(connection), newest)
         # Reopening neither duplicates nor bumps the stamp.
