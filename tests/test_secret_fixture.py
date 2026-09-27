@@ -291,6 +291,12 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
 
         cls.run_cli("detect", "--state-dir", str(cls.state_dir))
         cls.run_cli("digest", "--stdout", "--state-dir", str(cls.state_dir))
+        cls.explain_prompt = cls.run_cli(
+            "explain",
+            "--dry-run",
+            "--state-dir",
+            str(cls.state_dir),
+        ).stdout
 
         # Snapshot the persisted state before anything else can touch it:
         # every byte of every state file (the plan's grep across twill.db,
@@ -426,6 +432,14 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
                 if forbidden in value:
                     offenders.append(f"{table}.{column}: {value[:80]!r}")
         self.assertEqual(offenders, [], "fixture credentials leaked into the state DB")
+
+    def test_no_fixture_credential_appears_in_the_explain_prompt(self):
+        offenders = [
+            value
+            for value in self.forbidden_values()
+            if value in self.explain_prompt
+        ]
+        self.assertEqual(offenders, [], "fixture credentials leaked into the Explain prompt")
 
     def test_every_credential_kind_lands_as_a_redaction_marker(self):
         # Positive control for the absence assertions: the pipeline actually

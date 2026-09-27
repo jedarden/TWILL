@@ -28,6 +28,7 @@ from typing import Iterator, Mapping, Sequence
 
 import twill_detectors
 import twill_digest
+import twill_explainer
 import twill_lessons
 import twill_measure
 import twill_prune
@@ -63,7 +64,7 @@ MAX_EXCERPT_LENGTH = 240
 SIGNATURE_INPUT_LIMIT = 400
 SIGNATURE_HASH_LENGTH = 12
 MUTATING_VERBS = frozenset(
-    {"ingest", "detect", "rank", "accept", "apply", "measure", "prune"}
+    {"ingest", "detect", "rank", "explain", "accept", "apply", "measure", "prune"}
 )
 
 # Plan §6.1/§8.2: the parse_shape bucket a parsed record lands in when its
@@ -1683,6 +1684,77 @@ def rank_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def explain_command(args: argparse.Namespace) -> int:
+    """Build the bounded Explain prompt, optionally sending it to Claude."""
+
+    config = load_config()
+    top_k = config.top_k if getattr(args, "top", None) is None else args.top
+    if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k < 1:
+        raise UsageError("--top must be a positive integer")
+    state_dir = _state_dir(args.state_dir)
+    connection = (
+        twill_schema.connect_read_only(state_dir)
+        if args.dry_run
+        else twill_schema.connect(state_dir)
+    )
+    try:
+        candidates = twill_explainer.load_candidate_prompt_clusters(
+            connection,
+            top_k=top_k,
+        )
+        prompt = twill_explainer.build_prompt(
+            candidates,
+            content_fences=config.content_fences,
+            top_k=top_k,
+        )
+        if args.dry_run:
+            if args.json:
+                emit_success(
+                    {
+                        "clusters": len(candidates),
+                        "prompt": prompt,
+                        "prompt_bytes": len(prompt.encode("utf-8")),
+                    },
+                    json_mode=True,
+                )
+            else:
+                # The dry-run stream is the prompt itself: no status prefix,
+                # timestamp, or other changing bytes may enter the golden.
+                sys.stdout.write(prompt)
+            return EXIT_SUCCESS
+
+        model = args.model or config.model
+        output = twill_explainer.invoke_claude(prompt, model=model)
+        expected_cluster_ids = tuple(
+            f"{candidate.cluster.detector_id}:{candidate.cluster.key}"
+            for candidate in candidates
+        )
+        drafts = twill_explainer.validate_explain_output(
+            output,
+            expected_cluster_ids=expected_cluster_ids,
+        )
+        paths = twill_explainer.write_lesson_files(
+            drafts,
+            candidates,
+            config,
+            connection=connection,
+        )
+    finally:
+        connection.close()
+
+    data = {
+        "clusters": len(candidates),
+        "drafts": len(drafts),
+        "lessons": [str(path) for path in paths],
+    }
+    emit_success(data, json_mode=args.json)
+    if not args.json:
+        print(f"drafted {len(paths)} lesson(s)")
+        for path in paths:
+            print(f"- {redact_text(path)}")
+    return EXIT_SUCCESS
+
+
 def rules_command(args: argparse.Namespace) -> int:
     """Render the read-only inverse view of rule coverage and decay."""
 
@@ -2045,6 +2117,20 @@ def build_parser() -> argparse.ArgumentParser:
     rank.add_argument("--json", action="store_true")
     rank.set_defaults(handler=rank_command)
 
+    explain = subparsers.add_parser(
+        "explain", help="draft lessons from ranked recurring friction"
+    )
+    explain.add_argument("--top", type=int, default=None, help="maximum clusters to explain")
+    explain.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="print the bounded prompt without spawning Claude or writing lessons",
+    )
+    explain.add_argument("--model", help="Claude model for the Explain pass")
+    explain.add_argument("--state-dir")
+    explain.add_argument("--json", action="store_true")
+    explain.set_defaults(handler=explain_command)
+
     rules = subparsers.add_parser(
         "rules", help="show per-rule earnings, recurrence trends, and decay"
     )
@@ -2167,7 +2253,10 @@ def main(argv: Sequence[str] | None = None) -> int:
         # otherwise read-only doctor verb takes the state lock for it like
         # any mutating verb — a timer firing mid-recovery queues behind it.
         rebuilds_state = args.command == "doctor" and args.rebuild
-        if args.command in MUTATING_VERBS or writes_artifact or rebuilds_state:
+        needs_lock = args.command in MUTATING_VERBS and not (
+            args.command == "explain" and args.dry_run
+        )
+        if needs_lock or writes_artifact or rebuilds_state:
             with StateLock(_state_dir(args.state_dir)):
                 return int(args.handler(args))
         return int(args.handler(args))

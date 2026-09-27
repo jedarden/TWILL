@@ -1422,6 +1422,19 @@ def load_candidate_clusters(
     return _load_candidate_clusters(connection, _limit(top_k, 10, 1_000_000, "top_k"))
 
 
+def load_candidate_prompt_clusters(
+    connection: sqlite3.Connection,
+    top_k: int = 10,
+) -> tuple[PromptCluster, ...]:
+    """Load candidate clusters with their bounded database evidence."""
+
+    candidates = load_candidate_clusters(connection, top_k)
+    return tuple(
+        PromptCluster(candidate, _load_evidence(connection, candidate))
+        for candidate in candidates
+    )
+
+
 __all__ = [
     "CLUSTER_BEGIN",
     "ClaudeInvocationError",
@@ -1453,6 +1466,7 @@ __all__ = [
     "build_prompt_from_db",
     "invoke_claude",
     "load_candidate_clusters",
+    "load_candidate_prompt_clusters",
     "persist_lesson_drafts",
     "validate_explain_output",
     "write_lesson_files",

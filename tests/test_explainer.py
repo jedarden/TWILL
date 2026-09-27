@@ -1,6 +1,7 @@
 """Tests for Explain prompt construction and Claude invocation."""
 
 import hashlib
+import io
 import json
 import os
 import subprocess
@@ -15,6 +16,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import twill_detectors  # noqa: E402
+import twill_app  # noqa: E402
 import twill_explainer  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_config import ConfigError, TwillConfig  # noqa: E402
@@ -161,6 +163,65 @@ class ExplainerTestCase(unittest.TestCase):
         )
         self.assertIn("Include exactly one item for every input cluster", prompt)
         self.assertIn("do not emit any other keys", prompt)
+
+    def test_golden_prompt_bytes_are_stable_for_fixed_input(self):
+        candidate = twill_explainer.PromptCluster(
+            self.cluster(),
+            (
+                self.excerpt(11),
+                self.excerpt(12, "sqlite3: command not found"),
+            ),
+        )
+
+        prompt = twill_explainer.build_prompt((candidate,))
+
+        self.assertEqual(
+            hashlib.sha256(prompt.encode("utf-8")).hexdigest(),
+            "a45098df93d5d40c866ed8d9d4de06fb8412cec5de9373efac9d5e4f815206d8",
+        )
+        self.assertEqual(
+            prompt.encode("utf-8"),
+            twill_explainer.build_prompt((candidate,)).encode("utf-8"),
+        )
+
+    def test_cli_dry_run_prints_prompt_without_invoking_claude(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        self.seed_cluster_row(connection)
+        self.seed_observation(
+            connection,
+            "session-11",
+            datetime(2026, 9, 10, tzinfo=timezone.utc),
+        )
+        connection.commit()
+        connection.close()
+        args = type(
+            "ExplainArgs",
+            (),
+            {
+                "dry_run": True,
+                "json": False,
+                "model": None,
+                "state_dir": str(state_dir),
+                "top": None,
+            },
+        )()
+
+        with mock.patch.object(
+            twill_app, "load_config", return_value=self.config()
+        ), mock.patch.object(
+            twill_explainer,
+            "invoke_claude",
+            side_effect=AssertionError("dry-run spawned Claude"),
+        ), mock.patch("sys.stdout", new_callable=io.StringIO) as stdout:
+            exit_code = twill_app.explain_command(args)
+
+        self.assertEqual(exit_code, 0)
+        self.assertIn(twill_explainer.CLUSTER_DATA_BEGIN, stdout.getvalue())
+        self.assertIn(
+            '"cluster_id":"D-01:command-not-found:sqlite3"',
+            stdout.getvalue(),
+        )
 
     def test_validates_complete_lesson_output_against_expected_clusters(self):
         cluster_id = "D-01:command-not-found:sqlite3"
