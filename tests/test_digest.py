@@ -18,6 +18,7 @@ sys.path.insert(0, str(ROOT))
 twill_digest = importlib.import_module("twill_digest")
 twill_schema = importlib.import_module("twill_schema")
 twill_detectors = importlib.import_module("twill_detectors")
+twill_contract = importlib.import_module("twill_contract")
 MISSING_BINARY = twill_detectors.MISSING_BINARY
 SUBJECT = (2026, 38)
 SUBJECT_LABEL = "2026-W38"
@@ -692,6 +693,50 @@ class DigestCliTests(DigestStateCase):
         self.assertIn("<redacted:github-token>", result.stdout)
         self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
         self.assertIn(f" | $ twill digest --week {SUBJECT_LABEL} --stdout", artifact.read_text())
+
+
+class DigestWriteInvariantTests(DigestStateCase):
+    """The write boundary enforces the committed-digest line invariants (§3, §8.3)."""
+
+    def setUp(self):
+        super().setUp()
+        self.artifacts = self.root / "artifacts"
+        self.digests = self.artifacts / "digests"
+
+    def test_write_commits_rendered_report_text(self):
+        seed_failure(self.connection, "sqlite3", 2, IN_WEEK)
+        text = twill_digest.render_text(self.build())
+
+        path = twill_digest.write_digest_file(text, self.artifacts, SUBJECT)
+
+        self.assertEqual(path, self.digests / f"{SUBJECT_LABEL}.txt")
+        self.assertEqual(path.read_text(encoding="utf-8"), text)
+
+    def test_write_refuses_an_unbounded_line_before_creating_anything(self):
+        overlong = "x" * (twill_digest.MAX_LINE_LENGTH + 1)
+
+        with self.assertRaises(twill_contract.ValidationError) as raised:
+            twill_digest.write_digest_file(
+                f"{overlong} | $ twill digest --week {SUBJECT_LABEL} --stdout\n",
+                self.artifacts,
+                SUBJECT,
+            )
+
+        self.assertIn("exceeds", str(raised.exception))
+        self.assertFalse(self.digests.exists())
+
+    def test_write_refuses_unredacted_credential_content_before_creating_anything(self):
+        token = "ghp_" + "1234567890abcdefghijklmnop"
+
+        with self.assertRaises(twill_contract.ValidationError) as raised:
+            twill_digest.write_digest_file(
+                f"new: leaked {token} in a line | $ twill digest --stdout\n",
+                self.artifacts,
+                SUBJECT,
+            )
+
+        self.assertIn("redacted content", str(raised.exception))
+        self.assertFalse(self.digests.exists())
 
 
 if __name__ == "__main__":

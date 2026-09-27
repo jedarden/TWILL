@@ -18,6 +18,7 @@ import twill_detectors
 import twill_lessons
 import twill_measure
 import twill_trend
+from twill_contract import ValidationError
 from twill_detectors import (
     MAX_ERROR_LENGTH,
     STATUS_ERROR,
@@ -1169,7 +1170,33 @@ def render_text(report: DigestReport) -> str:
     return "\n".join(lines) + "\n"
 
 
+def _validate_digest_text(text: str) -> None:
+    """Refuse digest text whose lines break the committed-artifact invariants.
+
+    Plan §3 and §8.3: every digest line reaching the committed artifact is
+    post-redaction and at most 240 characters.  ``render_text`` guarantees
+    this by construction; this check makes the write boundary itself fail
+    closed, so a caller that bypasses the renderer cannot commit an
+    unbounded or unredacted line.
+    """
+
+    for number, line in enumerate(text.splitlines(), start=1):
+        if len(line) > MAX_LINE_LENGTH:
+            raise ValidationError(
+                f"digest line {number} exceeds {MAX_LINE_LENGTH} characters",
+                "render the report with render_text, which bounds every line, "
+                "before committing it",
+            )
+        if redact_text(line) != line:
+            raise ValidationError(
+                f"digest line {number} contains redacted content",
+                "render the report with render_text, which redacts every line, "
+                "before committing it",
+            )
+
+
 def write_digest_file(text: str, artifacts_root: Path, week: Week) -> Path:
+    _validate_digest_text(text)
     directory = Path(artifacts_root).expanduser().resolve() / "digests"
     if directory.is_symlink():
         raise ValueError("digest directory may not be a symbolic link")
