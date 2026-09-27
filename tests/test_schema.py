@@ -758,6 +758,47 @@ class StoreIntegrationTests(unittest.TestCase):
         ).fetchone()[0]
         self.assertEqual(count, 2)
 
+    def test_observations_are_capped_per_session_but_events_are_retained(self):
+        store = twill_app.Store(self.root / "state")
+        self.addCleanup(store.close)
+        event_count = twill_app.MAX_OBSERVATIONS_PER_SESSION + 7
+        session = twill_app.SessionData(
+            self.root / "pathological.jsonl",
+            "pathological-session",
+            "jsonl",
+            tuple(
+                twill_app.TranscriptEvent(
+                    session_id="pathological-session",
+                    timestamp=f"2026-09-20T12:00:{index % 60:02d}Z",
+                    kind="message",
+                    text=f"event {index}",
+                    source_line=index + 1,
+                    event_index=0,
+                )
+                for index in range(event_count)
+            ),
+        )
+
+        events, observations = store.ingest(session)
+
+        self.assertEqual(events, event_count)
+        self.assertEqual(observations, twill_app.MAX_OBSERVATIONS_PER_SESSION)
+        stored_events = store.connection.execute(
+            "SELECT count(*) FROM transcript_event"
+        ).fetchone()[0]
+        self.assertEqual(stored_events, event_count)
+        excerpts = [
+            row[0]
+            for row in store.connection.execute(
+                "SELECT excerpt FROM observation ORDER BY obs_id"
+            )
+        ]
+        self.assertEqual(len(excerpts), twill_app.MAX_OBSERVATIONS_PER_SESSION)
+        self.assertEqual(excerpts[0], "event 0")
+        self.assertEqual(
+            excerpts[-1], f"event {twill_app.MAX_OBSERVATIONS_PER_SESSION - 1}"
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

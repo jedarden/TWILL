@@ -490,6 +490,11 @@ installs it.
   session may contribute. A 500 MB transcript or a runaway retry loop otherwise outvotes a genuine
   cross-session pattern purely on volume, and ranking is a count of *sessions* for exactly that reason.
 
+**EC-16 implementation decision (2026-09-27):** the Phase 1 store keeps at most 1,000 observations
+per session after retention filtering, selecting the earliest observations in transcript order. The
+cap is applied before rows are fetched and transcript events remain available for re-ingest and
+diagnostics; keeping chronological order preserves adjacency semantics for paired detectors.
+
 ### 8.2 Failure Modes & Recovery
 
 | Failure | Detection | Recovery | Data Safety |

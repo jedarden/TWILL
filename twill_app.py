@@ -62,6 +62,7 @@ from twill_status import read_status, record_stage
 
 
 MAX_EXCERPT_LENGTH = 240
+MAX_OBSERVATIONS_PER_SESSION = 1000
 SIGNATURE_INPUT_LIMIT = 400
 SIGNATURE_HASH_LENGTH = 12
 MUTATING_VERBS = frozenset(
@@ -1141,7 +1142,14 @@ class Store:
         session_id: str,
         retention_seconds: float | None = None,
     ) -> int:
-        """D-00@1: a minimal detector proving stored events become observations."""
+        """D-00@1: turn bounded session events into observations.
+
+        The cap is deliberately applied after the retention filter and before
+        fetching rows.  A pathological transcript therefore cannot dominate
+        detector event counts, while the selection remains reproducible across
+        re-ingest and preserves the chronological observation order that
+        adjacency-based detectors rely on.
+        """
 
         # The v1 observation table carries no detector_id (cluster and
         # measurement attribute detectors); D-00@1 events are recognisable by
@@ -1157,6 +1165,8 @@ class Store:
             )
             query += " AND julianday(ts_utc) >= julianday(?)"
             parameters.append(cutoff.isoformat())
+        query += " ORDER BY source_line, event_index LIMIT ?"
+        parameters.append(MAX_OBSERVATIONS_PER_SESSION)
         rows = conn.execute(query, parameters).fetchall()
         for ts_utc, ts_local, text, stored_signature, cwd in rows:
             normalized = (
