@@ -381,6 +381,67 @@ class DigestDiffTests(DigestStateCase):
         self.assertEqual(d09.previous_clusters, 1)
         self.assertEqual(report.findings, ())
 
+    def test_digest_contains_a_read_only_escalation_proposal(self):
+        artifacts = self.root / "artifacts"
+        lessons = artifacts / "lessons"
+        measurements = artifacts / "measurements"
+        lessons.mkdir(parents=True)
+        measurements.mkdir()
+        lesson = lessons / "L-00000001.md"
+        lesson.write_text(
+            "\n".join(
+                [
+                    "---",
+                    "id: L-00000001",
+                    'summary: "A command fails repeatedly. Install it before retrying."',
+                    "state: applied:hook",
+                    "detector: D-01",
+                    'key: "command-not-found:sqlite3"',
+                    'evidence: {sessions: 4, events: 4, first_seen: 2026-08-01, session_ids: ["s1", "s2"]}',
+                    'routing: {recommended: hook, reason: "Use a hook to stop the recurring failure.", applied: hook, applied_at: 2026-08-20T00:00:00Z, bead: twill-test}',
+                    "backtest: {window_days: 180, sessions: 4, first_seen: 2026-08-01, weeks_present: 2}",
+                    "guard: {layer: null, artifact: null, installed: false}",
+                    "---",
+                    "",
+                ]
+            ),
+            encoding="utf-8",
+        )
+        measurement_path = measurements / "L-00000001.jsonl"
+        measurement_path.write_text(
+            json.dumps(
+                {
+                    "lesson_id": "L-00000001",
+                    "detector_id": "D-01@1",
+                    "measured_at": "2026-09-10T00:00:00Z",
+                    "window_days": 7,
+                    "sessions": 4,
+                    "events": 4,
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+        lesson_before = lesson.read_bytes()
+        measurement_before = measurement_path.read_bytes()
+
+        report = twill_digest.build_digest(
+            self.state,
+            SUBJECT,
+            registry=(),
+            artifacts_root=artifacts,
+        )
+
+        self.assertFalse(report.clean)
+        self.assertEqual(len(report.escalations), 1)
+        proposal = report.escalations[0]
+        self.assertEqual(proposal.next_layer, "environment")
+        data = twill_digest.render_data(report)
+        self.assertEqual(data["escalations"][0]["lesson_id"], "L-00000001")
+        self.assertIn("escalation proposals: 1", twill_digest.render_text(report))
+        self.assertEqual(lesson.read_bytes(), lesson_before)
+        self.assertEqual(measurement_path.read_bytes(), measurement_before)
+
     def test_detector_failure_is_visible_and_not_clean(self):
         detector = twill_digest.Detector(
             "D-99",

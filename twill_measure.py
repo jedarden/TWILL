@@ -27,6 +27,7 @@ MEASUREMENT_DIRNAME = "measurements"
 MEASUREMENT_DIR_MODE = 0o700
 MEASUREMENT_FILE_MODE = 0o600
 DEFAULT_MEASUREMENT_WINDOW_DAYS = 7
+ESCALATION_AFTER_DAYS = 21
 MEASURABLE_STATES = frozenset(
     {"accepted"} | {f"applied:{layer}" for layer in twill_lessons.ROUTING_LAYERS}
 )
@@ -66,6 +67,66 @@ class Measurement:
             "window_days": self.window_days,
             "sessions": self.sessions,
             "events": self.events,
+        }
+
+
+@dataclass(frozen=True)
+class EscalationProposal:
+    """A measurement-backed routing proposal for the weekly digest.
+
+    This is deliberately not a lesson lifecycle transition.  The operator
+    must decide whether to apply the stronger layer, so the proposal only
+    describes the evidence and the next layer that measurement justifies.
+    """
+
+    lesson_id: str
+    detector_id: str
+    key: str
+    current_layer: str
+    next_layer: str
+    applied_at: str
+    baseline_measured_at: str | None
+    baseline_sessions: int
+    baseline_events: int
+    measured_at: str
+    sessions: int
+    events: int
+
+    @property
+    def applied_layer(self) -> str:
+        """Compatibility name for callers that describe the source layer."""
+
+        return self.current_layer
+
+    @property
+    def proposed_layer(self) -> str:
+        """Compatibility name for callers that describe the target layer."""
+
+        return self.next_layer
+
+    @property
+    def days_after_applied(self) -> int:
+        elapsed = _timestamp(self.measured_at) - _timestamp(self.applied_at)
+        return max(0, elapsed.days)
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "lesson_id": self.lesson_id,
+            "detector": self.detector_id,
+            "detector_id": self.detector_id,
+            "key": self.key,
+            "current_layer": self.current_layer,
+            "applied_layer": self.current_layer,
+            "next_layer": self.next_layer,
+            "proposed_layer": self.next_layer,
+            "applied_at": self.applied_at,
+            "baseline_measured_at": self.baseline_measured_at,
+            "baseline_sessions": self.baseline_sessions,
+            "baseline_events": self.baseline_events,
+            "measured_at": self.measured_at,
+            "sessions": self.sessions,
+            "events": self.events,
+            "days_after_applied": self.days_after_applied,
         }
 
 
@@ -372,6 +433,128 @@ def _merge_history(
     for item in mirror_rows:
         history[(item.lesson_id, item.day)] = item
     return history
+
+
+def next_stronger_layer(applied_layer: str) -> str | None:
+    """Return the next stronger routing layer, if one exists."""
+
+    try:
+        position = twill_lessons.ROUTING_LAYER_ORDER.index(applied_layer)
+    except ValueError as exc:
+        raise _validation(f"unknown applied routing layer: {applied_layer!r}") from exc
+    if position == 0:
+        return None
+    return twill_lessons.ROUTING_LAYER_ORDER[position - 1]
+
+
+def evaluate_escalations(
+    lessons: Iterable[twill_lessons.LessonRecord],
+    measurements: Iterable[Measurement],
+    *,
+    as_of: str | datetime | None = None,
+) -> tuple[EscalationProposal, ...]:
+    """Find due lessons whose recurrence has not fallen by half.
+
+    The baseline is the latest measurement at or before application time when
+    one exists; otherwise the lesson's reviewed evidence is the baseline.  The
+    first measurement at or after the 21-day checkpoint is used, so later
+    digest runs continue to report the same historical proposal until a human
+    changes the lesson state.  Both session breadth and event volume must be
+    at or below half for the lesson to pass.
+    """
+
+    cutoff = _clock(as_of)
+    by_lesson: dict[str, list[Measurement]] = {}
+    for point in measurements:
+        by_lesson.setdefault(point.lesson_id, []).append(point)
+
+    proposals: list[EscalationProposal] = []
+    for lesson in sorted(lessons, key=lambda item: item.id):
+        if not lesson.state.startswith("applied:"):
+            continue
+        current_layer = lesson.state.split(":", 1)[1]
+        stronger = next_stronger_layer(current_layer)
+        if stronger is None:
+            continue
+        raw_applied_at = lesson.routing.get("applied_at")
+        if not isinstance(raw_applied_at, str):
+            continue
+        applied_at = _timestamp(raw_applied_at)
+        checkpoint = applied_at + timedelta(days=ESCALATION_AFTER_DAYS)
+        if checkpoint > cutoff:
+            continue
+
+        points = sorted(
+            (
+                point
+                for point in by_lesson.get(lesson.id, ())
+                if _timestamp(point.measured_at) <= cutoff
+            ),
+            key=lambda point: _timestamp(point.measured_at),
+        )
+        if not points:
+            continue
+        baseline_points = [
+            point
+            for point in points
+            if _timestamp(point.measured_at) <= applied_at
+        ]
+        baseline_point = baseline_points[-1] if baseline_points else None
+        baseline_sessions = (
+            baseline_point.sessions
+            if baseline_point is not None
+            else int(lesson.evidence["sessions"])
+        )
+        baseline_events = (
+            baseline_point.events
+            if baseline_point is not None
+            else int(lesson.evidence["events"])
+        )
+        checkpoint_points = [
+            point
+            for point in points
+            if _timestamp(point.measured_at) >= checkpoint
+        ]
+        if not checkpoint_points:
+            continue
+        point = checkpoint_points[0]
+        if point.sessions * 2 <= baseline_sessions and point.events * 2 <= baseline_events:
+            continue
+        proposals.append(
+            EscalationProposal(
+                lesson_id=lesson.id,
+                detector_id=point.detector_id,
+                key=lesson.key,
+                current_layer=current_layer,
+                next_layer=stronger,
+                applied_at=_format_timestamp(applied_at),
+                baseline_measured_at=(
+                    baseline_point.measured_at if baseline_point is not None else None
+                ),
+                baseline_sessions=baseline_sessions,
+                baseline_events=baseline_events,
+                measured_at=point.measured_at,
+                sessions=point.sessions,
+                events=point.events,
+            )
+        )
+    return tuple(proposals)
+
+
+def escalation_proposals(
+    artifacts_root: Path,
+    *,
+    as_of: str | datetime | None = None,
+    repo_root: Path | None = None,
+) -> tuple[EscalationProposal, ...]:
+    """Evaluate external lesson and measurement artifacts without mutating them."""
+
+    root = _validate_root(artifacts_root, repo_root)
+    return evaluate_escalations(
+        twill_lessons.list_lessons(root, repo_root=repo_root),
+        read_measurements(root, repo_root=repo_root),
+        as_of=as_of,
+    )
 
 
 def _detector_for(
@@ -750,18 +933,23 @@ def restore_measurements(
 
 __all__ = [
     "DEFAULT_MEASUREMENT_WINDOW_DAYS",
+    "ESCALATION_AFTER_DAYS",
     "MEASURABLE_STATES",
     "MEASUREMENT_DIRNAME",
     "MEASUREMENT_DIR_MODE",
     "MEASUREMENT_FILE_MODE",
     "Measurement",
+    "EscalationProposal",
     "MeasurementError",
     "MeasurementReport",
     "MeasurementValidationError",
     "measure_lessons",
+    "evaluate_escalations",
+    "escalation_proposals",
     "measurement_dir",
     "measurement_path",
     "read_measurements",
     "restore_measurements",
+    "next_stronger_layer",
     "run_measure",
 ]

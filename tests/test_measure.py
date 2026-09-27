@@ -12,6 +12,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import twill_detectors  # noqa: E402
+import twill_lessons  # noqa: E402
 import twill_measure  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_contract import EXIT_VALIDATION_FAILURE  # noqa: E402
@@ -174,6 +175,99 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(raised.exception.code, EXIT_VALIDATION_FAILURE)
         self.assertEqual(
             connection.execute("SELECT count(*) FROM measurement").fetchone()[0], 0
+        )
+
+    def test_escalation_waits_for_21_days_and_proposes_the_next_stronger_layer(self):
+        self.lesson("L-00000001", state="applied:hook")
+        record = twill_lessons.load_lesson(self.artifacts, "L-00000001")
+        point = twill_measure.Measurement(
+            lesson_id=record.id,
+            detector_id="D-01@1",
+            measured_at="2026-10-11T00:00:00Z",
+            window_days=7,
+            sessions=2,
+            events=2,
+        )
+
+        before_checkpoint = twill_measure.evaluate_escalations(
+            (record,),
+            (point,),
+            as_of="2026-10-10T23:59:59Z",
+        )
+        self.assertEqual(before_checkpoint, ())
+
+        proposals = twill_measure.evaluate_escalations(
+            (record,),
+            (point,),
+            as_of="2026-10-11T00:00:00Z",
+        )
+        self.assertEqual(len(proposals), 1)
+        self.assertEqual(proposals[0].current_layer, "hook")
+        self.assertEqual(proposals[0].next_layer, "environment")
+        self.assertEqual(proposals[0].baseline_sessions, 2)
+        self.assertEqual(proposals[0].sessions, 2)
+
+    def test_escalation_requires_both_counts_to_fall_by_half(self):
+        self.lesson("L-00000001", state="applied:hook")
+        record = twill_lessons.load_lesson(self.artifacts, "L-00000001")
+        point = twill_measure.Measurement(
+            lesson_id=record.id,
+            detector_id="D-01@1",
+            measured_at="2026-10-11T00:00:00Z",
+            window_days=7,
+            sessions=1,
+            events=2,
+        )
+
+        proposals = twill_measure.evaluate_escalations(
+            (record,),
+            (point,),
+            as_of="2026-10-11T00:00:00Z",
+        )
+        self.assertEqual(len(proposals), 1)
+
+        passed = twill_measure.Measurement(
+            lesson_id=record.id,
+            detector_id="D-01@1",
+            measured_at="2026-10-12T00:00:00Z",
+            window_days=7,
+            sessions=1,
+            events=1,
+        )
+        self.assertEqual(
+            twill_measure.evaluate_escalations(
+                (record,),
+                (passed,),
+                as_of="2026-10-12T00:00:00Z",
+            ),
+            (),
+        )
+
+    def test_escalation_does_not_act_on_terminal_or_strongest_layers(self):
+        self.lesson("L-00000001", state="applied:environment")
+        self.lesson("L-00000002", state="resolved", key="command-not-found:resolved")
+        records = tuple(
+            twill_lessons.load_lesson(self.artifacts, lesson_id)
+            for lesson_id in ("L-00000001", "L-00000002")
+        )
+        points = tuple(
+            twill_measure.Measurement(
+                lesson_id=record.id,
+                detector_id="D-01@1",
+                measured_at="2026-10-11T00:00:00Z",
+                window_days=7,
+                sessions=2,
+                events=2,
+            )
+            for record in records
+        )
+        self.assertEqual(
+            twill_measure.evaluate_escalations(
+                records,
+                points,
+                as_of="2026-10-11T00:00:00Z",
+            ),
+            (),
         )
 
 

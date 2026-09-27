@@ -2053,7 +2053,21 @@ def digest_command(args: argparse.Namespace) -> int:
         )
     except twill_digest.WeekError as exc:
         raise UsageError(str(exc)) from exc
-    report = twill_digest.build_digest(_state_dir(args.state_dir), selected_week)
+    artifacts_root = None
+    try:
+        config = load_config()
+        artifacts_root = config.require_artifacts_root()
+    except ConfigError:
+        # Read-only digest surfaces can still report detector findings when
+        # no external artifact root is configured.  A file-writing digest
+        # retains the existing fail-closed configuration behavior below.
+        if not (args.stdout or args.json):
+            raise
+    report = twill_digest.build_digest(
+        _state_dir(args.state_dir),
+        selected_week,
+        artifacts_root=artifacts_root,
+    )
     warnings = list(report.warnings)
     if args.json:
         emit_success(
@@ -2066,10 +2080,10 @@ def digest_command(args: argparse.Namespace) -> int:
     if args.stdout:
         sys.stdout.write(text)
     else:
-        config = load_config()
+        assert artifacts_root is not None
         artifact = twill_digest.write_digest_file(
             text,
-            config.require_artifacts_root(),
+            artifacts_root,
             selected_week,
         )
         print(

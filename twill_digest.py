@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 import twill_detectors
+import twill_measure
 from twill_detectors import (
     MAX_ERROR_LENGTH,
     STATUS_ERROR,
@@ -187,6 +188,7 @@ class DigestReport:
     detectors: tuple[DetectorSummary, ...]
     findings: tuple[Finding, ...]
     warnings: tuple[str, ...]
+    escalations: tuple[twill_measure.EscalationProposal, ...] = ()
 
     @property
     def week_id(self) -> str:
@@ -201,6 +203,7 @@ class DigestReport:
         return (
             self.database
             and not self.findings
+            and not self.escalations
             and all(
                 detector.current_status == STATUS_OK
                 and detector.previous_status == STATUS_OK
@@ -478,6 +481,7 @@ def build_digest(
     week: Week,
     *,
     registry: Sequence[Detector] = twill_detectors.REGISTRY,
+    artifacts_root: Path | None = None,
 ) -> DigestReport:
     state = Path(state_dir).expanduser().resolve()
     prior = previous_week(week)
@@ -485,6 +489,16 @@ def build_digest(
     prior_start, prior_end = week_bounds(prior)
     command = reproduction_command(state, week)
     detectors = twill_detectors.build_registry(*registry)
+    escalations: tuple[twill_measure.EscalationProposal, ...] = ()
+    if artifacts_root is not None:
+        # A report for a completed week must not use a measurement recorded in
+        # a later week.  Subtract a microsecond because week_bounds' end is an
+        # exclusive boundary.
+        report_as_of = datetime.fromisoformat(end) - timedelta(microseconds=1)
+        escalations = twill_measure.escalation_proposals(
+            artifacts_root,
+            as_of=report_as_of,
+        )
     db_path = state_db_path(state)
     if not db_path.is_file():
         summaries = tuple(
@@ -517,6 +531,7 @@ def build_digest(
             detectors=summaries,
             findings=(),
             warnings=(warning,),
+            escalations=escalations,
         )
 
     source = connect_read_only(state)
@@ -641,6 +656,7 @@ def build_digest(
         detectors=tuple(summaries),
         findings=findings,
         warnings=tuple(warnings),
+        escalations=escalations,
     )
 
 
@@ -702,6 +718,7 @@ def render_data(report: DigestReport) -> dict[str, object]:
         "observations_in_previous_week": report.observations_in_previous_week,
         "detectors": [_detector_data(detector) for detector in report.detectors],
         "findings": [_finding_data(finding) for finding in report.findings],
+        "escalations": [proposal.as_dict() for proposal in report.escalations],
         "reproduction_command": report.command,
     }
 
@@ -794,6 +811,20 @@ def render_text(report: DigestReport) -> str:
                     f"{_display_key(finding.key)} "
                     f"{_count_text(previous)}->{_count_text(current)}; "
                     f"{_waste_text(finding.estimated_waste)}",
+                    report.command,
+                )
+            )
+    if report.escalations:
+        lines.append(_line(f"escalation proposals: {len(report.escalations)}", report.command))
+        for proposal in report.escalations:
+            lines.append(
+                _line(
+                    f"- {proposal.lesson_id} {proposal.detector_id} "
+                    f"{_display_key(proposal.key)}: propose "
+                    f"{proposal.current_layer}->{proposal.next_layer}; "
+                    f"{proposal.sessions} sessions/{proposal.events} events "
+                    f"vs {proposal.baseline_sessions} sessions/"
+                    f"{proposal.baseline_events} events after 21 days",
                     report.command,
                 )
             )
