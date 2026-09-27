@@ -1346,6 +1346,128 @@ def ingest_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def _discard_state_database(state_dir: Path) -> None:
+    """Unlink the derived database and its WAL sidecars (plan §7.2, §8.2).
+
+    Every row in the state database is derived from transcripts that are
+    still on disk, so recovery from loss or corruption is deletion followed
+    by a reparse, never an in-place repair.  The files are removed before any
+    connection is attempted because a damaged file fails mid-DDL or, worse,
+    passes: SQLite reads a zero-byte file as a valid empty database, which
+    would turn "rebuild" into "silently keep an empty schema".
+    """
+
+    db_path = twill_schema.state_db_path(state_dir)
+    for suffix in ("", "-wal", "-shm"):
+        db_path.with_name(db_path.name + suffix).unlink(missing_ok=True)
+
+
+def rebuild_state_database(
+    state_dir: Path,
+    *,
+    roots: Sequence[Path | str],
+    settle_seconds: float,
+    content_fences: Sequence[str] = (),
+    retention_seconds: float | None = None,
+) -> dict[str, object]:
+    """Recreate the schema and reparse every session still on disk (§8.2).
+
+    This is Scenario 3's corrupt-DB recovery and §8.4's "the state directory
+    can be deleted and rebuilt" as one command: the derived database is
+    discarded, a fresh schema is laid down by the ordinary writer open, and
+    every settled transcript is reparsed from byte zero through the same
+    :meth:`Store.ingest_path` boundary an hourly ingest uses — so the rebuilt
+    rows are the rows a from-scratch ingest would produce (the §8.3
+    idempotency property).  Lessons, digests and measurements never enter
+    this path: they are files under ``artifacts_root`` in git, which is why a
+    full DB loss costs nothing but re-reading.
+
+    Enumeration happens before the database is touched, so a bad source
+    pattern or a tree with nothing settled yet fails while the old database —
+    however damaged — is still on disk.  The settle gate applies as in ingest
+    (EC-01): a file younger than the window is skipped whole and left for the
+    next hourly run, never parsed partially.  A transcript no longer on disk
+    is not an error either (EC-05): there is nothing to reparse, and the
+    evidence its rows carried is gone with the file, not with the database.
+    """
+
+    try:
+        files = settled_files(roots, settle_seconds)
+    except (OSError, ValueError) as exc:
+        raise CliError(
+            EXIT_RUNTIME_ERROR, str(exc), "check the transcript path and try again"
+        ) from exc
+    if not files and (_has_missing_source_root(roots) or _has_candidate_files(roots)):
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            "no settled JSONL sessions found",
+            "wait for the transcript settle window or use --settle 0 for a controlled fixture",
+        )
+    _discard_state_database(state_dir)
+    store = Store(
+        state_dir,
+        content_fences=content_fences,
+        retention_seconds=retention_seconds,
+    )
+    try:
+        processed = [store.ingest_path(path) for path in files]
+    finally:
+        store.close()
+    return {
+        "sessions": len(processed),
+        "events": sum(item["events"] for item in processed),
+        "observations": sum(item["observations"] for item in processed),
+    }
+
+
+def rebuild_command(args: argparse.Namespace) -> int:
+    """``twill doctor --rebuild``: the doctor surface's one recovery action.
+
+    Plain ``doctor`` stays read-only and lock-free; this flag is what makes
+    the verb mutating, so ``main`` wraps it in the state lock (EC-10) — an
+    hourly ingest firing mid-recovery queues behind it instead of racing a
+    database that is being deleted and relaid.  The run lands in
+    ``status.json`` as its own ``rebuild`` stage beside ``ingest``'s, keeping
+    the staleness baseline intact across the loss.
+    """
+
+    # Loaded before the database is touched, for the same reason ingest
+    # loads it first: a bad config is a startup error, never a convenient
+    # fallback that decides mid-recovery it has nowhere to put artifacts.
+    config = load_config()
+    state_dir = _state_dir(args.state_dir)
+    started = perf_counter()
+    result = rebuild_state_database(
+        state_dir,
+        roots=_source_patterns(args.source, config),
+        settle_seconds=args.settle if args.settle is not None else config.settle_window,
+        content_fences=config.content_fences,
+        retention_seconds=config.retention,
+    )
+    record_stage(
+        state_dir,
+        "rebuild",
+        perf_counter() - started,
+        {
+            "files": result["sessions"],
+            "sessions": result["sessions"],
+            "events": result["events"],
+            "observations": result["observations"],
+        },
+    )
+    if args.json:
+        emit_success(result, json_mode=True)
+    elif result["sessions"] == 0:
+        print("rebuilt the state database; no settled sessions found on disk")
+    else:
+        print(
+            f"rebuilt the state database; reparsed {result['sessions']} session(s); "
+            f"stored {result['events']} event(s); "
+            f"detector emitted {result['observations']} observation(s)"
+        )
+    return EXIT_SUCCESS
+
+
 def _window_days(seconds: float) -> int:
     """Convert a ``--window`` duration to whole days (cluster.window_days)."""
 
@@ -1785,6 +1907,8 @@ def status_command(args: argparse.Namespace) -> int:
 
 
 def doctor_command(args: argparse.Namespace) -> int:
+    if args.rebuild:
+        return rebuild_command(args)
     report = twill_doctor.run_doctor(_state_dir(args.state_dir))
     emit_success(
         report.as_dict(),
@@ -1946,6 +2070,18 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser(
         "doctor", help="check Phase 1 pipeline health"
     )
+    doctor.add_argument(
+        "--rebuild",
+        action="store_true",
+        help="recreate the state database and reparse every on-disk session",
+    )
+    doctor.add_argument("--source", action="append", help="transcript root; may be repeated")
+    doctor.add_argument(
+        "--settle",
+        type=_parse_duration,
+        default=None,
+        help="seconds or a form such as 2h; default comes from config.toml (2h)",
+    )
     doctor.add_argument("--state-dir")
     doctor.add_argument("--json", action="store_true")
     doctor.set_defaults(handler=doctor_command)
@@ -1978,7 +2114,11 @@ def main(argv: Sequence[str] | None = None) -> int:
         if getattr(args, "limit", 1) < 1:
             raise CliError(EXIT_USAGE_ERROR, "--limit must be at least 1")
         writes_artifact = args.command == "digest" and not args.stdout and not args.json
-        if args.command in MUTATING_VERBS or writes_artifact:
+        # EC-10: --rebuild deletes and rewrites the state database, so the
+        # otherwise read-only doctor verb takes the state lock for it like
+        # any mutating verb — a timer firing mid-recovery queues behind it.
+        rebuilds_state = args.command == "doctor" and args.rebuild
+        if args.command in MUTATING_VERBS or writes_artifact or rebuilds_state:
             with StateLock(_state_dir(args.state_dir)):
                 return int(args.handler(args))
         return int(args.handler(args))

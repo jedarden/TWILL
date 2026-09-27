@@ -134,6 +134,24 @@ The command exits `0` when healthy, `1` when degraded, and `2` when broken. Thes
 reported through the normal JSON envelope; argument errors retain the CLI usage-error contract.
 Later health checks and recovery flags are added independently.
 
+`doctor --rebuild` is the one recovery action (plan §5 Scenario 3, §8.2): after database loss or
+corruption it discards `twill.db` and its WAL sidecars, recreates the schema, and reparses every
+settled session still on disk through the ordinary ingest path — so the rebuilt rows match a
+from-scratch ingest and the settle gate still applies. It takes the state lock like any mutating
+verb, records a `rebuild` stage in `status.json`, and never touches the lesson, digest, or
+measurement files under `artifacts_root`, which is why a full database loss costs nothing but
+re-reading:
+
+```sh
+twill doctor --rebuild
+```
+
+Enumeration happens before the database is touched: a missing source root or a tree whose files are
+all younger than the settle window fails with exit 1 while the damaged `twill.db` is still on disk
+for inspection. A tree with no transcripts at all rebuilds to an empty schema — the recovery is
+"delete and reparse," and there is nothing to reparse. Source roots and the settle window come from
+`config.toml` unless overridden with `--source` and `--settle` as in ingest.
+
 ## CLI output contract
 
 Read verbs accept `--json` and write one JSON object to stdout. Successful commands use this
