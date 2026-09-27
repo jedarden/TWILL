@@ -12,7 +12,7 @@ import shutil
 import sqlite3
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
@@ -33,6 +33,7 @@ EXIT_BROKEN = 2
 
 FREE_DISK_WARN_BYTES = 5 * 1024**3
 TIMER_INTERVALS = {"ingest": 3600.0}
+DEAD_MAN_WINDOW_SECONDS = 24 * 3600.0
 REQUIRED_TABLES = (
     "cluster",
     "cluster_week",
@@ -428,6 +429,169 @@ def _check_timer_freshness(
     )
 
 
+def _mtime_timestamp(value: object) -> datetime | None:
+    """Convert a cursor's nanosecond mtime to an aware UTC timestamp."""
+
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    try:
+        return datetime.fromtimestamp(value / 1_000_000_000, timezone.utc)
+    except (OverflowError, OSError, ValueError):
+        return None
+
+
+def _check_dead_man_switch(
+    connection: sqlite3.Connection | None,
+    open_error: str | None,
+    now: datetime,
+    window_seconds: float = DEAD_MAN_WINDOW_SECONDS,
+) -> CheckResult:
+    """Fail when recent transcript arrivals produced no observations.
+
+    ``cursor`` is the durable record of files that entered the ingest path.  A
+    row's first-seen time catches new session files; its stored mtime catches a
+    known file that received an append or rewrite.  We deliberately scope the
+    observation query to the sessions represented by those rows: observations
+    from an older, healthy session must not mask a parser that stopped emitting
+    rows for newly arriving files.
+
+    Real ingested state has the ``session`` table, whose ``ingested_at`` value
+    is the strongest timestamp for this check.  Minimal/pre-session databases
+    remain diagnosable by falling back to observation timestamps instead of
+    making the doctor unable to run during an additive upgrade.
+    """
+
+    if connection is None:
+        return _result(
+            "dead_man_switch",
+            BROKEN,
+            f"database unavailable: {open_error or 'could not open state database'}",
+            {"error": open_error or "could not open state database"},
+        )
+    if (
+        isinstance(window_seconds, bool)
+        or not isinstance(window_seconds, (int, float))
+        or not math.isfinite(float(window_seconds))
+        or window_seconds <= 0
+    ):
+        return _result(
+            "dead_man_switch",
+            BROKEN,
+            "dead-man's switch window is invalid",
+            {"window_seconds": redact_text(str(window_seconds))},
+        )
+
+    cutoff = now - timedelta(seconds=float(window_seconds))
+    try:
+        cursor_rows = connection.execute(
+            "SELECT path, source, session_id, first_seen, mtime_ns "
+            "FROM cursor WHERE path_missing = 0"
+        ).fetchall()
+    except Exception as exc:
+        return _result(
+            "dead_man_switch",
+            BROKEN,
+            f"transcript arrival history cannot be read: {_exception_text(exc)}",
+            {"error": _exception_text(exc)},
+        )
+
+    arrivals: list[dict[str, object]] = []
+    for row_index, row in enumerate(cursor_rows):
+        if len(row) != 5:
+            return _result(
+                "dead_man_switch",
+                BROKEN,
+                f"cursor row {row_index} has an invalid arrival shape",
+                {"row": row_index},
+            )
+        path, source, session_id, first_seen, mtime_ns = row
+        first_seen_at = _parse_timestamp(first_seen)
+        mtime_at = _mtime_timestamp(mtime_ns)
+        if (
+            not isinstance(path, str)
+            or not isinstance(source, str)
+            or not isinstance(session_id, str)
+            or first_seen_at is None
+            or mtime_at is None
+        ):
+            return _result(
+                "dead_man_switch",
+                BROKEN,
+                f"cursor row {row_index} has invalid transcript arrival fields",
+                {"row": row_index},
+            )
+        arrival_at = max(first_seen_at, mtime_at)
+        if arrival_at >= cutoff and arrival_at <= now:
+            arrivals.append(
+                {
+                    "path": redact_text(path),
+                    "source": redact_text(source),
+                    "session_id": redact_text(session_id),
+                    "arrived_at": arrival_at.isoformat(),
+                }
+            )
+
+    details: dict[str, object] = {
+        "window_seconds": float(window_seconds),
+        "window_start": cutoff.isoformat(),
+        "recent_file_count": len(arrivals),
+        "recent_files": sorted(
+            arrivals,
+            key=lambda item: (str(item["arrived_at"]), str(item["path"])),
+        ),
+        "observations_ingested": 0,
+    }
+    if not arrivals:
+        return _result(
+            "dead_man_switch",
+            HEALTHY,
+            "no transcript files arrived in the last 24 hours",
+            details,
+        )
+
+    session_ids = tuple(sorted({str(item["session_id"]) for item in arrivals}))
+    placeholders = ", ".join("?" for _ in session_ids)
+    try:
+        has_session_table = connection.execute(
+            "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'session'"
+        ).fetchone()
+        if has_session_table:
+            observation_row = connection.execute(
+                "SELECT count(*) FROM observation AS o "
+                "JOIN session AS s ON s.session_id = o.session_id "
+                f"WHERE o.session_id IN ({placeholders}) AND s.ingested_at >= ?",
+                (*session_ids, cutoff.isoformat()),
+            ).fetchone()
+        else:
+            observation_row = connection.execute(
+                "SELECT count(*) FROM observation "
+                f"WHERE session_id IN ({placeholders}) AND ts_utc >= ?",
+                (*session_ids, cutoff.isoformat()),
+            ).fetchone()
+    except Exception as exc:
+        return _result(
+            "dead_man_switch",
+            BROKEN,
+            f"recent observations cannot be read: {_exception_text(exc)}",
+            {**details, "error": _exception_text(exc)},
+        )
+    observations = int(observation_row[0]) if observation_row else 0
+    details["observations_ingested"] = observations
+    if observations:
+        return _result(
+            "dead_man_switch",
+            HEALTHY,
+            f"{len(arrivals)} recent transcript file(s) produced {observations} observation(s)",
+            details,
+        )
+    return _result(
+        "dead_man_switch",
+        BROKEN,
+        "dead-man's switch: transcript files arrived but zero observations were ingested in the last 24 hours",
+        details,
+    )
+
+
 def _nearest_existing_path(path: Path) -> Path:
     candidate = path
     while not candidate.exists():
@@ -500,10 +664,11 @@ def run_doctor(
         integrity = _check_database_integrity(connection, open_error)
         schema = _check_database_schema(connection, open_error)
         cursor = _check_cursor_health(connection, open_error)
+        dead_man = _check_dead_man_switch(connection, open_error, reference)
     finally:
         if connection is not None:
             connection.close()
 
     timer = _check_timer_freshness(state_dir, reference, effective_intervals)
     disk = _check_disk_space(state_dir, disk_usage)
-    return DoctorReport((integrity, schema, timer, cursor, disk))
+    return DoctorReport((integrity, schema, timer, cursor, dead_man, disk))

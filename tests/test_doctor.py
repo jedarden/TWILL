@@ -47,9 +47,83 @@ class DoctorChecksTests(unittest.TestCase):
         self.assertEqual(report.exit_code, 0)
         self.assertEqual(
             [check.name for check in report.checks],
-            ["db_integrity", "db_schema", "timer_freshness", "cursor_health", "disk_space"],
+            [
+                "db_integrity",
+                "db_schema",
+                "timer_freshness",
+                "cursor_health",
+                "dead_man_switch",
+                "disk_space",
+            ],
         )
         self.assertTrue(all(check.status == twill_doctor.HEALTHY for check in report.checks))
+
+    def add_cursor(self, *, now, first_seen=None, mtime_ns=None, session_id="s1"):
+        first_seen = first_seen or now
+        mtime_ns = (
+            mtime_ns
+            if mtime_ns is not None
+            else int(first_seen.timestamp() * 1_000_000_000)
+        )
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "INSERT INTO cursor(path, session_id, source, identity_sha, size, mtime_ns, "
+            "last_offset, parse_errors, first_seen, last_indexed_at) "
+            "VALUES (?, ?, 'claude', 'sha', 1, ?, 1, 0, ?, ?)",
+            (f"/transcripts/{session_id}.jsonl", session_id, mtime_ns, first_seen.isoformat(), now.isoformat()),
+        )
+        connection.commit()
+        connection.close()
+
+    def add_observation(self, *, now, session_id="s1"):
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind) VALUES (?, ?, ?, 'file_read')",
+            (session_id, now.isoformat(), now.isoformat()),
+        )
+        connection.commit()
+        connection.close()
+
+    def test_dead_man_switch_fails_after_a_day_of_arrivals_without_observations(self):
+        now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.add_cursor(now=now, first_seen=now - timedelta(hours=24))
+        report = twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+        check = self.check(report, "dead_man_switch")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertEqual(check.details["recent_file_count"], 1)
+        self.assertEqual(check.details["observations_ingested"], 0)
+        self.assertIn("zero observations", check.message)
+        self.assertEqual(report.exit_code, twill_doctor.EXIT_BROKEN)
+
+    def test_dead_man_switch_is_healthy_when_recent_arrival_has_an_observation(self):
+        now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.add_cursor(now=now, first_seen=now - timedelta(hours=24))
+        self.add_observation(now=now)
+        report = twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+        check = self.check(report, "dead_man_switch")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["observations_ingested"], 1)
+
+    def test_dead_man_switch_does_not_alarm_for_a_quiet_window(self):
+        now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.add_cursor(now=now, first_seen=now - timedelta(hours=24, seconds=1))
+        report = twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+        self.assertEqual(self.check(report, "dead_man_switch").status, twill_doctor.HEALTHY)
 
     def test_missing_database_is_broken_without_creating_state(self):
         report = twill_doctor.run_doctor(
