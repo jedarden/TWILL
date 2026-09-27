@@ -125,6 +125,17 @@ normalized text as `key`. `sessions` counts distinct session ids, while `events`
 `last_seen` descending, then key ascending. The registry keeps `cluster.score` at zero; Phase 3's
 ranker owns the global score built from these fields.
 
+## D-03@1: retry loop
+
+D-03 first groups `run_failed` observations by the trimmed normalized `command` and `session_id`.
+A group qualifies at three or more failures only when no later `run_succeeded` observation for that
+same command exists in the active trailing window. Qualifying sessions are then aggregated into one
+cluster per command: `sessions` counts the sessions with an abandoned loop and `events` counts their
+failed attempts. Empty commands, other observation kinds, successes, and groups below three failures
+are excluded. Session-hit and weekly queries use the same qualification rule. Output is ordered by
+sessions descending, latest `last_seen` descending, then command ascending; the registry keeps
+`cluster.score` at zero for Phase 3's ranker.
+
 ## D-09@1: unread rule document
 
 D-09 emits one cluster for each live indexed rule document whose newest `last_read_by_agent` value

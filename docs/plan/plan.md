@@ -569,6 +569,16 @@ and `tool_error` observations with a non-empty `signature` and `sig_hash`, group
 `last_seen` descending, with `key` as a deterministic tie-breaker. Persisted clusters retain
 `score = 0.0`; the Phase 3 ranker consumes these counts and timestamps for global ranking.
 
+**D-03@1 decision (2026-09-27):** a retry loop is a trimmed normalized `command` with at least
+`N = 3` `run_failed` observations in one session and no later `run_succeeded` observation for that
+command in the active trailing window. Qualification happens per `(command, session_id)` before
+aggregating qualifying sessions into a command cluster, so three failures split across sessions do
+not qualify. Empty commands and non-run observations are ignored. `sessions`, `events`,
+`first_seen`, and `last_seen` cover the qualifying abandoned failures, and output is ordered by
+qualifying sessions descending, latest `last_seen` descending, then command ascending. Persisted
+clusters retain `score = 0.0`; the Phase 3 ranker consumes these counts and timestamps for global
+ranking.
+
 **D-09@1 decision (2026-09-24):** D-09 emits one cluster for each live indexed rule document whose
 newest `last_read_by_agent` value for its content hash is missing or earlier than the trailing-window
 start and which has no matching `file_read` observation in the window. Reading either copy of identical

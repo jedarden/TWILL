@@ -499,6 +499,170 @@ RECURRING_ERROR_SIGNATURE = Detector(
 )
 
 
+RETRY_LOOP_SQL = """
+    WITH failed AS (
+        SELECT obs_id, session_id, trim(command) AS command, ts_utc
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND kind = 'run_failed'
+          AND command IS NOT NULL
+          AND trim(command) <> ''
+    ),
+    abandoned_sessions AS (
+        SELECT f.session_id,
+               f.command,
+               count(*) AS events,
+               min(f.ts_utc) AS first_seen,
+               max(f.ts_utc) AS last_seen
+        FROM failed AS f
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM observation AS success
+            WHERE success.session_id = f.session_id
+              AND success.kind = 'run_succeeded'
+              AND success.command IS NOT NULL
+              AND trim(success.command) = f.command
+              AND success.ts_utc >= :window_start_utc
+              AND (
+                  success.ts_utc > f.ts_utc
+                  OR (success.ts_utc = f.ts_utc AND success.obs_id > f.obs_id)
+              )
+        )
+        GROUP BY f.session_id, f.command
+        HAVING count(*) >= 3
+    )
+    SELECT command AS key,
+           count(*) AS sessions,
+           sum(events) AS events,
+           min(first_seen) AS first_seen,
+           max(last_seen) AS last_seen
+    FROM abandoned_sessions
+    GROUP BY command
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+RETRY_LOOP_HIT_SQL = """
+    WITH failed AS (
+        SELECT obs_id, session_id, trim(command) AS command, ts_utc
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND kind = 'run_failed'
+          AND command IS NOT NULL
+          AND trim(command) <> ''
+    ),
+    abandoned_sessions AS (
+        SELECT f.session_id, f.command
+        FROM failed AS f
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM observation AS success
+            WHERE success.session_id = f.session_id
+              AND success.kind = 'run_succeeded'
+              AND success.command IS NOT NULL
+              AND trim(success.command) = f.command
+              AND success.ts_utc >= :window_start_utc
+              AND (
+                  success.ts_utc > f.ts_utc
+                  OR (success.ts_utc = f.ts_utc AND success.obs_id > f.obs_id)
+              )
+        )
+        GROUP BY f.session_id, f.command
+        HAVING count(*) >= 3
+    )
+    SELECT command AS key, session_id
+    FROM abandoned_sessions
+    ORDER BY key ASC, session_id ASC
+"""
+
+RETRY_LOOP_WEEK_HIT_SQL = """
+    WITH failed AS (
+        SELECT obs_id, session_id, trim(command) AS command, ts_utc
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND kind = 'run_failed'
+          AND command IS NOT NULL
+          AND trim(command) <> ''
+    ),
+    abandoned_sessions AS (
+        SELECT f.session_id, f.command
+        FROM failed AS f
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM observation AS success
+            WHERE success.session_id = f.session_id
+              AND success.kind = 'run_succeeded'
+              AND success.command IS NOT NULL
+              AND trim(success.command) = f.command
+              AND success.ts_utc >= :window_start_utc
+              AND (
+                  success.ts_utc > f.ts_utc
+                  OR (success.ts_utc = f.ts_utc AND success.obs_id > f.obs_id)
+              )
+        )
+        GROUP BY f.session_id, f.command
+        HAVING count(*) >= 3
+    )
+    SELECT substr(f.command, 1, 240) AS key,
+           strftime('%G-W%V', f.ts_utc) AS week
+    FROM failed AS f
+    JOIN abandoned_sessions AS a
+      ON a.session_id = f.session_id AND a.command = f.command
+    GROUP BY substr(f.command, 1, 240), strftime('%G-W%V', f.ts_utc)
+    ORDER BY key ASC, week ASC
+"""
+
+RETRY_LOOP_WEEKLY_HIT_SQL = """
+    WITH failed AS (
+        SELECT obs_id, session_id, trim(command) AS command, ts_utc
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND ts_utc < :window_end_utc
+          AND kind = 'run_failed'
+          AND command IS NOT NULL
+          AND trim(command) <> ''
+    ),
+    abandoned_sessions AS (
+        SELECT f.session_id, f.command
+        FROM failed AS f
+        WHERE NOT EXISTS (
+            SELECT 1
+            FROM observation AS success
+            WHERE success.session_id = f.session_id
+              AND success.kind = 'run_succeeded'
+              AND success.command IS NOT NULL
+              AND trim(success.command) = f.command
+              AND success.ts_utc >= :window_start_utc
+              AND success.ts_utc < :window_end_utc
+              AND (
+                  success.ts_utc > f.ts_utc
+                  OR (success.ts_utc = f.ts_utc AND success.obs_id > f.obs_id)
+              )
+        )
+        GROUP BY f.session_id, f.command
+        HAVING count(*) >= 3
+    )
+    SELECT substr(f.command, 1, 240) AS key,
+           strftime('%G-W%V', f.ts_utc) AS week,
+           count(DISTINCT f.session_id) AS sessions,
+           count(*) AS events
+    FROM failed AS f
+    JOIN abandoned_sessions AS a
+      ON a.session_id = f.session_id AND a.command = f.command
+    GROUP BY substr(f.command, 1, 240), strftime('%G-W%V', f.ts_utc)
+    ORDER BY key ASC, week ASC
+"""
+
+RETRY_LOOP = Detector(
+    "D-03",
+    1,
+    "normalized commands retried at least three times in one session and abandoned",
+    RETRY_LOOP_SQL,
+    session_hits_sql=RETRY_LOOP_HIT_SQL,
+    week_hits_sql=RETRY_LOOP_WEEK_HIT_SQL,
+    weekly_hits_sql=RETRY_LOOP_WEEKLY_HIT_SQL,
+)
+
+
 UNREAD_RULE_DOC_SQL = """
     WITH read_state AS (
         SELECT sha, max(last_read_by_agent) AS last_read
@@ -539,7 +703,7 @@ UNREAD_RULE_DOC = Detector(
 # recurring error signature, ... D-10 ICG gate gap) append their entries here;
 # an entry leaves this tuple when its successor version lands.
 REGISTRY: tuple[Detector, ...] = build_registry(
-    MISSING_BINARY, RECURRING_ERROR_SIGNATURE, UNREAD_RULE_DOC
+    MISSING_BINARY, RECURRING_ERROR_SIGNATURE, RETRY_LOOP, UNREAD_RULE_DOC
 )
 
 

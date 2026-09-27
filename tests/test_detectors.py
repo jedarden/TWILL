@@ -1121,6 +1121,165 @@ class RecurringErrorSignatureDetectorTests(unittest.TestCase):
         self.assertEqual([row[0] for row in ordered], ["shared failure", "tool failure"])
 
 
+class RetryLoopDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def test_d03_requires_three_failures_in_one_session_and_no_later_success(self):
+        for days_ago in (6, 5, 4, 3):
+            seed_observation(
+                self.connection,
+                session_id="loop-a",
+                command="pytest -q",
+                days_ago=days_ago,
+            )
+        for days_ago in (2.5, 1.5, 0.5):
+            seed_observation(
+                self.connection,
+                session_id="loop-b",
+                command="pytest -q",
+                days_ago=days_ago,
+            )
+
+        # Two failures in another session do not combine with each other or
+        # with the qualifying attempts above.
+        for days_ago in (4, 3):
+            seed_observation(
+                self.connection,
+                session_id="below-threshold",
+                command="pytest -q",
+                days_ago=days_ago,
+            )
+
+        # A successful retry after the failures makes the loop resolved.
+        for days_ago in (6, 5, 4):
+            seed_observation(
+                self.connection,
+                session_id="resolved",
+                command="cargo test",
+                days_ago=days_ago,
+            )
+        seed_observation(
+            self.connection,
+            session_id="resolved",
+            command="cargo test",
+            kind="run_succeeded",
+            days_ago=2,
+        )
+
+        # An earlier success does not suppress a later abandoned retry loop.
+        seed_observation(
+            self.connection,
+            session_id="earlier-success",
+            command="make test",
+            kind="run_succeeded",
+            days_ago=8,
+        )
+        for days_ago in (6, 5, 4):
+            seed_observation(
+                self.connection,
+                session_id="earlier-success",
+                command="make test",
+                days_ago=days_ago,
+            )
+
+        # Blank commands, non-run failures, and observations outside the
+        # active window do not contribute.
+        for days_ago in (1, 2, 3):
+            seed_observation(
+                self.connection,
+                session_id="ignored",
+                command=" ",
+                days_ago=days_ago,
+            )
+            seed_observation(
+                self.connection,
+                session_id="ignored",
+                command="tool failure",
+                kind="tool_error",
+                days_ago=days_ago,
+            )
+        for days_ago in (31, 32, 33):
+            seed_observation(
+                self.connection,
+                session_id="old",
+                command="old command",
+                days_ago=days_ago,
+            )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.RETRY_LOOP,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-03@1", "ok", 2)],
+        )
+        rows = cluster_rows(self.connection, "D-03")
+        self.assertEqual([row[1] for row in rows], ["make test", "pytest -q"])
+        make_test = next(row for row in rows if row[1] == "make test")
+        self.assertEqual(make_test[3:5], (1, 3))
+        pytest = next(row for row in rows if row[1] == "pytest -q")
+        self.assertEqual(pytest[3:5], (2, 7))
+        self.assertEqual(pytest[7], 0.0)
+        self.assertEqual(pytest[9], "open")
+
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT key, session_id FROM cluster_session "
+                "WHERE detector_id = 'D-03' ORDER BY key, session_id"
+            ).fetchall(),
+            [
+                ("make test", "earlier-success"),
+                ("pytest -q", "loop-a"),
+                ("pytest -q", "loop-b"),
+            ],
+        )
+
+    def test_d03_orders_by_qualifying_sessions_then_recency_then_key(self):
+        for session_id in ("a", "b"):
+            for days_ago in (5, 4, 3):
+                seed_observation(
+                    self.connection,
+                    session_id=session_id,
+                    command="alpha",
+                    days_ago=days_ago,
+                )
+        for days_ago in (2, 1.5, 1):
+            seed_observation(
+                self.connection,
+                session_id="c",
+                command="beta",
+                days_ago=days_ago,
+            )
+        for days_ago in (3, 2, 1):
+            seed_observation(
+                self.connection,
+                session_id="d",
+                command="gamma",
+                days_ago=days_ago,
+            )
+
+        rows = self.connection.execute(
+            twill_detectors.RETRY_LOOP_SQL,
+            {
+                "window_start_utc": (
+                    datetime.now(timezone.utc) - timedelta(days=30)
+                ).isoformat(),
+                "window_days": 30,
+            },
+        ).fetchall()
+
+        self.assertEqual([row[0] for row in rows], ["alpha", "gamma", "beta"])
+
+
 class UnreadRuleDocDetectorTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -1427,6 +1586,14 @@ class DetectCliTests(unittest.TestCase):
                         "error": None,
                     },
                     {
+                        "detector_id": "D-03",
+                        "version": 1,
+                        "full_id": "D-03@1",
+                        "status": "ok",
+                        "clusters": 0,
+                        "error": None,
+                    },
+                    {
                         "detector_id": "D-09",
                         "version": 1,
                         "full_id": "D-09@1",
@@ -1444,6 +1611,7 @@ class DetectCliTests(unittest.TestCase):
             self.assertEqual(human.returncode, 0, human.stderr)
             self.assertIn("D-01@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-02@1: 0 cluster(s)", human.stdout)
+            self.assertIn("D-03@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-09@1: 0 cluster(s)", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):
