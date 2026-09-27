@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import quote
 
 import twill_schema
+import twill_rulecorpus
 from twill_redactor import Redactor, redact_text
 from twill_status import read_status
 
@@ -394,6 +395,123 @@ def _check_cursor_health(
         DEGRADED,
         f"{len(parse_errors)} cursor file(s) have parse errors; "
         f"{len(missing_paths)} path(s) are missing",
+        details,
+    )
+
+
+def _check_rule_corpus(
+    connection: sqlite3.Connection | None,
+    open_error: str | None,
+) -> CheckResult:
+    """Report rule rows whose indexed content or path is no longer current.
+
+    The indexer marks vanished paths during a corpus run, but doctor must not
+    depend on that run having happened: a file can disappear after indexing,
+    and a file can change without the rank timer running again.  This check
+    therefore reads every stored path directly and never mutates ``rule_doc``
+    or ``rule_fts``.
+    """
+
+    if connection is None:
+        return _result(
+            "rule_corpus",
+            BROKEN,
+            f"database unavailable: {open_error or 'could not open state database'}",
+            {"error": open_error or "could not open state database"},
+        )
+    try:
+        rows = connection.execute(
+            "SELECT path, sha, stale FROM rule_doc ORDER BY path"
+        ).fetchall()
+    except Exception as exc:
+        return _result(
+            "rule_corpus",
+            BROKEN,
+            f"rule corpus cannot be read: {_exception_text(exc)}",
+            {"error": _exception_text(exc)},
+        )
+
+    hash_mismatches: list[dict[str, object]] = []
+    vanished_paths: list[str] = []
+    stale_rows: list[str] = []
+    unreadable_paths: list[dict[str, str]] = []
+    for row_index, row in enumerate(rows):
+        if len(row) != 3:
+            return _result(
+                "rule_corpus",
+                BROKEN,
+                f"rule_doc row {row_index} has an invalid shape",
+                {"row": row_index},
+            )
+        path, indexed_sha, stale = row
+        if (
+            not isinstance(path, str)
+            or not isinstance(indexed_sha, str)
+            or isinstance(stale, bool)
+            or not isinstance(stale, int)
+            or stale < 0
+        ):
+            return _result(
+                "rule_corpus",
+                BROKEN,
+                f"rule_doc row {row_index} has invalid staleness fields",
+                {"row": row_index},
+            )
+
+        safe_path = redact_text(path)
+        if stale != 0:
+            stale_rows.append(safe_path)
+        rule_path = Path(path)
+        if not rule_path.is_file():
+            vanished_paths.append(safe_path)
+            continue
+        try:
+            current_sha = twill_rulecorpus.content_sha(rule_path.read_bytes())
+        except OSError as exc:
+            unreadable_paths.append(
+                {"path": safe_path, "error": _exception_text(exc)}
+            )
+            continue
+        if current_sha != indexed_sha:
+            hash_mismatches.append(
+                {
+                    "path": safe_path,
+                    "indexed_sha": indexed_sha,
+                    "current_sha": current_sha,
+                }
+            )
+
+    hash_mismatches.sort(key=lambda item: str(item["path"]))
+    vanished_paths = sorted(set(vanished_paths))
+    stale_rows = sorted(set(stale_rows))
+    unreadable_paths.sort(key=lambda item: str(item["path"]))
+    details = {
+        "document_count": len(rows),
+        "hash_mismatches": hash_mismatches,
+        "hash_mismatch_count": len(hash_mismatches),
+        "vanished_paths": vanished_paths,
+        "vanished_path_count": len(vanished_paths),
+        "stale_rows": stale_rows,
+        "stale_row_count": len(stale_rows),
+        "unreadable_paths": unreadable_paths,
+        "unreadable_path_count": len(unreadable_paths),
+    }
+    if not hash_mismatches and not vanished_paths and not stale_rows and not unreadable_paths:
+        return _result("rule_corpus", HEALTHY, "rule corpus is fresh", details)
+
+    issues: list[str] = []
+    if hash_mismatches:
+        issues.append(f"{len(hash_mismatches)} indexed hash mismatch(es)")
+    if vanished_paths:
+        issues.append(f"{len(vanished_paths)} rule path(s) vanished")
+    if stale_rows:
+        issues.append(f"{len(stale_rows)} stale row(s)")
+    if unreadable_paths:
+        issues.append(f"{len(unreadable_paths)} unreadable path(s)")
+    return _result(
+        "rule_corpus",
+        DEGRADED,
+        "rule corpus coverage needs attention: " + "; ".join(issues),
         details,
     )
 
@@ -779,6 +897,7 @@ def run_doctor(
         integrity = _check_database_integrity(connection, open_error)
         schema = _check_database_schema(connection, open_error)
         cursor = _check_cursor_health(connection, open_error)
+        rule_corpus = _check_rule_corpus(connection, open_error)
         dead_man = _check_dead_man_switch(connection, open_error, reference)
     finally:
         if connection is not None:
@@ -786,4 +905,4 @@ def run_doctor(
 
     timer = _check_timer_freshness(state_dir, reference, effective_intervals)
     disk = _check_disk_space(state_dir, disk_usage)
-    return DoctorReport((integrity, schema, timer, cursor, dead_man, disk))
+    return DoctorReport((integrity, schema, timer, cursor, rule_corpus, dead_man, disk))

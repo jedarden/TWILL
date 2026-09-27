@@ -124,7 +124,8 @@ live in the engine.
 ## Health checks
 
 `twill doctor` is the read-only Phase 1 health entry point. It checks SQLite integrity and schema
-version, ingest timer freshness, cursor parse or missing-path anomalies, and free disk space:
+version, ingest timer freshness, cursor parse or missing-path anomalies, rule-corpus hash drift or
+vanished paths, and free disk space:
 
 Ingest refuses to start below 2 GiB free space (exit 1); doctor warns below 5 GiB so the operator
 has time to recover before writes fail.

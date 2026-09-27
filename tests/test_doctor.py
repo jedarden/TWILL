@@ -14,6 +14,7 @@ CLI = ROOT / "twill"
 sys.path.insert(0, str(ROOT))
 
 import twill_doctor  # noqa: E402
+import twill_rulecorpus  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_status import record_stage, status_path  # noqa: E402
 
@@ -52,6 +53,7 @@ class DoctorChecksTests(unittest.TestCase):
                 "db_schema",
                 "timer_freshness",
                 "cursor_health",
+                "rule_corpus",
                 "dead_man_switch",
                 "disk_space",
             ],
@@ -299,6 +301,62 @@ class DoctorChecksTests(unittest.TestCase):
         self.assertEqual(check.status, twill_doctor.DEGRADED)
         self.assertEqual(check.details["parse_error_file_count"], 1)
         self.assertEqual(check.details["missing_path_count"], 1)
+
+    def test_rule_corpus_reports_hash_drift_and_vanished_paths(self):
+        self.create_database()
+        changed = self.root / "rules" / "changed.md"
+        missing = self.root / "rules" / "missing.md"
+        changed.parent.mkdir()
+        changed.write_text("original rule\n")
+        connection = twill_schema.connect(self.state)
+        connection.executemany(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, stale) "
+            "VALUES (?, 'agents_md', ?, 't', 0)",
+            [
+                (str(changed), twill_rulecorpus.content_sha(b"original rule\n")),
+                (str(missing), twill_rulecorpus.content_sha(b"missing rule\n")),
+            ],
+        )
+        connection.commit()
+        connection.close()
+        changed.write_text("edited rule\n")
+
+        report = twill_doctor.run_doctor(
+            self.state,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+        check = self.check(report, "rule_corpus")
+        self.assertEqual(check.status, twill_doctor.DEGRADED)
+        self.assertEqual(check.details["hash_mismatch_count"], 1)
+        self.assertEqual(
+            check.details["hash_mismatches"][0]["path"], str(changed)
+        )
+        self.assertEqual(check.details["vanished_paths"], [str(missing)])
+        self.assertEqual(check.details["vanished_path_count"], 1)
+
+    def test_rule_corpus_reports_persisted_stale_rows(self):
+        self.create_database()
+        path = self.root / "rules.md"
+        path.write_text("rule\n")
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, stale) "
+            "VALUES (?, 'memory', ?, 't', 1)",
+            (str(path), twill_rulecorpus.content_sha(b"rule\n")),
+        )
+        connection.commit()
+        connection.close()
+
+        report = twill_doctor.run_doctor(
+            self.state,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+        check = self.check(report, "rule_corpus")
+        self.assertEqual(check.status, twill_doctor.DEGRADED)
+        self.assertEqual(check.details["stale_rows"], [str(path)])
+        self.assertEqual(check.details["vanished_paths"], [])
 
     def test_free_disk_threshold_is_inclusive(self):
         report = self.healthy_report(free=twill_doctor.FREE_DISK_WARN_BYTES - 1)
