@@ -165,6 +165,20 @@ is itself a high-signal finding. Session-hit, week-hit, and weekly-series querie
 rule. Output is ordered by sessions descending, latest `last_seen` descending, then key ascending;
 the registry keeps `cluster.score` at zero for Phase 3's ranker.
 
+## D-07@1: rediscovery
+
+D-07 emits two cluster families. A trimmed, non-empty `file_read.path` is a
+finding when it appears in at least two distinct sessions and two distinct UTC
+calendar dates in the active window. `file_edit`, `file_write`, and
+`file_changed` observations for the path suppress that file finding for the
+window, so a changed file is not mistaken for a rediscovered fact. A trimmed,
+non-empty command in a `run`, `run_succeeded`, or `run_failed` observation is a
+finding when it appears across at least two distinct sessions. The keys are
+`rediscovery:file:<path>` and `rediscovery:command:<command>`; counts and
+timestamps describe all qualifying observations. Session-hit, week-hit, and
+weekly-series queries use the same rules. The registry keeps `cluster.score` at
+zero for Phase 3's ranker.
+
 ## D-09@1: unread rule document
 
 D-09 emits one cluster for each live indexed rule document whose newest `last_read_by_agent` value

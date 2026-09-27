@@ -88,6 +88,7 @@ def seed_observation(
     days_ago: float = 1.0,
     kind: str = "run_failed",
     tool: str | None = None,
+    path: str | None = None,
     command: str | None = None,
     signature: str | None = None,
     sig_hash: str | None = None,
@@ -102,8 +103,8 @@ def seed_observation(
         stored_sig_hash = twill_app.h12(signature)
     connection.execute(
         "INSERT INTO observation(session_id, ts_utc, ts_local, kind, program, "
-        "command, tool, signature, sig_hash, excerpt) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+        "command, tool, path, signature, sig_hash, excerpt) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
         (
             session_id,
             observed_at.isoformat(),
@@ -114,6 +115,7 @@ def seed_observation(
                 f"{program} --flag" if program else None
             ),
             tool,
+            path,
             signature,
             stored_sig_hash,
             stored_excerpt,
@@ -1598,6 +1600,146 @@ class InterruptCorrectionDetectorTests(unittest.TestCase):
         )
 
 
+class RediscoveryDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def test_d07_finds_repeated_files_and_commands_with_their_own_thresholds(self):
+        for session_id, days_ago in (
+            ("file-a", 8),
+            ("file-a", 7),
+            ("file-b", 5),
+            ("file-c", 2),
+        ):
+            seed_observation(
+                self.connection,
+                session_id=session_id,
+                kind="file_read",
+                path=" /rules/rediscovery.md ",
+                days_ago=days_ago,
+            )
+        # Repeated reads in one session, and reads from two sessions on one
+        # date, do not meet the file's two-session/two-day bar.
+        seed_observation(
+            self.connection,
+            session_id="one-session",
+            kind="file_read",
+            path="/rules/one-session.md",
+            days_ago=3,
+        )
+        seed_observation(
+            self.connection,
+            session_id="one-session",
+            kind="file_read",
+            path="/rules/one-session.md",
+            days_ago=2,
+        )
+        for session_id in ("same-day-a", "same-day-b"):
+            seed_observation(
+                self.connection,
+                session_id=session_id,
+                kind="file_read",
+                path="/rules/same-day.md",
+                days_ago=4,
+            )
+
+        for session_id, days_ago in (
+            ("command-a", 6),
+            ("command-b", 3),
+            ("command-b", 2),
+            ("command-c", 1),
+        ):
+            seed_observation(
+                self.connection,
+                session_id=session_id,
+                kind="run_succeeded",
+                command="  rg -n rediscovery README.md  ",
+                days_ago=days_ago,
+            )
+        seed_observation(
+            self.connection,
+            session_id="command-one-session",
+            kind="run_succeeded",
+            command="git status --short",
+            days_ago=3,
+        )
+        seed_observation(
+            self.connection,
+            session_id="command-one-session",
+            kind="run_succeeded",
+            command="git status --short",
+            days_ago=1,
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.REDISCOVERY,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-07@1", "ok", 2)],
+        )
+        rows = cluster_rows(self.connection, "D-07")
+        self.assertEqual(
+            [row[1] for row in rows],
+            [
+                "rediscovery:command:rg -n rediscovery README.md",
+                "rediscovery:file:/rules/rediscovery.md",
+            ],
+        )
+        command = next(row for row in rows if row[1].startswith("rediscovery:command:"))
+        self.assertEqual(command[3:5], (3, 4))
+        file_read = next(row for row in rows if row[1].startswith("rediscovery:file:"))
+        self.assertEqual(file_read[3:5], (3, 4))
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT key, session_id FROM cluster_session "
+                "WHERE detector_id = 'D-07' ORDER BY key, session_id"
+            ).fetchall(),
+            [
+                ("rediscovery:command:rg -n rediscovery README.md", "command-a"),
+                ("rediscovery:command:rg -n rediscovery README.md", "command-b"),
+                ("rediscovery:command:rg -n rediscovery README.md", "command-c"),
+                ("rediscovery:file:/rules/rediscovery.md", "file-a"),
+                ("rediscovery:file:/rules/rediscovery.md", "file-b"),
+                ("rediscovery:file:/rules/rediscovery.md", "file-c"),
+            ],
+        )
+
+    def test_d07_suppresses_a_file_that_was_edited_in_the_window(self):
+        for session_id, days_ago in (("before-edit", 6), ("after-edit", 2)):
+            seed_observation(
+                self.connection,
+                session_id=session_id,
+                kind="file_read",
+                path="/rules/changed.md",
+                days_ago=days_ago,
+            )
+        seed_observation(
+            self.connection,
+            session_id="editor",
+            kind="file_edit",
+            path="/rules/changed.md",
+            days_ago=4,
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.REDISCOVERY,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(cluster_rows(self.connection, "D-07"), [])
+
+
 class UnreadRuleDocDetectorTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -1928,6 +2070,14 @@ class DetectCliTests(unittest.TestCase):
                         "error": None,
                     },
                     {
+                        "detector_id": "D-07",
+                        "version": 1,
+                        "full_id": "D-07@1",
+                        "status": "ok",
+                        "clusters": 0,
+                        "error": None,
+                    },
+                    {
                         "detector_id": "D-09",
                         "version": 1,
                         "full_id": "D-09@1",
@@ -1948,6 +2098,7 @@ class DetectCliTests(unittest.TestCase):
             self.assertIn("D-03@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-05@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-06@1: 0 cluster(s)", human.stdout)
+            self.assertIn("D-07@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-09@1: 0 cluster(s)", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):

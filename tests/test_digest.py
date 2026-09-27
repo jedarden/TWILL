@@ -425,7 +425,7 @@ class DigestCliTests(DigestStateCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("TWILL digest", result.stdout)
-        self.assertIn("new: 2", result.stdout)
+        self.assertIn("new: 3", result.stdout)
         self.assertIn(f" | $ twill digest --week {SUBJECT_LABEL} --stdout", result.stdout)
 
         machine = self.run_cli(
@@ -440,7 +440,7 @@ class DigestCliTests(DigestStateCase):
         payload = json.loads(machine.stdout)
         self.assertEqual(payload["data"]["week"], SUBJECT_LABEL)
         self.assertEqual(payload["data"]["previous_week"], PREVIOUS_LABEL)
-        self.assertEqual(len(payload["data"]["findings"]), 2)
+        self.assertEqual(len(payload["data"]["findings"]), 3)
 
         empty = self.run_cli(
             "digest",

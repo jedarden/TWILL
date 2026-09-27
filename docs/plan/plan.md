@@ -613,6 +613,15 @@ is ordered by sessions descending, latest `last_seen` descending, then key ascen
 week-hit, and weekly-series queries use the same pairing rule; persisted clusters retain `score = 0.0`
 for the Phase 3 ranker.
 
+**D-07@1 decision (2026-09-27):** D-07 emits two rediscovery cluster families. A trimmed non-empty
+`file_read.path` qualifies when it appears in at least two distinct sessions and two distinct UTC
+calendar dates in the active window; `file_edit`, `file_write`, and `file_changed` observations for
+that path suppress the file finding for the window. A trimmed non-empty command from `run`,
+`run_succeeded`, or `run_failed` qualifies when it appears in at least two distinct sessions. Keys are
+`rediscovery:file:<path>` and `rediscovery:command:<command>`; `sessions`, `events`, and the first/last
+timestamps cover the qualifying observations. Session-hit, week-hit, and weekly-series queries use
+the same membership rules, and persisted clusters retain `score = 0.0` for the Phase 3 ranker.
+
 **D-09@1 decision (2026-09-24):** D-09 emits one cluster for each live indexed rule document whose
 newest `last_read_by_agent` value for its content hash is missing or earlier than the trailing-window
 start and which has no matching `file_read` observation in the window. Reading either copy of identical

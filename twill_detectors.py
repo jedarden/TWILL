@@ -961,6 +961,263 @@ INTERRUPT_CORRECTION = Detector(
 )
 
 
+REDISCOVERY_SQL = """
+    WITH file_reads AS (
+        SELECT trim(o.path) AS path,
+               o.session_id,
+               o.ts_utc,
+               date(o.ts_utc) AS read_day
+        FROM observation AS o
+        WHERE o.ts_utc >= :window_start_utc
+          AND o.kind = 'file_read'
+          AND o.path IS NOT NULL
+          AND trim(o.path) <> ''
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observation AS edit
+              WHERE edit.ts_utc >= :window_start_utc
+                AND edit.path IS NOT NULL
+                AND trim(edit.path) = trim(o.path)
+                AND edit.kind IN ('file_edit', 'file_write', 'file_changed')
+          )
+    ),
+    qualifying_files AS (
+        SELECT path
+        FROM file_reads
+        GROUP BY path
+        HAVING count(DISTINCT session_id) >= 2
+           AND count(DISTINCT read_day) >= 2
+    ),
+    exploratory_commands AS (
+        SELECT trim(o.command) AS command,
+               o.session_id,
+               o.ts_utc
+        FROM observation AS o
+        WHERE o.ts_utc >= :window_start_utc
+          AND o.kind IN ('run', 'run_succeeded', 'run_failed')
+          AND o.command IS NOT NULL
+          AND trim(o.command) <> ''
+    ),
+    qualifying_commands AS (
+        SELECT command
+        FROM exploratory_commands
+        GROUP BY command
+        HAVING count(DISTINCT session_id) >= 2
+    ),
+    findings AS (
+        SELECT 'rediscovery:file:' || f.path AS key,
+               count(DISTINCT f.session_id) AS sessions,
+               count(*) AS events,
+               min(f.ts_utc) AS first_seen,
+               max(f.ts_utc) AS last_seen
+        FROM file_reads AS f
+        JOIN qualifying_files AS q USING (path)
+        GROUP BY f.path
+        UNION ALL
+        SELECT 'rediscovery:command:' || c.command AS key,
+               count(DISTINCT c.session_id) AS sessions,
+               count(*) AS events,
+               min(c.ts_utc) AS first_seen,
+               max(c.ts_utc) AS last_seen
+        FROM exploratory_commands AS c
+        JOIN qualifying_commands AS q USING (command)
+        GROUP BY c.command
+    )
+    SELECT key, sessions, events, first_seen, last_seen
+    FROM findings
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+REDISCOVERY_HIT_SQL = """
+    WITH file_reads AS (
+        SELECT trim(o.path) AS path,
+               o.session_id,
+               date(o.ts_utc) AS read_day
+        FROM observation AS o
+        WHERE o.ts_utc >= :window_start_utc
+          AND o.kind = 'file_read'
+          AND o.path IS NOT NULL
+          AND trim(o.path) <> ''
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observation AS edit
+              WHERE edit.ts_utc >= :window_start_utc
+                AND edit.path IS NOT NULL
+                AND trim(edit.path) = trim(o.path)
+                AND edit.kind IN ('file_edit', 'file_write', 'file_changed')
+          )
+    ),
+    qualifying_files AS (
+        SELECT path
+        FROM file_reads
+        GROUP BY path
+        HAVING count(DISTINCT file_reads.session_id) >= 2
+           AND count(DISTINCT file_reads.read_day) >= 2
+    ),
+    exploratory_commands AS (
+        SELECT trim(o.command) AS command, o.session_id
+        FROM observation AS o
+        WHERE o.ts_utc >= :window_start_utc
+          AND o.kind IN ('run', 'run_succeeded', 'run_failed')
+          AND o.command IS NOT NULL
+          AND trim(o.command) <> ''
+    ),
+    qualifying_commands AS (
+        SELECT command
+        FROM exploratory_commands
+        GROUP BY command
+        HAVING count(DISTINCT session_id) >= 2
+    )
+    SELECT 'rediscovery:file:' || path AS key, session_id
+    FROM file_reads
+    WHERE path IN (SELECT path FROM qualifying_files)
+    GROUP BY path, session_id
+    UNION ALL
+    SELECT 'rediscovery:command:' || command AS key, session_id
+    FROM exploratory_commands
+    WHERE command IN (SELECT command FROM qualifying_commands)
+    GROUP BY command, session_id
+    ORDER BY key ASC, session_id ASC
+"""
+
+REDISCOVERY_WEEK_HIT_SQL = """
+    WITH file_reads AS (
+        SELECT trim(o.path) AS path,
+               o.session_id,
+               o.ts_utc,
+               date(o.ts_utc) AS read_day
+        FROM observation AS o
+        WHERE o.ts_utc >= :window_start_utc
+          AND o.kind = 'file_read'
+          AND o.path IS NOT NULL
+          AND trim(o.path) <> ''
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observation AS edit
+              WHERE edit.ts_utc >= :window_start_utc
+                AND edit.path IS NOT NULL
+                AND trim(edit.path) = trim(o.path)
+                AND edit.kind IN ('file_edit', 'file_write', 'file_changed')
+          )
+    ),
+    qualifying_files AS (
+        SELECT path
+        FROM file_reads
+        GROUP BY path
+        HAVING count(DISTINCT session_id) >= 2
+           AND count(DISTINCT read_day) >= 2
+    ),
+    exploratory_commands AS (
+        SELECT trim(o.command) AS command,
+               o.session_id,
+               o.ts_utc
+        FROM observation AS o
+        WHERE o.ts_utc >= :window_start_utc
+          AND o.kind IN ('run', 'run_succeeded', 'run_failed')
+          AND o.command IS NOT NULL
+          AND trim(o.command) <> ''
+    ),
+    qualifying_commands AS (
+        SELECT command
+        FROM exploratory_commands
+        GROUP BY command
+        HAVING count(DISTINCT session_id) >= 2
+    ),
+    hits AS (
+        SELECT 'rediscovery:file:' || f.path AS key,
+               strftime('%G-W%V', f.ts_utc) AS week
+        FROM file_reads AS f
+        JOIN qualifying_files AS q USING (path)
+        UNION ALL
+        SELECT 'rediscovery:command:' || c.command AS key,
+               strftime('%G-W%V', c.ts_utc) AS week
+        FROM exploratory_commands AS c
+        JOIN qualifying_commands AS q USING (command)
+    )
+    SELECT key, week
+    FROM hits
+    GROUP BY key, week
+    ORDER BY key ASC, week ASC
+"""
+
+REDISCOVERY_WEEKLY_HIT_SQL = """
+    WITH file_reads AS (
+        SELECT trim(o.path) AS path,
+               o.session_id,
+               o.ts_utc
+        FROM observation AS o
+        WHERE o.ts_utc >= :window_start_utc
+          AND o.ts_utc < :window_end_utc
+          AND o.kind = 'file_read'
+          AND o.path IS NOT NULL
+          AND trim(o.path) <> ''
+          AND NOT EXISTS (
+              SELECT 1
+              FROM observation AS edit
+              WHERE edit.ts_utc >= :window_start_utc
+                AND edit.ts_utc < :window_end_utc
+                AND edit.path IS NOT NULL
+                AND trim(edit.path) = trim(o.path)
+                AND edit.kind IN ('file_edit', 'file_write', 'file_changed')
+          )
+    ),
+    qualifying_files AS (
+        SELECT path
+        FROM file_reads
+        GROUP BY path
+        HAVING count(DISTINCT session_id) >= 2
+           AND count(DISTINCT date(ts_utc)) >= 2
+    ),
+    exploratory_commands AS (
+        SELECT trim(o.command) AS command,
+               o.session_id,
+               o.ts_utc
+        FROM observation AS o
+        WHERE o.ts_utc >= :window_start_utc
+          AND o.ts_utc < :window_end_utc
+          AND o.kind IN ('run', 'run_succeeded', 'run_failed')
+          AND o.command IS NOT NULL
+          AND trim(o.command) <> ''
+    ),
+    qualifying_commands AS (
+        SELECT command
+        FROM exploratory_commands
+        GROUP BY command
+        HAVING count(DISTINCT session_id) >= 2
+    ),
+    hits AS (
+        SELECT 'rediscovery:file:' || f.path AS key,
+               strftime('%G-W%V', f.ts_utc) AS week,
+               f.session_id
+        FROM file_reads AS f
+        JOIN qualifying_files AS q USING (path)
+        UNION ALL
+        SELECT 'rediscovery:command:' || c.command AS key,
+               strftime('%G-W%V', c.ts_utc) AS week,
+               c.session_id
+        FROM exploratory_commands AS c
+        JOIN qualifying_commands AS q USING (command)
+    )
+    SELECT key,
+           week,
+           count(DISTINCT session_id) AS sessions,
+           count(*) AS events
+    FROM hits
+    GROUP BY key, week
+    ORDER BY key ASC, week ASC
+"""
+
+REDISCOVERY = Detector(
+    "D-07",
+    1,
+    "facts rediscovered through repeated unchanged file reads or exploratory commands",
+    REDISCOVERY_SQL,
+    session_hits_sql=REDISCOVERY_HIT_SQL,
+    week_hits_sql=REDISCOVERY_WEEK_HIT_SQL,
+    weekly_hits_sql=REDISCOVERY_WEEKLY_HIT_SQL,
+)
+
+
 UNREAD_RULE_DOC_SQL = """
     WITH read_state AS (
         SELECT sha, max(last_read_by_agent) AS last_read
@@ -1006,6 +1263,7 @@ REGISTRY: tuple[Detector, ...] = build_registry(
     RETRY_LOOP,
     REJECTED_TOOL_CALL,
     INTERRUPT_CORRECTION,
+    REDISCOVERY,
     UNREAD_RULE_DOC,
 )
 
