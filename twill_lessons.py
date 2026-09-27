@@ -739,6 +739,60 @@ def save_lesson(record: LessonRecord) -> Path:
     return record.path
 
 
+def attach_guard(
+    artifacts_root_or_path: Path,
+    lesson_id: str | None = None,
+    *,
+    layer: str,
+    artifact: object,
+    installed: bool = False,
+    operator: bool = True,
+    repo_root: Path | None = None,
+) -> LessonRecord:
+    """Record the external guard artifact emitted for an applied lesson.
+
+    The file is deliberately not marked installed: generating a proposal and
+    installing it are separate human actions.  This metadata update is itself
+    an explicit operator operation, so a background explain pass cannot make a
+    lesson appear enacted merely by producing a draft.
+    """
+
+    if not isinstance(operator, bool) or not operator:
+        raise _error(
+            "refusing to attach a guard without an explicit operator command",
+            "run the apply command with --emit-guard after reviewing the lesson",
+        )
+    if lesson_id is None:
+        path = Path(artifacts_root_or_path).expanduser()
+        record = load_lesson(path, repo_root=repo_root)
+    else:
+        record = load_lesson(artifacts_root_or_path, lesson_id, repo_root=repo_root)
+    validated_layer = _validate_layer(layer)
+    if record.layer != validated_layer:
+        raise _error(
+            f"lesson {record.id} is not applied at the {validated_layer} layer",
+            "emit a guard only for the layer recorded by the applied lesson",
+        )
+    safe_artifact = _operator_token(artifact, "guard.artifact")
+    expected = f"guards/{record.id}.hook.json"
+    if safe_artifact != expected:
+        raise _error(
+            f"guard.artifact must be {expected}",
+            "guard artifacts are named from the lesson id and always live under guards/",
+        )
+    if not isinstance(installed, bool):
+        raise _error("guard.installed must be boolean")
+    updates = {
+        "guard": {
+            "layer": validated_layer,
+            "artifact": safe_artifact,
+            "installed": installed,
+        }
+    }
+    _write_atomic(record.path, _replace_fields(record, updates))
+    return load_lesson(record.path, repo_root=repo_root)
+
+
 def _operator_token(value: object, field: str) -> str:
     if not isinstance(value, str) or not value.strip():
         raise _error(f"{field} must be a non-empty string")
@@ -1029,6 +1083,7 @@ __all__ = [
     "TERMINAL_STATES",
     "VALID_STATES",
     "accept_lesson",
+    "attach_guard",
     "apply_lesson",
     "escalate_lesson",
     "lesson_path",

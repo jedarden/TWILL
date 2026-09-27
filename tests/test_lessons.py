@@ -19,8 +19,10 @@ from twill_explainer import (  # noqa: E402
     PromptExcerpt,
     write_lesson_files,
 )  # noqa: E402
+import twill_guards  # noqa: E402
 from twill_lessons import (  # noqa: E402
     accept_lesson,
+    attach_guard,
     apply_lesson,
     escalate_lesson,
     list_lessons,
@@ -256,6 +258,42 @@ class LessonLifecycleTests(unittest.TestCase):
         self.assertNotIn(token, path.read_text())
         self.assertIn("<redacted:github-token>", path.read_text())
 
+    def test_hook_guard_is_external_literal_matcher_and_stays_uninstalled(self):
+        path = self.write_draft("hook-denied:kubectl delete")
+        lesson_id = path.stem
+        accept_lesson(self.artifacts, lesson_id)
+        applied = apply_lesson(
+            self.artifacts,
+            lesson_id,
+            layer="hook",
+            bead="twill-hook",
+            applied_at="2026-09-27T00:00:00Z",
+        )
+
+        artifact = twill_guards.write_hook_guard(self.artifacts, applied)
+        payload = json.loads(artifact.read_text())
+
+        self.assertEqual(artifact, self.artifacts / "guards" / f"{lesson_id}.hook.json")
+        self.assertEqual(payload["schema"], "twill-guard/v1")
+        self.assertEqual(payload["hook"]["matcher"], "Write|Edit|MultiEdit|Bash")
+        self.assertEqual(payload["rule"]["regex"], r"hook\-denied:kubectl\ delete")
+        self.assertEqual(payload["install"]["human_only"], True)
+        self.assertFalse(load_lesson(path).guard["installed"])
+
+        recorded = attach_guard(
+            self.artifacts,
+            lesson_id,
+            layer="hook",
+            artifact=f"guards/{lesson_id}.hook.json",
+        )
+        self.assertEqual(recorded.guard["artifact"], f"guards/{lesson_id}.hook.json")
+        self.assertFalse(recorded.guard["installed"])
+
+    def test_hook_guard_rejects_other_layers(self):
+        path = self.write_draft()
+        with self.assertRaises(ValidationError):
+            twill_guards.render_hook_guard(load_lesson(path), target_layer="environment")
+
 
 class LessonCliTests(unittest.TestCase):
     @classmethod
@@ -375,6 +413,61 @@ class LessonCliTests(unittest.TestCase):
             unapplied_data = json.loads(unapplied.stdout)["data"]["lesson"]
             self.assertEqual(unapplied_data["state"], "accepted")
             self.assertIsNone(unapplied_data["routing"]["applied"])
+
+    def test_apply_emit_guard_writes_external_hook_artifact(self):
+        artifacts = Path(self.temporary.name) / "artifacts"
+        path = write_lesson_files(
+            (
+                LessonDraft(
+                    "D-01:hook-denied:cli",
+                    "The hook matcher should stop this recurring command before execution. "
+                    "Use the reviewed alternative instead.",
+                ),
+            ),
+            (
+                PromptCluster(
+                    RankedCluster(
+                        "D-01",
+                        "hook-denied:cli",
+                        30,
+                        3,
+                        7,
+                        "2026-09-01T00:00:00+00:00",
+                        "2026-09-24T00:00:00+00:00",
+                        1.0,
+                        None,
+                        "open",
+                    ),
+                    (PromptExcerpt(1, "session-hook-cli", "safe evidence"),),
+                ),
+            ),
+            TwillConfig(artifacts_root=artifacts),
+        )[0]
+        lesson_id = path.stem
+        state = Path(self.temporary.name) / "state-hook"
+        accepted = self.run_cli("accept", lesson_id, "--state-dir", str(state), "--json")
+        self.assertEqual(accepted.returncode, 0, accepted.stderr)
+        applied = self.run_cli(
+            "apply",
+            lesson_id,
+            "--layer",
+            "hook",
+            "--bead",
+            "twill-hook-cli",
+            "--emit-guard",
+            "--state-dir",
+            str(state),
+            "--json",
+        )
+
+        self.assertEqual(applied.returncode, 0, applied.stderr)
+        data = json.loads(applied.stdout)["data"]
+        self.assertEqual(data["lesson"]["guard"]["artifact"], f"guards/{lesson_id}.hook.json")
+        self.assertFalse(data["lesson"]["guard"]["installed"])
+        self.assertEqual(
+            json.loads((artifacts / "guards" / f"{lesson_id}.hook.json").read_text())["lesson_id"],
+            lesson_id,
+        )
 
 
 if __name__ == "__main__":

@@ -30,6 +30,7 @@ import twill_detectors
 import twill_brief
 import twill_digest
 import twill_explainer
+import twill_guards
 import twill_lessons
 import twill_measure
 import twill_prune
@@ -2186,10 +2187,13 @@ def _lesson_data(
     record: twill_lessons.LessonRecord,
     *,
     bead_command: str | None = None,
+    guard_artifact: Path | None = None,
 ) -> dict[str, object]:
     data: dict[str, object] = {"lesson": record.as_dict()}
     if bead_command is not None:
         data["bead_create_command"] = bead_command
+    if guard_artifact is not None:
+        data["guard_artifact"] = str(guard_artifact)
     return data
 
 
@@ -2224,24 +2228,46 @@ def apply_command(args: argparse.Namespace) -> int:
             "--bead is required when recording an applied lesson",
             "record the bead that owns the fix before applying the lesson",
         )
+    if args.emit_guard and args.layer != "hook":
+        raise UsageError(
+            "--emit-guard is currently supported only for --layer hook",
+            "use --layer hook or omit --emit-guard",
+        )
+    artifacts_root = config.require_artifacts_root()
     record = twill_lessons.apply_lesson(
-        config.require_artifacts_root(),
+        artifacts_root,
         args.lesson_id,
         layer=args.layer,
         bead=args.bead,
         operator=True,
     )
+    guard_artifact: Path | None = None
+    if args.emit_guard:
+        guard_artifact = twill_guards.write_hook_guard(artifacts_root, record)
+        record = twill_lessons.attach_guard(
+            artifacts_root,
+            record.id,
+            layer="hook",
+            artifact=f"guards/{guard_artifact.name}",
+            operator=True,
+        )
     bead_command = twill_router.bead_create_command(
         title=record.summary,
         body=record.body,
         detector=record.detector,
     )
     emit_success(
-        _lesson_data(record, bead_command=bead_command),
+        _lesson_data(
+            record,
+            bead_command=bead_command,
+            guard_artifact=guard_artifact,
+        ),
         json_mode=args.json,
     )
     if not args.json:
         _print_lesson(record, "applied")
+        if guard_artifact is not None:
+            print(f"guard artifact: {guard_artifact}")
         print(bead_command)
     return EXIT_SUCCESS
 
@@ -2632,6 +2658,11 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("lesson_id", metavar="ID")
     apply.add_argument("--layer", required=True)
     apply.add_argument("--bead")
+    apply.add_argument(
+        "--emit-guard",
+        action="store_true",
+        help="write the human-installable hook matcher under artifacts_root",
+    )
     apply.add_argument("--state-dir")
     apply.add_argument("--json", action="store_true")
     apply.set_defaults(handler=apply_command)
