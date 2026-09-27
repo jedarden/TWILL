@@ -152,6 +152,19 @@ same pairing rule. Output is ordered by sessions descending, latest
 `last_seen` descending, then key ascending; the registry keeps `cluster.score`
 at zero for Phase 3's ranker.
 
+## D-06@1: interrupt then correction
+
+D-06 pairs each `interrupt` observation with the immediately following
+`user_turn_after_correction` observation in the same session. The pair is discarded when the
+correction excerpt is empty or when any other observation intervenes; adjacency uses `obs_id`, the
+raw transcript-derived order, rather than timestamps. The key is
+`interrupt:<redacted correction>`, bounded to 240 characters by the detector runner.
+`sessions` counts distinct sessions, `events` counts interrupt/correction pairs, and
+`first_seen`/`last_seen` use the interrupt timestamp. There is no recurrence threshold: a correction
+is itself a high-signal finding. Session-hit, week-hit, and weekly-series queries use the same pairing
+rule. Output is ordered by sessions descending, latest `last_seen` descending, then key ascending;
+the registry keeps `cluster.score` at zero for Phase 3's ranker.
+
 ## D-09@1: unread rule document
 
 D-09 emits one cluster for each live indexed rule document whose newest `last_read_by_agent` value

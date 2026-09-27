@@ -1441,6 +1441,163 @@ class RejectedToolCallDetectorTests(unittest.TestCase):
         )
 
 
+class InterruptCorrectionDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def seed_pair(
+        self,
+        *,
+        session_id: str,
+        correction: str | None,
+        days_ago: float = 1.0,
+    ) -> None:
+        seed_observation(
+            self.connection,
+            session_id=session_id,
+            kind="interrupt",
+            excerpt="[Request interrupted by user]",
+            days_ago=days_ago,
+        )
+        seed_observation(
+            self.connection,
+            session_id=session_id,
+            kind="user_turn_after_correction",
+            excerpt=correction,
+            days_ago=days_ago - 0.01,
+        )
+
+    def test_d06_pairs_adjacent_interrupts_with_the_next_correction(self):
+        self.seed_pair(
+            session_id="session-a",
+            correction="don't deploy, run the dry-run first",
+            days_ago=5,
+        )
+        self.seed_pair(
+            session_id="session-b",
+            correction="don't deploy, run the dry-run first",
+            days_ago=4,
+        )
+        self.seed_pair(
+            session_id="session-c",
+            correction="use the scratch directory instead",
+            days_ago=2,
+        )
+
+        # An empty correction and a correction separated by another
+        # observation are not interrupt-then-correction findings.
+        self.seed_pair(
+            session_id="ignored-empty-correction",
+            correction=" ",
+            days_ago=1,
+        )
+        seed_observation(
+            self.connection,
+            session_id="ignored-intervening-event",
+            kind="interrupt",
+            excerpt="[Request interrupted by user]",
+            days_ago=3,
+        )
+        seed_observation(
+            self.connection,
+            session_id="ignored-intervening-event",
+            kind="tool_error",
+            tool="Bash",
+            excerpt="the tool failed",
+            days_ago=2.99,
+        )
+        seed_observation(
+            self.connection,
+            session_id="ignored-intervening-event",
+            kind="user_turn_after_correction",
+            excerpt="this is a new instruction",
+            days_ago=2.98,
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.INTERRUPT_CORRECTION,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-06@1", "ok", 2)],
+        )
+        rows = cluster_rows(self.connection, "D-06")
+        self.assertEqual(
+            [row[1] for row in rows],
+            [
+                "interrupt:don't deploy, run the dry-run first",
+                "interrupt:use the scratch directory instead",
+            ],
+        )
+        self.assertEqual([(row[3], row[4]) for row in rows], [(2, 2), (1, 1)])
+        self.assertEqual(rows[0][7], 0.0)
+        self.assertEqual(rows[0][9], "open")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT key, session_id FROM cluster_session "
+                "WHERE detector_id = 'D-06' ORDER BY key, session_id"
+            ).fetchall(),
+            [
+                ("interrupt:don't deploy, run the dry-run first", "session-a"),
+                ("interrupt:don't deploy, run the dry-run first", "session-b"),
+                ("interrupt:use the scratch directory instead", "session-c"),
+            ],
+        )
+
+    def test_d06_uses_interrupt_order_and_window_for_pairing(self):
+        self.seed_pair(
+            session_id="in-window",
+            correction="dry run",
+            days_ago=2,
+        )
+        self.seed_pair(
+            session_id="old-interrupt",
+            correction="old correction",
+            days_ago=31,
+        )
+        self.seed_pair(
+            session_id="raw-order-wins",
+            correction="ordered by transcript",
+            days_ago=2,
+        )
+        self.connection.execute(
+            "UPDATE observation SET ts_utc = ?, ts_local = ? "
+            "WHERE session_id = ? AND kind = 'user_turn_after_correction'",
+            (
+                (datetime.now(timezone.utc) - timedelta(days=10)).isoformat(),
+                (datetime.now(timezone.utc) - timedelta(days=10)).isoformat(),
+                "raw-order-wins",
+            ),
+        )
+        self.connection.commit()
+
+        rows = self.connection.execute(
+            twill_detectors.INTERRUPT_CORRECTION_SQL,
+            {
+                "window_start_utc": (
+                    datetime.now(timezone.utc) - timedelta(days=30)
+                ).isoformat(),
+                "window_days": 30,
+            },
+        ).fetchall()
+
+        self.assertEqual(
+            {(row[0], row[1], row[2]) for row in rows},
+            {
+                ("interrupt:dry run", 1, 1),
+                ("interrupt:ordered by transcript", 1, 1),
+            },
+        )
+
+
 class UnreadRuleDocDetectorTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -1763,6 +1920,14 @@ class DetectCliTests(unittest.TestCase):
                         "error": None,
                     },
                     {
+                        "detector_id": "D-06",
+                        "version": 1,
+                        "full_id": "D-06@1",
+                        "status": "ok",
+                        "clusters": 0,
+                        "error": None,
+                    },
+                    {
                         "detector_id": "D-09",
                         "version": 1,
                         "full_id": "D-09@1",
@@ -1782,6 +1947,7 @@ class DetectCliTests(unittest.TestCase):
             self.assertIn("D-02@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-03@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-05@1: 0 cluster(s)", human.stdout)
+            self.assertIn("D-06@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-09@1: 0 cluster(s)", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):

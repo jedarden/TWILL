@@ -818,6 +818,149 @@ REJECTED_TOOL_CALL = Detector(
 )
 
 
+INTERRUPT_CORRECTION_SQL = """
+    WITH paired AS (
+        SELECT i.obs_id AS interrupt_id,
+               i.session_id,
+               i.ts_utc AS interrupted_at,
+               trim(c.excerpt) AS correction
+        FROM observation AS i
+        JOIN observation AS c
+          ON c.session_id = i.session_id
+         AND c.kind = 'user_turn_after_correction'
+         AND c.ts_utc >= :window_start_utc
+         AND c.obs_id > i.obs_id
+         AND NOT EXISTS (
+             SELECT 1
+             FROM observation AS between_events
+             WHERE between_events.session_id = i.session_id
+               AND between_events.obs_id > i.obs_id
+               AND between_events.obs_id < c.obs_id
+         )
+        WHERE i.ts_utc >= :window_start_utc
+          AND i.kind = 'interrupt'
+          AND c.excerpt IS NOT NULL
+          AND trim(c.excerpt) <> ''
+    )
+    SELECT substr('interrupt:' || correction, 1, 240) AS key,
+           count(DISTINCT session_id) AS sessions,
+           count(*) AS events,
+           min(interrupted_at) AS first_seen,
+           max(interrupted_at) AS last_seen
+    FROM paired
+    GROUP BY substr('interrupt:' || correction, 1, 240)
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+INTERRUPT_CORRECTION_HIT_SQL = """
+    WITH paired AS (
+        SELECT i.obs_id AS interrupt_id,
+               i.session_id,
+               trim(c.excerpt) AS correction
+        FROM observation AS i
+        JOIN observation AS c
+          ON c.session_id = i.session_id
+         AND c.kind = 'user_turn_after_correction'
+         AND c.ts_utc >= :window_start_utc
+         AND c.obs_id > i.obs_id
+         AND NOT EXISTS (
+             SELECT 1
+             FROM observation AS between_events
+             WHERE between_events.session_id = i.session_id
+               AND between_events.obs_id > i.obs_id
+               AND between_events.obs_id < c.obs_id
+         )
+        WHERE i.ts_utc >= :window_start_utc
+          AND i.kind = 'interrupt'
+          AND c.excerpt IS NOT NULL
+          AND trim(c.excerpt) <> ''
+    )
+    SELECT substr('interrupt:' || correction, 1, 240) AS key,
+           session_id
+    FROM paired
+    GROUP BY substr('interrupt:' || correction, 1, 240), session_id
+    ORDER BY key ASC, session_id ASC
+"""
+
+INTERRUPT_CORRECTION_WEEK_HIT_SQL = """
+    WITH paired AS (
+        SELECT i.obs_id AS interrupt_id,
+               i.session_id,
+               i.ts_utc AS interrupted_at,
+               trim(c.excerpt) AS correction
+        FROM observation AS i
+        JOIN observation AS c
+          ON c.session_id = i.session_id
+         AND c.kind = 'user_turn_after_correction'
+         AND c.ts_utc >= :window_start_utc
+         AND c.obs_id > i.obs_id
+         AND NOT EXISTS (
+             SELECT 1
+             FROM observation AS between_events
+             WHERE between_events.session_id = i.session_id
+               AND between_events.obs_id > i.obs_id
+               AND between_events.obs_id < c.obs_id
+         )
+        WHERE i.ts_utc >= :window_start_utc
+          AND i.kind = 'interrupt'
+          AND c.excerpt IS NOT NULL
+          AND trim(c.excerpt) <> ''
+    )
+    SELECT substr('interrupt:' || correction, 1, 240) AS key,
+           strftime('%G-W%V', interrupted_at) AS week
+    FROM paired
+    GROUP BY substr('interrupt:' || correction, 1, 240),
+             strftime('%G-W%V', interrupted_at)
+    ORDER BY key ASC, week ASC
+"""
+
+INTERRUPT_CORRECTION_WEEKLY_HIT_SQL = """
+    WITH paired AS (
+        SELECT i.obs_id AS interrupt_id,
+               i.session_id,
+               i.ts_utc AS interrupted_at,
+               trim(c.excerpt) AS correction
+        FROM observation AS i
+        JOIN observation AS c
+          ON c.session_id = i.session_id
+         AND c.kind = 'user_turn_after_correction'
+         AND c.ts_utc >= :window_start_utc
+         AND c.ts_utc < :window_end_utc
+         AND c.obs_id > i.obs_id
+         AND NOT EXISTS (
+             SELECT 1
+             FROM observation AS between_events
+             WHERE between_events.session_id = i.session_id
+               AND between_events.obs_id > i.obs_id
+               AND between_events.obs_id < c.obs_id
+         )
+        WHERE i.ts_utc >= :window_start_utc
+          AND i.ts_utc < :window_end_utc
+          AND i.kind = 'interrupt'
+          AND c.excerpt IS NOT NULL
+          AND trim(c.excerpt) <> ''
+    )
+    SELECT substr('interrupt:' || correction, 1, 240) AS key,
+           strftime('%G-W%V', interrupted_at) AS week,
+           count(DISTINCT session_id) AS sessions,
+           count(*) AS events
+    FROM paired
+    GROUP BY substr('interrupt:' || correction, 1, 240),
+             strftime('%G-W%V', interrupted_at)
+    ORDER BY key ASC, week ASC
+"""
+
+INTERRUPT_CORRECTION = Detector(
+    "D-06",
+    1,
+    "tool-call interrupts immediately followed by a corrective user turn",
+    INTERRUPT_CORRECTION_SQL,
+    session_hits_sql=INTERRUPT_CORRECTION_HIT_SQL,
+    week_hits_sql=INTERRUPT_CORRECTION_WEEK_HIT_SQL,
+    weekly_hits_sql=INTERRUPT_CORRECTION_WEEKLY_HIT_SQL,
+)
+
+
 UNREAD_RULE_DOC_SQL = """
     WITH read_state AS (
         SELECT sha, max(last_read_by_agent) AS last_read
@@ -862,6 +1005,7 @@ REGISTRY: tuple[Detector, ...] = build_registry(
     RECURRING_ERROR_SIGNATURE,
     RETRY_LOOP,
     REJECTED_TOOL_CALL,
+    INTERRUPT_CORRECTION,
     UNREAD_RULE_DOC,
 )
 
