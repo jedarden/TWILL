@@ -29,6 +29,12 @@ VALID_STATES = frozenset(
     LESSON_STATES | {f"applied:{layer}" for layer in ROUTING_LAYERS}
 )
 MAX_FIELD_LENGTH = 240
+_GUARD_ARTIFACT_SUFFIXES = {
+    "hook": (".hook.json", ".gate.txt"),
+    "wrapper": (".wrapper.sh",),
+    "agents_md": (".agents.md",),
+    "memory": (".memory.md",),
+}
 _REQUIRED_TOP_LEVEL = frozenset(
     {"id", "summary", "state", "detector", "key", "evidence", "routing", "backtest"}
 )
@@ -774,10 +780,11 @@ def attach_guard(
             "emit a guard only for the layer recorded by the applied lesson",
         )
     safe_artifact = _operator_token(artifact, "guard.artifact")
-    expected = f"guards/{record.id}.hook.json"
-    if safe_artifact != expected:
+    suffixes = _GUARD_ARTIFACT_SUFFIXES.get(validated_layer, ())
+    expected = tuple(f"guards/{record.id}{suffix}" for suffix in suffixes)
+    if safe_artifact not in expected:
         raise _error(
-            f"guard.artifact must be {expected}",
+            f"guard.artifact must be one of: {', '.join(expected)}",
             "guard artifacts are named from the lesson id and always live under guards/",
         )
     if not isinstance(installed, bool):

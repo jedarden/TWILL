@@ -294,6 +294,56 @@ class LessonLifecycleTests(unittest.TestCase):
         with self.assertRaises(ValidationError):
             twill_guards.render_hook_guard(load_lesson(path), target_layer="environment")
 
+    def test_per_layer_guard_templates_are_human_installable(self):
+        cases = (
+            ("wrapper", "wrapper", twill_guards.WRAPPER_SUFFIX),
+            ("gate", "hook", twill_guards.GATE_SUFFIX),
+            ("agents_md", "agents_md", twill_guards.AGENTS_MD_SUFFIX),
+            ("memory", "memory", twill_guards.MEMORY_SUFFIX),
+        )
+        for template, layer, suffix in cases:
+            with self.subTest(template=template):
+                path = self.write_draft(f"template:{template}")
+                lesson_id = path.stem
+                accept_lesson(self.artifacts, lesson_id)
+                applied = apply_lesson(
+                    self.artifacts,
+                    lesson_id,
+                    layer=layer,
+                    bead=f"twill-{template}",
+                    applied_at="2026-09-27T00:00:00Z",
+                )
+
+                artifact = twill_guards.write_guard(
+                    self.artifacts,
+                    applied,
+                    target_layer=template,
+                )
+                self.assertEqual(artifact.name, f"{lesson_id}{suffix}")
+                self.assertEqual(artifact.stat().st_mode & 0o777, 0o600)
+                rendered = artifact.read_text()
+                self.assertIn(lesson_id, rendered)
+                self.assertIn("D-01", rendered)
+                self.assertIn("template:", rendered)
+                if template == "wrapper":
+                    self.assertTrue(rendered.startswith("#!/bin/sh\n"))
+                elif template == "gate":
+                    self.assertTrue(rendered.startswith("- [ ] TWILL guard"))
+                elif template == "agents_md":
+                    self.assertIn("AGENTS.md", rendered)
+                else:
+                    self.assertTrue(rendered.startswith("---\n"))
+                    self.assertIn('summary: "A command fails repeatedly.', rendered)
+
+                recorded = attach_guard(
+                    self.artifacts,
+                    lesson_id,
+                    layer=layer,
+                    artifact=f"guards/{artifact.name}",
+                )
+                self.assertEqual(recorded.guard["artifact"], f"guards/{artifact.name}")
+                self.assertFalse(recorded.guard["installed"])
+
 
 class LessonCliTests(unittest.TestCase):
     @classmethod

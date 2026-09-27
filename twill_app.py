@@ -2228,11 +2228,26 @@ def apply_command(args: argparse.Namespace) -> int:
             "--bead is required when recording an applied lesson",
             "record the bead that owns the fix before applying the lesson",
         )
-    if args.emit_guard and args.layer != "hook":
-        raise UsageError(
-            "--emit-guard is currently supported only for --layer hook",
-            "use --layer hook or omit --emit-guard",
-        )
+    template_layer = (
+        (args.guard_template or args.layer) if args.emit_guard else None
+    )
+    if template_layer is not None:
+        if template_layer not in twill_guards.TEMPLATE_LAYERS:
+            raise UsageError(
+                f"--emit-guard has no template for the {args.layer} layer",
+                "use --emit-guard with hook, wrapper, agents_md, or memory",
+            )
+        if template_layer == "gate":
+            if args.layer != "hook":
+                raise UsageError(
+                    "the gate template requires --layer hook",
+                    "hook and gate are the same routing strength",
+                )
+        elif template_layer != args.layer:
+            raise UsageError(
+                f"the {template_layer} template requires --layer {template_layer}",
+                "choose a template matching the applied routing layer",
+            )
     artifacts_root = config.require_artifacts_root()
     record = twill_lessons.apply_lesson(
         artifacts_root,
@@ -2243,11 +2258,16 @@ def apply_command(args: argparse.Namespace) -> int:
     )
     guard_artifact: Path | None = None
     if args.emit_guard:
-        guard_artifact = twill_guards.write_hook_guard(artifacts_root, record)
+        assert template_layer is not None
+        guard_artifact = twill_guards.write_guard(
+            artifacts_root,
+            record,
+            target_layer=template_layer,
+        )
         record = twill_lessons.attach_guard(
             artifacts_root,
             record.id,
-            layer="hook",
+            layer=args.layer,
             artifact=f"guards/{guard_artifact.name}",
             operator=True,
         )
@@ -2661,7 +2681,15 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument(
         "--emit-guard",
         action="store_true",
-        help="write the human-installable hook matcher under artifacts_root",
+        help="write the human-installable template under artifacts_root",
+    )
+    apply.add_argument(
+        "--guard-template",
+        choices=twill_guards.TEMPLATE_LAYERS,
+        help=(
+            "template to emit; defaults to the applied layer, with gate available "
+            "for the hook layer"
+        ),
     )
     apply.add_argument("--state-dir")
     apply.add_argument("--json", action="store_true")
