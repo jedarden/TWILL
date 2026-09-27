@@ -70,7 +70,12 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(
             self.config().stat().st_mode & 0o777, 0o600, "config holds operator paths"
         )
-        for unit_name in ("twill-ingest.service", "twill-ingest.timer"):
+        for unit_name in (
+            "twill-ingest.service",
+            "twill-ingest.timer",
+            "twill-digest.service",
+            "twill-digest.timer",
+        ):
             installed = self.user_units() / unit_name
             self.assertEqual(installed.read_text(), (SYSTEMD_SOURCE / unit_name).read_text())
             self.assertEqual(installed.stat().st_mode & 0o777, 0o644)
@@ -88,6 +93,24 @@ class InstallTests(unittest.TestCase):
             service.index("ExecStart=/usr/bin/env %h/.local/bin/twill ingest"),
             service.index("ExecStart=/usr/bin/env %h/.local/bin/twill detect"),
         )
+
+    def test_weekly_digest_timer_is_persistent_and_orders_the_pipeline(self):
+        self.assertEqual(run_install(self.home).returncode, 0)
+        timer = (self.user_units() / "twill-digest.timer").read_text()
+        service = (self.user_units() / "twill-digest.service").read_text()
+
+        self.assertIn("OnCalendar=Mon *-*-* 08:00:00", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("Unit=twill-digest.service", timer)
+        self.assertIn("Type=oneshot", service)
+        commands = [
+            "ExecStart=/usr/bin/env %h/.local/bin/twill rank",
+            "ExecStart=/usr/bin/env %h/.local/bin/twill explain",
+            "ExecStart=/usr/bin/env %h/.local/bin/twill digest",
+        ]
+        positions = [service.index(command) for command in commands]
+        self.assertLess(positions[0], positions[1])
+        self.assertLess(positions[1], positions[2])
 
     def test_installed_entry_point_runs_from_a_foreign_cwd(self):
         self.assertEqual(run_install(self.home).returncode, 0)

@@ -37,7 +37,7 @@ here: a one-off error is noise, the same one across six hundred sessions is a le
 docs/notes/        design decisions, detector catalog, redaction policy
 docs/research/     prior art and source material
 docs/plan/         plan.md — the complete plan (start here)
-systemd/           the three user timers (ingest hourly, measure daily, digest weekly)
+systemd/           the ingest hourly and digest weekly user timers
 Makefile           `make install` — CLI symlink + config skeleton (§13.1)
 config.toml.skeleton  the operator config `make install` lays down on first install
 ```
@@ -76,12 +76,13 @@ rather than a clobber.
 `artifacts_root` is the one setting the skeleton deliberately does not provide
 — it has no default (see above), so edit the laid-down config and point it at
 the private artifacts repository before the first run; `twill` aborts at
-startup until it is set. `make install` also lays down the hourly
-`twill-ingest.service` and `twill-ingest.timer` units under
-`~/.config/systemd/user/`; enable the timer with `systemctl --user enable --now
-twill-ingest.timer` after configuring the tool. The service runs ingest before
-detect and remains a single oneshot activation, so overlapping timer firings
-are not started.
+startup until it is set. `make install` also lays down the hourly ingest units
+and the weekly digest units under `~/.config/systemd/user/`; enable both timers
+with `systemctl --user enable --now twill-ingest.timer twill-digest.timer` after
+configuring the tool. The digest timer runs every Monday at 08:00 local time,
+and its oneshot service runs rank, explain, and digest in order. Each service
+remains a single oneshot activation, so overlapping timer firings are not
+started.
 
 ## Tests
 

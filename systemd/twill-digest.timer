@@ -1,0 +1,10 @@
+[Unit]
+Description=Run the TWILL digest weekly on Monday morning
+
+[Timer]
+OnCalendar=Mon *-*-* 08:00:00
+Persistent=true
+Unit=twill-digest.service
+
+[Install]
+WantedBy=timers.target
