@@ -19,6 +19,7 @@ from typing import Any
 from urllib.parse import quote
 
 import twill_detectors
+import twill_reader
 import twill_rulecorpus
 import twill_schema
 from twill_redactor import Redactor, redact_text
@@ -1236,6 +1237,78 @@ def _check_ingest_performance(state_dir: Path) -> CheckResult:
     return _check_performance_budgets(state_dir)
 
 
+def _check_optional_inputs(
+    registry: Sequence[twill_reader.ReaderRegistration],
+) -> CheckResult:
+    """Report optional-input liveness without making absence a failure.
+
+    The readers own their predicates because they know how to identify their
+    external input.  Doctor only evaluates the registry and renders a stable
+    summary.  A missing input is expected and therefore healthy; a predicate
+    that cannot answer is degraded so the operator does not mistake an
+    unreadable probe for a clean absence.
+    """
+
+    inputs: dict[str, dict[str, object]] = {}
+    live_inputs: list[str] = []
+    absent_inputs: list[str] = []
+    probe_errors: list[str] = []
+    for reader in registry:
+        try:
+            live = reader.liveness()
+            if not isinstance(live, bool):
+                raise TypeError(
+                    f"predicate returned {type(live).__name__}, expected bool"
+                )
+        except Exception as exc:
+            live = False
+            error = _exception_text(exc)
+            probe_errors.append(reader.name)
+            inputs[reader.name] = {"live": False, "error": error}
+        else:
+            inputs[reader.name] = {"live": live}
+
+        if live:
+            live_inputs.append(reader.name)
+        else:
+            absent_inputs.append(reader.name)
+
+    live_inputs.sort()
+    absent_inputs.sort()
+    inputs = dict(sorted(inputs.items()))
+    details: dict[str, object] = {
+        "inputs": inputs,
+        "registered": len(inputs),
+        "live": len(live_inputs),
+        "absent": len(absent_inputs),
+        "live_inputs": live_inputs,
+        "absent_inputs": absent_inputs,
+    }
+    if probe_errors:
+        details["probe_errors"] = sorted(probe_errors)
+        return _result(
+            "optional_inputs",
+            DEGRADED,
+            f"{len(probe_errors)} optional input liveness probe(s) failed",
+            details,
+        )
+
+    if not inputs:
+        return _result(
+            "optional_inputs",
+            HEALTHY,
+            "no optional input readers are registered",
+            details,
+        )
+    return _result(
+        "optional_inputs",
+        HEALTHY,
+        f"{len(live_inputs)} of {len(inputs)} optional input(s) live; "
+        f"{len(absent_inputs)} absent",
+        details,
+    )
+
+
 def check_ingest_disk_space(
     state_dir: Path,
     disk_usage: Callable[[Path], Any] | None = None,
@@ -1284,6 +1357,7 @@ def run_doctor(
     disk_usage: Callable[[Path], Any] | None = None,
     intervals: Mapping[str, float] | None = None,
     registry: Sequence[twill_detectors.Detector] | None = None,
+    reader_registry: Sequence[twill_reader.ReaderRegistration] | None = None,
 ) -> DoctorReport:
     """Evaluate the Phase 1 health checks without changing state."""
 
@@ -1292,6 +1366,9 @@ def run_doctor(
     effective_intervals = dict(TIMER_INTERVALS if intervals is None else intervals)
     effective_registry = (
         twill_detectors.REGISTRY if registry is None else tuple(registry)
+    )
+    effective_reader_registry = twill_reader.build_reader_registry(
+        *(twill_reader.READER_REGISTRY if reader_registry is None else reader_registry)
     )
 
     connection: sqlite3.Connection | None
@@ -1316,6 +1393,7 @@ def run_doctor(
     timer = _check_timer_freshness(state_dir, reference, effective_intervals)
     performance = _check_ingest_performance(state_dir)
     self_test = _check_detector_self_test(effective_registry, reference)
+    optional_inputs = _check_optional_inputs(effective_reader_registry)
     disk = _check_disk_space(state_dir, disk_usage)
     return DoctorReport(
         (
@@ -1327,6 +1405,7 @@ def run_doctor(
             rule_corpus,
             dead_man,
             self_test,
+            optional_inputs,
             disk,
         )
     )

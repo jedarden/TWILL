@@ -141,7 +141,8 @@ retention pass records the SQLite database footprint (including WAL and shared-m
 
 `twill doctor` is the read-only Phase 1 health entry point. It checks SQLite integrity and schema
 version, ingest timer freshness, ingest performance budgets, cursor parse or missing-path anomalies,
-rule-corpus hash drift or vanished paths, the detector self-test, and free disk space:
+rule-corpus hash drift or vanished paths, the detector self-test, optional-input reader liveness,
+and free disk space. Missing optional inputs are reported as absent without failing doctor:
 
 The detector self-test (plan §13.3) replays every registered detector's whole query family —
 cluster, session-hit, week-hit, and weekly SQL — against a small in-memory fixture built from the

@@ -41,6 +41,7 @@ from __future__ import annotations
 
 import json
 import re
+from collections.abc import Callable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Iterator
@@ -80,6 +81,87 @@ _REJECTION_SENTINELS = (
     "The user doesn't want to proceed with this tool use",
     "The user doesn't want to take this action",
 )
+
+
+@dataclass(frozen=True)
+class ReaderRegistration:
+    """One optional input reader and the probe that says whether it is live.
+
+    Optional inputs are owned outside TWILL, so their readers cannot assume
+    that a path or producer exists.  Registering the probe separately from
+    the parser lets ``doctor`` report that absence without making ingest
+    depend on an external gate being answered first.
+    """
+
+    name: str
+    liveness: Callable[[], bool]
+
+    @property
+    def predicate(self) -> Callable[[], bool]:
+        """Descriptive alias for callers that refer to a liveness predicate."""
+
+        return self.liveness
+
+    @property
+    def is_live(self) -> Callable[[], bool]:
+        """Compatibility alias for readers that expose an ``is_live`` probe."""
+
+        return self.liveness
+
+
+# The concrete optional readers land in separate beads once their external
+# formats and owners are settled.  Keeping the registry empty is deliberate:
+# doctor can still run now, and each later reader adds its own registration.
+READER_REGISTRY: tuple[ReaderRegistration, ...] = ()
+
+
+def build_reader_registry(
+    *readers: ReaderRegistration,
+) -> tuple[ReaderRegistration, ...]:
+    """Validate and freeze an optional-reader registry.
+
+    Names are the stable keys rendered by doctor.  A duplicate is rejected at
+    construction time so two readers cannot report different liveness for the
+    same optional input.
+    """
+
+    seen: set[str] = set()
+    for reader in readers:
+        if not isinstance(reader, ReaderRegistration):
+            raise TypeError("reader registry entries must be ReaderRegistration values")
+        if not reader.name.strip():
+            raise ValueError("reader registration name must not be empty")
+        if not callable(reader.liveness):
+            raise TypeError(
+                f"reader {reader.name!r} liveness predicate must be callable"
+            )
+        if reader.name in seen:
+            raise ValueError(f"reader {reader.name!r} is registered more than once")
+        seen.add(reader.name)
+    return tuple(readers)
+
+
+def register_optional_input_reader(
+    name: str,
+    liveness: Callable[[], bool],
+) -> ReaderRegistration:
+    """Register one optional-input reader and return its registration.
+
+    Reader modules call this once at import time.  The returned value is also
+    useful for tests and for code that prefers an explicit registry override.
+    """
+
+    global READER_REGISTRY
+    reader = ReaderRegistration(name, liveness)
+    READER_REGISTRY = build_reader_registry(*READER_REGISTRY, reader)
+    return reader
+
+
+# Short names keep the registry vocabulary consistent with the detector
+# registry while retaining the explicit public function above.
+Reader = ReaderRegistration
+OptionalInputReader = ReaderRegistration
+register_reader = register_optional_input_reader
 
 
 @dataclass(frozen=True)

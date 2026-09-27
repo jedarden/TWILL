@@ -16,6 +16,7 @@ sys.path.insert(0, str(ROOT))
 import twill_detectors  # noqa: E402
 import twill_doctor  # noqa: E402
 import twill_perf  # noqa: E402
+import twill_reader  # noqa: E402
 import twill_rulecorpus  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_status import record_stage, status_path  # noqa: E402
@@ -59,6 +60,7 @@ class DoctorChecksTests(unittest.TestCase):
                 "rule_corpus",
                 "dead_man_switch",
                 "detector_self_test",
+                "optional_inputs",
                 "disk_space",
             ],
         )
@@ -564,6 +566,84 @@ class DoctorChecksTests(unittest.TestCase):
             status["data"]["stages"]["rescan_redaction"]["counts"],
             {"records": 1, "rows": 1},
         )
+
+
+class OptionalInputLivenessTests(unittest.TestCase):
+    """Plan §§6.5 and 13.3: optional readers are visible without gating doctor."""
+
+    def setUp(self):
+        self.temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self.temporary.cleanup)
+        self.state = Path(self.temporary.name) / "state"
+
+    def report(self, reader_registry=None):
+        return twill_doctor.run_doctor(
+            self.state,
+            reader_registry=reader_registry,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+    def optional_inputs(self, report):
+        return next(check for check in report.checks if check.name == "optional_inputs")
+
+    def test_no_external_reader_is_registered_yet_and_doctor_stays_healthy(self):
+        check = self.optional_inputs(self.report())
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["registered"], 0)
+        self.assertEqual(check.details["live"], 0)
+        self.assertEqual(check.details["absent"], 0)
+        self.assertEqual(check.details["inputs"], {})
+
+    def test_registry_reports_live_and_absent_inputs_without_degrading(self):
+        registry = twill_reader.build_reader_registry(
+            twill_reader.ReaderRegistration("catalog", lambda: True),
+            twill_reader.ReaderRegistration("receipts", lambda: False),
+        )
+        check = self.optional_inputs(self.report(registry))
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["live"], 1)
+        self.assertEqual(check.details["absent"], 1)
+        self.assertEqual(check.details["live_inputs"], ["catalog"])
+        self.assertEqual(check.details["absent_inputs"], ["receipts"])
+        self.assertEqual(
+            check.details["inputs"],
+            {"catalog": {"live": True}, "receipts": {"live": False}},
+        )
+        self.assertIn("1 of 2", check.message)
+        self.assertIn("1 absent", check.message)
+
+    def test_liveness_probe_failure_is_visible_as_degraded(self):
+        def broken_probe():
+            raise OSError("probe unavailable")
+
+        registry = twill_reader.build_reader_registry(
+            twill_reader.ReaderRegistration("denials", broken_probe),
+        )
+        check = self.optional_inputs(self.report(registry))
+        self.assertEqual(check.status, twill_doctor.DEGRADED)
+        self.assertEqual(check.details["absent_inputs"], ["denials"])
+        self.assertEqual(check.details["probe_errors"], ["denials"])
+        self.assertEqual(
+            check.details["inputs"],
+            {"denials": {"live": False, "error": "probe unavailable"}},
+        )
+
+    def test_registry_rejects_duplicate_reader_names(self):
+        with self.assertRaisesRegex(ValueError, "registered more than once"):
+            twill_reader.build_reader_registry(
+                twill_reader.ReaderRegistration("same", lambda: True),
+                twill_reader.ReaderRegistration("same", lambda: False),
+            )
+
+    def test_reader_registration_appends_to_the_shared_registry(self):
+        previous = twill_reader.READER_REGISTRY
+        try:
+            twill_reader.READER_REGISTRY = ()
+            registered = twill_reader.register_reader("guard", lambda: True)
+            self.assertEqual(registered.name, "guard")
+            self.assertEqual(twill_reader.READER_REGISTRY, (registered,))
+        finally:
+            twill_reader.READER_REGISTRY = previous
 
 
 class DetectorSelfTestTests(unittest.TestCase):
