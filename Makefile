@@ -1,17 +1,19 @@
 # TWILL install entry point (plan §13.1).
 #
 # `make install` puts the CLI on PATH and lays down the operator config
-# skeleton.  It is idempotent and never overwrites operator state: an existing
-# config file is kept, and a non-symlink binary in the way is a loud refusal,
-# not a clobber.  The three systemd --user timers install from systemd/ and are
-# wired into this target as their own beads land (each invokes verbs from a
-# different phase, so each unit ships separately).
+# skeleton and the hourly ingest timer.  It is idempotent and never overwrites
+# operator state: an existing config file is kept, and a non-symlink binary in
+# the way is a loud refusal, not a clobber.  The remaining systemd --user
+# timers install from systemd/ as their own beads land (each invokes verbs from
+# a different phase, so each unit ships separately).
 
 BIN_DIR ?= $(HOME)/.local/bin
 CONFIG_DIR ?= $(HOME)/.config/twill
 CONFIG_FILE := $(CONFIG_DIR)/config.toml
 SKELETON := config.toml.skeleton
 LINK := $(BIN_DIR)/twill
+SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
+INGEST_UNITS := twill-ingest.service twill-ingest.timer
 
 # Unit tests under the open-path audit gate (plan §8.3, §10.2).  Putting
 # tests/ on PYTHONPATH makes `site` import tests/sitecustomize.py before
@@ -41,4 +43,9 @@ install:
 		echo "twill: installed config skeleton at $(CONFIG_FILE)"; \
 		echo "twill: edit it to set artifacts_root (it has no default) before the first run"; \
 	fi
+	@mkdir -p "$(SYSTEMD_USER_DIR)"
+	@for unit in $(INGEST_UNITS); do \
+		install -m 644 "$(CURDIR)/systemd/$$unit" "$(SYSTEMD_USER_DIR)/$$unit"; \
+	done
 	@echo "twill: installed $(LINK) -> $(CURDIR)/twill"
+	@echo "twill: installed hourly ingest units in $(SYSTEMD_USER_DIR)"

@@ -1,0 +1,10 @@
+[Unit]
+Description=Run TWILL ingest and detection hourly
+
+[Timer]
+OnCalendar=hourly
+Persistent=true
+Unit=twill-ingest.service
+
+[Install]
+WantedBy=timers.target

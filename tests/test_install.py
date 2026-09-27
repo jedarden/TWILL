@@ -16,6 +16,7 @@ from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
 SKELETON = ROOT / "config.toml.skeleton"
+SYSTEMD_SOURCE = ROOT / "systemd"
 sys.path.insert(0, str(ROOT))
 
 from twill_config import ConfigError, load_config  # noqa: E402
@@ -57,6 +58,9 @@ class InstallTests(unittest.TestCase):
     def config(self) -> Path:
         return self.home / ".config" / "twill" / "config.toml"
 
+    def user_units(self) -> Path:
+        return self.home / ".config" / "systemd" / "user"
+
     def test_install_symlinks_twill_and_lays_down_the_skeleton(self):
         result = run_install(self.home)
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -65,6 +69,24 @@ class InstallTests(unittest.TestCase):
         self.assertEqual(self.config().read_text(), SKELETON.read_text())
         self.assertEqual(
             self.config().stat().st_mode & 0o777, 0o600, "config holds operator paths"
+        )
+        for unit_name in ("twill-ingest.service", "twill-ingest.timer"):
+            installed = self.user_units() / unit_name
+            self.assertEqual(installed.read_text(), (SYSTEMD_SOURCE / unit_name).read_text())
+            self.assertEqual(installed.stat().st_mode & 0o777, 0o644)
+
+    def test_hourly_timer_is_persistent_and_serializes_ingest_before_detect(self):
+        self.assertEqual(run_install(self.home).returncode, 0)
+        timer = (self.user_units() / "twill-ingest.timer").read_text()
+        service = (self.user_units() / "twill-ingest.service").read_text()
+
+        self.assertIn("OnCalendar=hourly", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("Unit=twill-ingest.service", timer)
+        self.assertIn("Type=oneshot", service)
+        self.assertLess(
+            service.index("ExecStart=/usr/bin/env %h/.local/bin/twill ingest"),
+            service.index("ExecStart=/usr/bin/env %h/.local/bin/twill detect"),
         )
 
     def test_installed_entry_point_runs_from_a_foreign_cwd(self):
