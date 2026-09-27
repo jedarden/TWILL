@@ -1,0 +1,10 @@
+[Unit]
+Description=Run TWILL measurement and retention pruning daily at 06:00
+
+[Timer]
+OnCalendar=*-*-* 06:00:00
+Persistent=true
+Unit=twill-measure.service
+
+[Install]
+WantedBy=timers.target

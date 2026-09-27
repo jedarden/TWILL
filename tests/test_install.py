@@ -73,6 +73,8 @@ class InstallTests(unittest.TestCase):
         for unit_name in (
             "twill-ingest.service",
             "twill-ingest.timer",
+            "twill-measure.service",
+            "twill-measure.timer",
             "twill-digest.service",
             "twill-digest.timer",
         ):
@@ -111,6 +113,20 @@ class InstallTests(unittest.TestCase):
         positions = [service.index(command) for command in commands]
         self.assertLess(positions[0], positions[1])
         self.assertLess(positions[1], positions[2])
+
+    def test_daily_measure_timer_is_persistent_and_prunes_after_measurement(self):
+        self.assertEqual(run_install(self.home).returncode, 0)
+        timer = (self.user_units() / "twill-measure.timer").read_text()
+        service = (self.user_units() / "twill-measure.service").read_text()
+
+        self.assertIn("OnCalendar=*-*-* 06:00:00", timer)
+        self.assertIn("Persistent=true", timer)
+        self.assertIn("Unit=twill-measure.service", timer)
+        self.assertIn("Type=oneshot", service)
+        self.assertLess(
+            service.index("ExecStart=/usr/bin/env %h/.local/bin/twill measure"),
+            service.index("ExecStart=/usr/bin/env %h/.local/bin/twill prune"),
+        )
 
     def test_installed_entry_point_runs_from_a_foreign_cwd(self):
         self.assertEqual(run_install(self.home).returncode, 0)

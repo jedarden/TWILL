@@ -1,0 +1,14 @@
+[Unit]
+Description=Measure TWILL lessons and prune old observations
+
+[Service]
+# A timer will not start another activation while this oneshot is active.
+# Each TWILL verb also holds the shared state lock for defense in depth.
+Type=oneshot
+# Keep the installed path explicit while letting systemd-analyze verify the
+# unit even on a checkout where the user's symlink has not been installed.
+ExecStart=/usr/bin/env %h/.local/bin/twill measure
+ExecStart=/usr/bin/env %h/.local/bin/twill prune
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=twill-measure

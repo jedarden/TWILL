@@ -1,7 +1,7 @@
 # TWILL install entry point (plan §13.1).
 #
 # `make install` puts the CLI on PATH and lays down the operator config
-# skeleton and the ingest and digest timers.  It is idempotent and never
+# skeleton and the ingest, measure, and digest timers.  It is idempotent and never
 # overwrites operator state: an existing config file is kept, and a
 # non-symlink binary in the way is a loud refusal, not a clobber.
 
@@ -11,7 +11,7 @@ CONFIG_FILE := $(CONFIG_DIR)/config.toml
 SKELETON := config.toml.skeleton
 LINK := $(BIN_DIR)/twill
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
-SYSTEMD_UNITS := twill-ingest.service twill-ingest.timer twill-digest.service twill-digest.timer
+SYSTEMD_UNITS := twill-ingest.service twill-ingest.timer twill-measure.service twill-measure.timer twill-digest.service twill-digest.timer
 
 # Unit tests under the open-path audit gate (plan §8.3, §10.2).  Putting
 # tests/ on PYTHONPATH makes `site` import tests/sitecustomize.py before
@@ -46,4 +46,4 @@ install:
 		install -m 644 "$(CURDIR)/systemd/$$unit" "$(SYSTEMD_USER_DIR)/$$unit"; \
 	done
 	@echo "twill: installed $(LINK) -> $(CURDIR)/twill"
-	@echo "twill: installed ingest and digest units in $(SYSTEMD_USER_DIR)"
+	@echo "twill: installed ingest, measure, and digest units in $(SYSTEMD_USER_DIR)"
