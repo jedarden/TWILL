@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 import twill_detectors
+import twill_lessons
 import twill_measure
 from twill_detectors import (
     MAX_ERROR_LENGTH,
@@ -32,6 +33,7 @@ from twill_schema import connect_read_only, state_db_path
 MAX_LINE_LENGTH = 240
 DIGEST_DIR_MODE = 0o700
 DIGEST_FILE_MODE = 0o600
+LESSON_FLOW_WINDOW_DAYS = 60
 VERDICT_NEW = "new"
 VERDICT_WORSENING = "worsening"
 VERDICT_IMPROVING = "improving"
@@ -176,6 +178,34 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class LessonFlowHealth:
+    """The lesson lifecycle counts for one completed digest window."""
+
+    window_days: int
+    window_start: str | None
+    window_end: str | None
+    drafted: int
+    accepted: int
+    applied: int
+    resolved: int
+    available: bool = True
+    warning: str | None = None
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "window_days": self.window_days,
+            "window_start": self.window_start,
+            "window_end": self.window_end,
+            "drafted": self.drafted,
+            "accepted": self.accepted,
+            "applied": self.applied,
+            "resolved": self.resolved,
+            "available": self.available,
+            "warning": self.warning,
+        }
+
+
+@dataclass(frozen=True)
 class DigestReport:
     state_dir: Path
     week: Week
@@ -188,6 +218,7 @@ class DigestReport:
     detectors: tuple[DetectorSummary, ...]
     findings: tuple[Finding, ...]
     warnings: tuple[str, ...]
+    lesson_flow: LessonFlowHealth
     escalations: tuple[twill_measure.EscalationProposal, ...] = ()
 
     @property
@@ -210,6 +241,76 @@ class DigestReport:
                 for detector in self.detectors
             )
         )
+
+
+def _parse_lesson_timestamp(value: object) -> datetime:
+    if not isinstance(value, str):
+        raise ValueError("lesson timestamp is not text")
+    parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    return parsed.astimezone(timezone.utc)
+
+
+def lesson_flow_health(
+    artifacts_root: Path | None,
+    *,
+    as_of: datetime,
+    window_days: int = LESSON_FLOW_WINDOW_DAYS,
+) -> LessonFlowHealth:
+    """Count current lesson states in the trailing completed digest window.
+
+    The lesson files predate lifecycle history, so draft, accepted, and
+    resolved timestamps come from their file metadata.  Application has an
+    explicit timestamp in the lesson frontmatter and uses that instead.  The
+    digest's ``as_of`` value keeps historical reports reproducible rather than
+    comparing them with the wall clock at render time.
+    """
+
+    if artifacts_root is None:
+        return LessonFlowHealth(
+            window_days=window_days,
+            window_start=None,
+            window_end=None,
+            drafted=0,
+            accepted=0,
+            applied=0,
+            resolved=0,
+            available=False,
+            warning="artifacts_root is not configured; lesson flow is unavailable",
+        )
+    if as_of.tzinfo is None:
+        as_of = as_of.replace(tzinfo=timezone.utc)
+    as_of = as_of.astimezone(timezone.utc)
+    start = as_of - timedelta(days=window_days)
+    records = twill_lessons.list_lessons(Path(artifacts_root))
+    counts = {"draft": 0, "accepted": 0, "applied": 0, "resolved": 0}
+    for record in records:
+        category = twill_lessons.state_category(record.state)
+        if category == "applied":
+            applied_at = record.routing.get("applied_at")
+            if applied_at is None:
+                continue
+            event_at = _parse_lesson_timestamp(applied_at)
+        else:
+            event_at = datetime.fromtimestamp(record.path.stat().st_mtime, timezone.utc)
+        if start <= event_at <= as_of and category in counts:
+            counts[category] += 1
+    warning = (
+        "no lessons reached applied in this 60-day window"
+        if counts["applied"] == 0
+        else None
+    )
+    return LessonFlowHealth(
+        window_days=window_days,
+        window_start=start.isoformat().replace("+00:00", "Z"),
+        window_end=as_of.isoformat().replace("+00:00", "Z"),
+        drafted=counts["draft"],
+        accepted=counts["accepted"],
+        applied=counts["applied"],
+        resolved=counts["resolved"],
+        warning=warning,
+    )
 
 
 def _read_window(
@@ -489,12 +590,13 @@ def build_digest(
     prior_start, prior_end = week_bounds(prior)
     command = reproduction_command(state, week)
     detectors = twill_detectors.build_registry(*registry)
+    report_as_of = datetime.fromisoformat(end) - timedelta(microseconds=1)
+    lesson_flow = lesson_flow_health(artifacts_root, as_of=report_as_of)
     escalations: tuple[twill_measure.EscalationProposal, ...] = ()
     if artifacts_root is not None:
         # A report for a completed week must not use a measurement recorded in
         # a later week.  Subtract a microsecond because week_bounds' end is an
         # exclusive boundary.
-        report_as_of = datetime.fromisoformat(end) - timedelta(microseconds=1)
         escalations = twill_measure.escalation_proposals(
             artifacts_root,
             as_of=report_as_of,
@@ -531,6 +633,7 @@ def build_digest(
             detectors=summaries,
             findings=(),
             warnings=(warning,),
+            lesson_flow=lesson_flow,
             escalations=escalations,
         )
 
@@ -656,6 +759,7 @@ def build_digest(
         detectors=tuple(summaries),
         findings=findings,
         warnings=tuple(warnings),
+        lesson_flow=lesson_flow,
         escalations=escalations,
     )
 
@@ -718,6 +822,7 @@ def render_data(report: DigestReport) -> dict[str, object]:
         "observations_in_previous_week": report.observations_in_previous_week,
         "detectors": [_detector_data(detector) for detector in report.detectors],
         "findings": [_finding_data(finding) for finding in report.findings],
+        "lesson_flow": report.lesson_flow.as_dict(),
         "escalations": [proposal.as_dict() for proposal in report.escalations],
         "reproduction_command": report.command,
     }
@@ -770,6 +875,21 @@ def render_text(report: DigestReport) -> str:
             report.command,
         )
     )
+    flow = report.lesson_flow
+    if flow.available:
+        flow_text = (
+            f"lesson flow (last {flow.window_days} days): "
+            f"drafted {flow.drafted}, accepted {flow.accepted}, "
+            f"applied {flow.applied}, resolved {flow.resolved}"
+        )
+        if flow.warning is not None:
+            flow_text += f" — WARNING: {flow.warning}"
+    else:
+        flow_text = (
+            f"lesson flow (last {flow.window_days} days): unavailable — "
+            f"WARNING: {flow.warning}"
+        )
+    lines.append(_line(flow_text, report.command))
     for detector in report.detectors:
         if detector.current_error is not None:
             lines.append(

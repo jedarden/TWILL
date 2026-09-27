@@ -235,12 +235,103 @@ class DigestDiffTests(DigestStateCase):
         self.assertTrue(report.clean)
         text = twill_digest.render_text(report)
         self.assertIn("clean week: no findings; detectors ran: none registered", text)
+        self.assertIn("lesson flow (last 60 days): unavailable", text)
         self.assertTrue(
             all(
                 line.endswith(f" | $ {report.command}")
                 for line in text.splitlines()
             )
         )
+
+    def test_lesson_flow_health_counts_states_in_the_completed_week_window(self):
+        artifacts = self.root / "artifacts"
+        lessons = artifacts / "lessons"
+        lessons.mkdir(parents=True)
+
+        def write_lesson(lesson_id, state, timestamp, *, applied_at=None):
+            if state.startswith("applied:") or state == "resolved":
+                layer = (
+                    state.split(":", 1)[1]
+                    if state.startswith("applied:")
+                    else "environment"
+                )
+                routing = (
+                    f'routing: {{recommended: {layer}, reason: "Use the routed fix.", '
+                    f"applied: {layer}, applied_at: {applied_at}, bead: twill-test}}"
+                )
+            else:
+                routing = (
+                    'routing: {recommended: environment, reason: "Use the routed fix.", '
+                    "applied: null, applied_at: null, bead: null}"
+                )
+            path = lessons / f"{lesson_id}.md"
+            path.write_text(
+                "\n".join(
+                    [
+                        "---",
+                        f"id: {lesson_id}",
+                        'summary: "A command fails repeatedly. Use the routed fix."',
+                        f"state: {state}",
+                        "detector: D-01",
+                        'key: "command-not-found:test"',
+                        'evidence: {sessions: 2, events: 2, first_seen: 2026-08-01, session_ids: ["s1", "s2"]}',
+                        routing,
+                        "backtest: {window_days: 180, sessions: 2, first_seen: 2026-08-01, weeks_present: 1}",
+                        "guard: {layer: null, artifact: null, installed: false}",
+                        "---",
+                        "",
+                    ]
+                ),
+                encoding="utf-8",
+            )
+            instant = datetime.fromisoformat(timestamp).timestamp()
+            os.utime(path, (instant, instant))
+
+        write_lesson("L-00000001", "draft", "2026-08-01T00:00:00+00:00")
+        write_lesson("L-00000002", "accepted", "2026-08-02T00:00:00+00:00")
+        write_lesson(
+            "L-00000003",
+            "applied:environment",
+            "2026-09-10T00:00:00+00:00",
+            applied_at="2026-09-10T00:00:00Z",
+        )
+        write_lesson(
+            "L-00000004",
+            "resolved",
+            "2026-09-11T00:00:00+00:00",
+            applied_at="2026-09-09T00:00:00Z",
+        )
+        write_lesson("L-00000005", "draft", "2026-06-01T00:00:00+00:00")
+
+        report = twill_digest.build_digest(
+            self.state,
+            SUBJECT,
+            registry=(),
+            artifacts_root=artifacts,
+        )
+
+        self.assertEqual(
+            report.lesson_flow.as_dict(),
+            {
+                "window_days": 60,
+                "window_start": "2026-07-22T23:59:59.999999Z",
+                "window_end": "2026-09-20T23:59:59.999999Z",
+                "drafted": 1,
+                "accepted": 1,
+                "applied": 1,
+                "resolved": 1,
+                "available": True,
+                "warning": None,
+            },
+        )
+        data = twill_digest.render_data(report)
+        self.assertEqual(data["lesson_flow"]["applied"], 1)
+        text = twill_digest.render_text(report)
+        self.assertIn(
+            "lesson flow (last 60 days): drafted 1, accepted 1, applied 1, resolved 1",
+            text,
+        )
+        self.assertNotIn("no lessons reached applied", text)
 
     def test_redaction_and_line_budget_never_truncate_the_command(self):
         token = "ghp_" + "1234567890abcdefghijklmnop"
