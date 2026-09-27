@@ -13,7 +13,8 @@ LINK := $(BIN_DIR)/twill
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
 SYSTEMD_UNITS := twill-ingest.service twill-ingest.timer twill-measure.service twill-measure.timer twill-digest.service twill-digest.timer
 
-# Unit tests under the open-path audit gate (plan §8.3, §10.2).  Putting
+# Unit tests under the import, network, and open-path audit gates (plan §3,
+# §8.3, §10.2).  Putting
 # tests/ on PYTHONPATH makes `site` import tests/sitecustomize.py before
 # unittest loads anything, so the hook is live from interpreter startup, and
 # the inherited variable makes every spawned CLI verb self-install it.  A

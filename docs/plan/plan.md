@@ -816,6 +816,11 @@ decided. Gated on Open Questions 3a (which cluster) and 3b (WARP ownership).
 - **Open-path test**: the whole test suite runs under an `open()`/`os.open` audit hook; any write
   outside this repository + the state dir + `artifacts_root`, or any read under the transcript
   archive, fails the run.
+- **Import audit**: the production tree may import only Python's standard library or modules in
+  this repository; the runtime hook also rejects a third-party import made dynamically by a test
+  or Python child.
+- **Network audit**: Python-level network events fail the run. The only sanctioned network-capable
+  process is the local `claude -p` Explain child.
 - **Artifact-containment gate** (three guards, because one is a promise and three are a mechanism):
   the engine repository `.gitignore`s the four artifact paths; the open-path harness fails on an
   artifact write *into* the repository tree; and `twill-ci` asserts the published tree contains no

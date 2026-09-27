@@ -92,15 +92,16 @@ make test                        # or: pytest
 scripts/definition-of-done.sh    # the one "done" command: the gated suite, pytest, ruff
 ```
 
-The suite runs under the open-path audit harness (§8.3, §10.2): an
-`open()`/`os.open` audit hook refuses any write outside this repository
-(never its artifact directories), the state directory, `artifacts_root` and
-test scratch space, and refuses any open under
-`~/agent-transcript-archive` outright. Every Python subprocess the suite
-spawns — each CLI verb — installs the same hook, so the verbs themselves
-are policed. A bare `python3 -m unittest discover` skips the harness's
-startup and deliberately fails; run the suite through `make test` or
-pytest. See `docs/notes/open-path-audit.md`.
+The suite runs under the import, network, and open-path audit harness (§3,
+§8.3, §10.2): the startup hook rejects third-party imports in the core path,
+Python-level network calls, writes outside this repository (never its artifact
+directories), the state directory, `artifacts_root` and test scratch space,
+and any open under `~/agent-transcript-archive`. The local `claude -p` child
+is the sole sanctioned network-capable process. Every Python subprocess the
+suite spawns — each CLI verb — installs the same hook, so the verbs themselves
+are policed. A bare `python3 -m unittest discover` skips the harness's startup
+and deliberately fails; run the suite through `make test` or pytest. See
+`docs/notes/open-path-audit.md`.
 
 `scripts/definition-of-done.sh` (§10.2) is the workspace's declared
 definition of done: one lane — the gated suite, the same suite under

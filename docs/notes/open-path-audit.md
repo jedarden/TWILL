@@ -1,14 +1,34 @@
-# The open-path audit harness
+# The test-suite audit harness
 
-The mechanical enforcement of the two §8.3 invariants that name paths —
+The mechanical enforcement of the §3 and §8.3 invariants that the test suite
+can observe —
 "No file outside `~/TWILL` and `~/.local/state/twill` is ever opened for
 writing" and "No path under `~/agent-transcript-archive` is ever opened at
-all" — and of §10.2's open-path stop-ship gate. The harness is
-`tests/openpath.py`; it is exercised by `tests/test_openpath.py`. Ideas
+all", no third-party Python import in the core path, and no Python network
+call except the local `claude -p` child — plus §10.2's stop-ship gate. The
+harness is `tests/openpath.py`; it is exercised by `tests/test_openpath.py` and
+`tests/test_audit.py`. Ideas
 ledger #77 rejected auditing in the engine's hot path; this is the selected
 alternative: the whole *test suite* runs under the hook, so every change to
 the engine is audited at development time, and the running timers pay
 nothing.
+
+## Import and network gates
+
+The same startup hook rejects an import whose top-level name is neither in
+Python's standard library nor a module in this checkout. The runtime check
+catches dynamic imports and is inherited by Python children through
+`tests/sitecustomize.py`; `tests/test_audit.py` also walks every production
+source file so a runner cannot hide a dependency by preloading it. `pytest`
+and `ruff` remain development tools: the pytest runner has loaded before its
+`conftest.py` installs the hook, and the production import walk excludes
+`tests/`.
+
+Python-level network audit events are refused at socket and stdlib client
+boundaries. Explain's local `claude -p` invocation is the sole exception in
+the design; it is an external process, so its own network traffic is outside
+Python's audit-hook boundary. No other production code is permitted to spawn
+a network-capable child.
 
 ## One audit event covers both entry points
 

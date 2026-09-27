@@ -1,4 +1,4 @@
-"""The open-path audit harness (plan §8.3, §10.2).
+"""The test-suite audit harness (plan §3, §8.3, §10.2).
 
 Mechanical enforcement of the two pre-flight invariants the plan lists as
 "must always hold":
@@ -6,15 +6,20 @@ Mechanical enforcement of the two pre-flight invariants the plan lists as
 - No file outside this repository and the state directory is ever opened for
   writing.
 - No path under ``~/agent-transcript-archive`` is ever opened at all.
+- Core code imports only the standard library or this repository.
+- Python code makes no network call.  The one sanctioned egress is the local
+  ``claude -p`` child used by Explain, which is not Python code and therefore
+  does not run this hook.
 
-:func:`install` puts an audit hook on the ``open`` event -- the single event
-both :func:`open` and ``os.open`` raise (PEP 578, verified: ``os.open``
-reports its intent through ``flags`` with ``mode=None``) -- into the
-interpreter running the test suite.  A write that has no allowed home, or any
-open under the transcript archive, raises :class:`OpenPathViolation` at the
-open itself, which fails the test that attempted it and therefore the run.
-There is no warning mode and no suppression switch: §10.2 makes this a
-stop-ship gate, and a gate with an opt-out is a convention, not a mechanism.
+:func:`install` puts PEP 578 audit hooks on imports, network events, and the
+``open`` event -- the single event both :func:`open` and ``os.open`` raise
+(verified: ``os.open`` reports its intent through ``flags`` with ``mode=None``)
+-- into the interpreter running the test suite.  A forbidden import, network
+operation, write that has no allowed home, or any open under the transcript
+archive raises an audit violation at the operation itself, which fails the
+test that attempted it and therefore the run.  There is no warning mode and
+no suppression switch: §10.2 makes this a stop-ship gate, and a gate with an
+opt-out is a convention, not a mechanism.
 
 Every Python child the suite spawns -- each CLI verb run through
 ``subprocess`` -- installs the same hook before its first open, so the engine
@@ -35,6 +40,11 @@ hook for pytest.  An entry point that skips both -- a bare
 ``python3 -m unittest discover`` -- runs unhooked, which
 ``tests/test_openpath.py`` detects and fails; running the suite ungated is
 supposed to be loud.
+
+The import and network policies are intentionally attached to this same
+startup hook.  A static import audit in ``tests/test_audit.py`` covers the
+whole production tree, while the runtime hook covers imports made through
+dynamic code paths and every Python child the suite spawns.
 
 Allowed write trees, and why the harness is allowed to be broader than the
 invariant it enforces:
@@ -122,6 +132,50 @@ _installed = False
 #: ``open`` -- so they stay live and honest.
 _temp_root: Path | None = None
 _artifacts_root_cache: tuple[Path, ...] | None = None
+# ``sys.stdlib_module_names`` is the authoritative top-level module set for
+# this interpreter.  The repository has flat production and test modules, so
+# their stems are the other names the harness may import.  The set is
+# snapshotted before the hook is installed for the same reason as the temp and
+# artifact roots: policy checks must not perform imports or opens themselves.
+_local_module_names: frozenset[str] | None = None
+
+# Constructing a socket is already enough to make a network attempt possible,
+# and the lower-level events cover code that reuses an already-created socket.
+# The protocol-specific events make the policy explicit for stdlib clients
+# that report before reaching ``socket.connect``.
+_NETWORK_EVENT_PREFIXES = (
+    "socket.",
+    "asyncio.",
+    "http.client.",
+    "ftplib.",
+    "imaplib.",
+    "poplib.",
+    "smtplib.",
+    "telnetlib.",
+)
+
+# A few tests import pytest while running under the stdlib unittest lane so
+# they can assert that redaction tests are non-skippable.  These are test
+# runner packages, not production dependencies; the source-level audit keeps
+# them out of the core import graph.
+_TEST_RUNNER_MODULES = frozenset(
+    {
+        "pytest",
+        "_pytest",
+        "pytest_benchmark",
+        "_hypothesis_pytestplugin",
+        "hypothesis",
+        "pluggy",
+        "iniconfig",
+        "packaging",
+        "pygments",
+        "pyparsing",
+        "tomli",
+        "exceptiongroup",
+        "py",
+        "sortedcontainers",
+    }
+)
 
 
 class OpenPathViolation(AssertionError):
@@ -148,11 +202,12 @@ def install() -> None:
     comment at :data:`_temp_root`).
     """
 
-    global _installed, _temp_root, _artifacts_root_cache
+    global _installed, _temp_root, _artifacts_root_cache, _local_module_names
     if _installed:
         return
     _temp_root = Path(tempfile.gettempdir()).resolve()
     _prepare_child_interpreters()
+    _local_module_names = _discover_local_module_names()
     if _artifacts_root_cache is None:
         _artifacts_root_cache = _load_artifacts_root()
     sys.addaudithook(audit_hook)
@@ -163,9 +218,88 @@ def audit_hook(event: str, args: tuple) -> None:
     """The audit hook itself; public so the policy is testable directly."""
 
     if event != "open":
+        if event == "import":
+            check_import(*args[:2])
+        elif _is_network_event(event):
+            check_network(event)
         return
     path, mode, flags = args
     check_open(path, mode, flags)
+
+
+class ImportViolation(AssertionError):
+    """A non-stdlib, non-repository module was imported by the suite."""
+
+
+class NetworkViolation(AssertionError):
+    """Python code attempted a network operation under the suite gate."""
+
+
+def check_import(module: object, filename: object = None, *unused: object) -> None:
+    """Refuse imports outside Python's stdlib and this checkout.
+
+    The audit event fires before a module is loaded and commonly reports no
+    filename, so the module's top-level name is the primary decision.  A
+    filename under the checkout is also accepted for local package layouts.
+    ``tests/test_audit.py`` performs the complementary source-level check,
+    which catches a dependency that happened to be preloaded by a runner.
+    """
+
+    name = str(module)
+    root = name.partition(".")[0]
+    local_names = _local_module_names
+    if local_names is None:
+        local_names = _discover_local_module_names()
+    if (
+        root in local_names
+        or root in _stdlib_module_names()
+        or root.startswith("_sysconfigdata_")
+        or root in _TEST_RUNNER_MODULES
+    ):
+        return
+    if isinstance(filename, (str, bytes, os.PathLike)):
+        path = Path(os.fsdecode(filename)).resolve()
+        if _under(path, REPO_TREE):
+            return
+    raise ImportViolation(
+        f"forbidden third-party import: {name!r}; TWILL core may import only "
+        "the standard library or modules from this repository (the local "
+        "claude CLI remains the sole sanctioned network-capable child)"
+    )
+
+
+def check_network(event: str) -> None:
+    """Refuse Python-level network activity under the test-suite gate."""
+
+    raise NetworkViolation(
+        f"forbidden network operation: {event!r}; Python code may not make "
+        "network calls (only the local claude CLI invocation is sanctioned)"
+    )
+
+
+def _is_network_event(event: str) -> bool:
+    return any(event.startswith(prefix) for prefix in _NETWORK_EVENT_PREFIXES)
+
+
+def _stdlib_module_names() -> frozenset[str]:
+    return frozenset(getattr(sys, "stdlib_module_names", ())) | frozenset(
+        sys.builtin_module_names
+    ) | {"__future__"}
+
+
+def _discover_local_module_names() -> frozenset[str]:
+    # ``usercustomize`` is the host's stdlib startup extension; it is loaded
+    # before this repository's hook and is not a TWILL runtime dependency.
+    names = {"sitecustomize", "usercustomize", "tests"}
+    for directory in (REPO_TREE, REPO_TREE / "tests"):
+        if not directory.is_dir():
+            continue
+        for path in directory.glob("*.py"):
+            names.add(path.stem)
+    # The executable CLI has no .py suffix but is a repository-owned module
+    # when imported via runpy or a test child.
+    names.add("twill")
+    return frozenset(names)
 
 
 def check_open(path: object, mode: str | None, flags: int) -> None:
