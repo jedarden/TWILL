@@ -622,6 +622,20 @@ that path suppress the file finding for the window. A trimmed non-empty command 
 timestamps cover the qualifying observations. Session-hit, week-hit, and weekly-series queries use
 the same membership rules, and persisted clusters retain `score = 0.0` for the Phase 3 ranker.
 
+**D-08@1 decision (2026-09-27):** D-08 emits two cluster families over live indexed rule documents,
+where a document names a program or host when its indexed `rule_fts` text contains it as an FTS
+phrase. The binary family joins that naming relation to D-01's qualification — a program with
+`command not found` `run_failed` observations in at least two distinct sessions inside the active
+window is proven absent from PATH by the agents still trying to run it — and emits
+`stale-rule:binary:<program>:<path>` per naming document, with `sessions`, `events`, and the
+first/last timestamps of those failures. The host family emits `stale-rule:host:<host>:<path>`
+with zero counts and the document's `indexed_at` for a host that produced observations before the
+window but none inside it while a live document still names it; a host with no observations at all
+is not retired, because nothing proved it existed, so the family stays dormant until Phase 7's
+multi-host pulls land. Session-hit, week-hit, and weekly-series queries cover the binary family
+only. Output is ordered by sessions descending, latest `last_seen` descending, then key ascending,
+and persisted clusters retain `score = 0.0` for the Phase 3 ranker.
+
 **D-09@1 decision (2026-09-24):** D-09 emits one cluster for each live indexed rule document whose
 newest `last_read_by_agent` value for its content hash is missing or earlier than the trailing-window
 start and which has no matching `file_read` observation in the window. Reading either copy of identical

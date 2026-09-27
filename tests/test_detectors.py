@@ -1876,6 +1876,233 @@ class UnreadRuleDocDetectorTests(unittest.TestCase):
         )
 
 
+class StaleRuleDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def seed_rule_doc(
+        self,
+        path: str,
+        text: str,
+        *,
+        indexed_at: str = "2026-09-01T00:00:00+00:00",
+        stale: int = 0,
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, last_read_by_agent, stale) "
+            "VALUES (?, 'memory', ?, ?, NULL, ?)",
+            (path, f"sha-{path}", indexed_at, stale),
+        )
+        self.connection.execute(
+            "INSERT INTO rule_fts(text, path) VALUES (?, ?)",
+            (text, path),
+        )
+        self.connection.commit()
+
+    def seed_host_observation(
+        self, host: str, session_id: str, days_ago: float
+    ) -> None:
+        observed_at = datetime.now(timezone.utc) - timedelta(days=days_ago)
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, host) "
+            "VALUES (?, ?, ?, 'session_activity', ?)",
+            (session_id, observed_at.isoformat(), observed_at.isoformat(), host),
+        )
+        self.connection.commit()
+
+    def test_d08_flags_live_documents_naming_an_absent_binary(self):
+        # The live contradiction D-08 exists for: a memory leaf still naming
+        # `bf` (never `br`) while the binary is absent and agents keep
+        # failing to run it in at least two sessions.
+        for program, session_id, days_ago in (
+            ("bf", "s1", 5),
+            ("bf", "s2", 3),
+            ("bf", "s2", 2),
+            ("sqlite3", "s1", 1),
+        ):
+            seed_observation(
+                self.connection,
+                program=program,
+                session_id=session_id,
+                days_ago=days_ago,
+                signature=f"{program}: command not found",
+            )
+        self.seed_rule_doc(
+            "/rules/memory-bf.md",
+            "always use `bf` for beads, never `br`; flush before pull",
+        )
+        self.seed_rule_doc(
+            "/rules/current.md",
+            "bead is canonical here; sqlite3 remains the backup tool",
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.STALE_RULE,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-08@1", "ok", 1)],
+        )
+        rows = cluster_rows(self.connection, "D-08")
+        self.assertEqual(
+            [row[1] for row in rows],
+            ["stale-rule:binary:bf:/rules/memory-bf.md"],
+        )
+        finding = rows[0]
+        self.assertEqual(finding[3], 2)
+        self.assertEqual(finding[4], 3)
+        self.assertLess(finding[5], finding[6])
+        self.assertEqual(finding[7], 0.0)
+        self.assertEqual(finding[9], "open")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT session_id FROM cluster_session "
+                "WHERE detector_id = 'D-08' ORDER BY session_id"
+            ).fetchall(),
+            [("s1",), ("s2",)],
+        )
+
+    def test_d08_requires_the_binary_threshold_and_a_naming_document(self):
+        # `go` reaches the two-session command-not-found bar but no document
+        # names it; `sqlite3` is named but only one session failed it.
+        for program, session_id in (
+            ("go", "s1"),
+            ("go", "s2"),
+            ("sqlite3", "s1"),
+        ):
+            seed_observation(
+                self.connection,
+                program=program,
+                session_id=session_id,
+                signature=f"{program}: command not found",
+            )
+        self.seed_rule_doc(
+            "/rules/tools.md",
+            "keep sqlite3 handy for database dumps",
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.STALE_RULE,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(report.outcomes[0].clusters, 0)
+        self.assertEqual(cluster_rows(self.connection, "D-08"), [])
+
+    def test_d08_excludes_stale_documents_and_out_of_window_failures(self):
+        seed_observation(
+            self.connection,
+            program="bf",
+            session_id="s1",
+            signature="bf: command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="bf",
+            session_id="s2",
+            signature="bf: command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="sqlite3",
+            session_id="s3",
+            days_ago=40,
+            signature="sqlite3: command not found",
+        )
+        seed_observation(
+            self.connection,
+            program="sqlite3",
+            session_id="s4",
+            days_ago=40,
+            signature="sqlite3: command not found",
+        )
+        self.seed_rule_doc(
+            "/rules/stale-bf.md",
+            "use `bf` and `sqlite3` here",
+            stale=1,
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.STALE_RULE,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(report.outcomes[0].clusters, 0)
+        self.assertEqual(cluster_rows(self.connection, "D-08"), [])
+
+    def test_d08_flags_documents_naming_a_retired_host(self):
+        # hetzner-ex44 produced observations only before the window;
+        # codinghome is live; lab never produced any observation at all.
+        self.seed_host_observation("hetzner-ex44", "old-1", 60)
+        self.seed_host_observation("hetzner-ex44", "old-2", 50)
+        self.seed_host_observation("codinghome", "new-1", 1)
+        self.seed_rule_doc(
+            "/rules/hosts.md",
+            "the fleet is codinghome, lab and hetzner-ex44 on the tailnet",
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.STALE_RULE,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-08@1", "ok", 1)],
+        )
+        rows = cluster_rows(self.connection, "D-08")
+        self.assertEqual(
+            [row[1] for row in rows],
+            ["stale-rule:host:hetzner-ex44:/rules/hosts.md"],
+        )
+        finding = rows[0]
+        self.assertEqual(finding[3], 0)
+        self.assertEqual(finding[4], 0)
+        self.assertEqual(
+            (finding[5], finding[6]),
+            ("2026-09-01T00:00:00+00:00", "2026-09-01T00:00:00+00:00"),
+        )
+        self.assertEqual(finding[7], 0.0)
+        self.assertEqual(finding[9], "open")
+
+    def test_d08_ignores_hosts_still_reporting_inside_the_window(self):
+        # lab reported before the window and again inside it, so it stays
+        # live; bench went silent before the window and is the control that
+        # proves the detector still fires in the same run.
+        self.seed_host_observation("lab", "lab-old", 45)
+        self.seed_host_observation("lab", "lab-new", 2)
+        self.seed_host_observation("bench", "bench-old", 40)
+        self.seed_rule_doc(
+            "/rules/hosts.md", "lab and bench are both reachable tailnet hosts"
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.STALE_RULE,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [row[1] for row in cluster_rows(self.connection, "D-08")],
+            ["stale-rule:host:bench:/rules/hosts.md"],
+        )
+
+
 class DetectCommandTests(unittest.TestCase):
     """The ``twill detect`` verb surface (§14) over the registry runner."""
 
@@ -2073,6 +2300,14 @@ class DetectCliTests(unittest.TestCase):
                         "detector_id": "D-07",
                         "version": 1,
                         "full_id": "D-07@1",
+                        "status": "ok",
+                        "clusters": 0,
+                        "error": None,
+                    },
+                    {
+                        "detector_id": "D-08",
+                        "version": 1,
+                        "full_id": "D-08@1",
                         "status": "ok",
                         "clusters": 0,
                         "error": None,

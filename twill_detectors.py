@@ -1218,6 +1218,247 @@ REDISCOVERY = Detector(
 )
 
 
+# D-08's "names" relation is an FTS phrase match, so the shared CTEs below
+# feed every query: a doc names a program or host when its indexed text
+# contains it as a token sequence.  The phrase is built from the column
+# value (quoted, embedded quotes doubled) because the MATCH term must be
+# derived inside the SQL; a name without an alphanumeric character cannot
+# form a phrase and is excluded rather than risking a tokenizer error.
+STALE_RULE_SQL = """
+    WITH command_not_found AS (
+        SELECT program, session_id, ts_utc
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND kind = 'run_failed'
+          AND program IS NOT NULL
+          AND trim(program) <> ''
+          AND signature IS NOT NULL
+          AND trim(signature) <> ''
+          AND sig_hash IS NOT NULL
+          AND lower(signature) LIKE '%command not found%'
+    ),
+    absent_programs AS (
+        SELECT program
+        FROM command_not_found
+        GROUP BY program
+        HAVING count(DISTINCT session_id) >= 2
+    ),
+    named_programs AS (
+        SELECT a.program, d.path
+        FROM absent_programs AS a
+        JOIN rule_doc AS d
+          ON d.stale = 0
+         AND d.path IS NOT NULL
+         AND trim(d.path) <> ''
+        WHERE a.program GLOB '*[0-9a-zA-Z]*'
+          AND EXISTS (
+              SELECT 1
+              FROM rule_fts AS f
+              WHERE f.path = d.path
+                AND f.text MATCH '"' || replace(a.program, '"', '""') || '"'
+          )
+    ),
+    silent_hosts AS (
+        SELECT DISTINCT trim(host) AS host
+        FROM observation
+        WHERE ts_utc < :window_start_utc
+          AND host IS NOT NULL
+          AND trim(host) <> ''
+        EXCEPT
+        SELECT DISTINCT trim(host)
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND host IS NOT NULL
+          AND trim(host) <> ''
+    ),
+    named_hosts AS (
+        SELECT s.host, d.path, d.indexed_at
+        FROM silent_hosts AS s
+        JOIN rule_doc AS d
+          ON d.stale = 0
+         AND d.path IS NOT NULL
+         AND trim(d.path) <> ''
+        WHERE s.host GLOB '*[0-9a-zA-Z]*'
+          AND EXISTS (
+              SELECT 1
+              FROM rule_fts AS f
+              WHERE f.path = d.path
+                AND f.text MATCH '"' || replace(s.host, '"', '""') || '"'
+          )
+    ),
+    binary_findings AS (
+        SELECT 'stale-rule:binary:' || n.program || ':' || n.path AS key,
+               count(DISTINCT c.session_id) AS sessions,
+               count(*) AS events,
+               min(c.ts_utc) AS first_seen,
+               max(c.ts_utc) AS last_seen
+        FROM named_programs AS n
+        JOIN command_not_found AS c ON c.program = n.program
+        GROUP BY n.program, n.path
+    ),
+    host_findings AS (
+        SELECT 'stale-rule:host:' || n.host || ':' || n.path AS key,
+               0 AS sessions,
+               0 AS events,
+               n.indexed_at AS first_seen,
+               n.indexed_at AS last_seen
+        FROM named_hosts AS n
+    )
+    SELECT key, sessions, events, first_seen, last_seen
+    FROM (
+        SELECT key, sessions, events, first_seen, last_seen
+        FROM binary_findings
+        UNION ALL
+        SELECT key, sessions, events, first_seen, last_seen
+        FROM host_findings
+    )
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+STALE_RULE_HIT_SQL = """
+    WITH command_not_found AS (
+        SELECT program, session_id, ts_utc
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND kind = 'run_failed'
+          AND program IS NOT NULL
+          AND trim(program) <> ''
+          AND signature IS NOT NULL
+          AND trim(signature) <> ''
+          AND sig_hash IS NOT NULL
+          AND lower(signature) LIKE '%command not found%'
+    ),
+    absent_programs AS (
+        SELECT program
+        FROM command_not_found
+        GROUP BY program
+        HAVING count(DISTINCT session_id) >= 2
+    ),
+    named_programs AS (
+        SELECT a.program, d.path
+        FROM absent_programs AS a
+        JOIN rule_doc AS d
+          ON d.stale = 0
+         AND d.path IS NOT NULL
+         AND trim(d.path) <> ''
+        WHERE a.program GLOB '*[0-9a-zA-Z]*'
+          AND EXISTS (
+              SELECT 1
+              FROM rule_fts AS f
+              WHERE f.path = d.path
+                AND f.text MATCH '"' || replace(a.program, '"', '""') || '"'
+          )
+    )
+    SELECT substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240) AS key,
+           c.session_id
+    FROM named_programs AS n
+    JOIN command_not_found AS c ON c.program = n.program
+    GROUP BY substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240),
+             c.session_id
+    ORDER BY key ASC, session_id ASC
+"""
+
+STALE_RULE_WEEK_HIT_SQL = """
+    WITH command_not_found AS (
+        SELECT program, session_id, ts_utc
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND kind = 'run_failed'
+          AND program IS NOT NULL
+          AND trim(program) <> ''
+          AND signature IS NOT NULL
+          AND trim(signature) <> ''
+          AND sig_hash IS NOT NULL
+          AND lower(signature) LIKE '%command not found%'
+    ),
+    absent_programs AS (
+        SELECT program
+        FROM command_not_found
+        GROUP BY program
+        HAVING count(DISTINCT session_id) >= 2
+    ),
+    named_programs AS (
+        SELECT a.program, d.path
+        FROM absent_programs AS a
+        JOIN rule_doc AS d
+          ON d.stale = 0
+         AND d.path IS NOT NULL
+         AND trim(d.path) <> ''
+        WHERE a.program GLOB '*[0-9a-zA-Z]*'
+          AND EXISTS (
+              SELECT 1
+              FROM rule_fts AS f
+              WHERE f.path = d.path
+                AND f.text MATCH '"' || replace(a.program, '"', '""') || '"'
+          )
+    )
+    SELECT substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240) AS key,
+           strftime('%G-W%V', c.ts_utc) AS week
+    FROM named_programs AS n
+    JOIN command_not_found AS c ON c.program = n.program
+    GROUP BY substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240),
+             strftime('%G-W%V', c.ts_utc)
+    ORDER BY key ASC, week ASC
+"""
+
+STALE_RULE_WEEKLY_HIT_SQL = """
+    WITH command_not_found AS (
+        SELECT program, session_id, ts_utc
+        FROM observation
+        WHERE ts_utc >= :window_start_utc
+          AND ts_utc < :window_end_utc
+          AND kind = 'run_failed'
+          AND program IS NOT NULL
+          AND trim(program) <> ''
+          AND signature IS NOT NULL
+          AND trim(signature) <> ''
+          AND sig_hash IS NOT NULL
+          AND lower(signature) LIKE '%command not found%'
+    ),
+    absent_programs AS (
+        SELECT program
+        FROM command_not_found
+        GROUP BY program
+        HAVING count(DISTINCT session_id) >= 2
+    ),
+    named_programs AS (
+        SELECT a.program, d.path
+        FROM absent_programs AS a
+        JOIN rule_doc AS d
+          ON d.stale = 0
+         AND d.path IS NOT NULL
+         AND trim(d.path) <> ''
+        WHERE a.program GLOB '*[0-9a-zA-Z]*'
+          AND EXISTS (
+              SELECT 1
+              FROM rule_fts AS f
+              WHERE f.path = d.path
+                AND f.text MATCH '"' || replace(a.program, '"', '""') || '"'
+          )
+    )
+    SELECT substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240) AS key,
+           strftime('%G-W%V', c.ts_utc) AS week,
+           count(DISTINCT c.session_id) AS sessions,
+           count(*) AS events
+    FROM named_programs AS n
+    JOIN command_not_found AS c ON c.program = n.program
+    GROUP BY substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240),
+             strftime('%G-W%V', c.ts_utc)
+    ORDER BY key ASC, week ASC
+"""
+
+STALE_RULE = Detector(
+    "D-08",
+    1,
+    "live rule documents naming a binary whose invocation keeps failing "
+    "command-not-found, or a host no longer producing observations",
+    STALE_RULE_SQL,
+    session_hits_sql=STALE_RULE_HIT_SQL,
+    week_hits_sql=STALE_RULE_WEEK_HIT_SQL,
+    weekly_hits_sql=STALE_RULE_WEEKLY_HIT_SQL,
+)
+
+
 UNREAD_RULE_DOC_SQL = """
     WITH read_state AS (
         SELECT sha, max(last_read_by_agent) AS last_read
@@ -1264,6 +1505,7 @@ REGISTRY: tuple[Detector, ...] = build_registry(
     REJECTED_TOOL_CALL,
     INTERRUPT_CORRECTION,
     REDISCOVERY,
+    STALE_RULE,
     UNREAD_RULE_DOC,
 )
 

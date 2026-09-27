@@ -179,6 +179,34 @@ timestamps describe all qualifying observations. Session-hit, week-hit, and
 weekly-series queries use the same rules. The registry keeps `cluster.score` at
 zero for Phase 3's ranker.
 
+## D-08@1: stale rule
+
+D-08 emits two cluster families over live indexed rule documents. A document
+**names** a program or host when its `rule_fts` text contains it as an FTS
+phrase — a quoted, token-sequence match under the corpus tokenizer, so `bf`
+matches `` `bf` `` in prose but not a substring buried inside another word,
+and `hetzner-ex44` matches across the hyphen split. The binary family joins
+that naming relation to D-01's qualification: a program whose
+`run_failed` observations carry a `command not found` signature in at least
+two distinct sessions inside the active window is proven absent from PATH by
+the agents still trying to run it, and each live document naming it emits
+`stale-rule:binary:<program>:<path>` with the sessions, events, and
+first/last timestamps of those failures. The host family emits
+`stale-rule:host:<host>:<path>` with zero counts and the document's
+`indexed_at` (the D-09 shape — the finding's evidence is the document) for a
+host that produced observations before the window but none inside it while a
+live document still names it; a host with no observations at all is not
+"retired", because nothing in the corpus ever proved it existed. Host
+findings stay dormant until Phase 7's multi-host pulls land. Session-hit,
+week-hit, and weekly-series queries follow the binary family only — a host
+finding has no session membership, which is consistent because its cluster
+reports zero sessions. Output is ordered by sessions descending, latest
+`last_seen` descending, then key ascending; the registry keeps
+`cluster.score` at zero for Phase 3's ranker. D-08 feeds rule decay and
+deletion review; the binary family is also lesson-eligible, because its
+evidence is real failed sessions, and a sub-threshold or unnamed program
+emits nothing.
+
 ## D-09@1: unread rule document
 
 D-09 emits one cluster for each live indexed rule document whose newest `last_read_by_agent` value
