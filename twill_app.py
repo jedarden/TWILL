@@ -378,6 +378,18 @@ def _source_kind(path: Path) -> str:
     return "jsonl"
 
 
+def launch_dir_from_path(path: Path) -> str:
+    """Return the directory that owns a transcript path.
+
+    ``launch_dir`` is source provenance, so it comes from the path rather than
+    from untrusted transcript content.  Keep the path spelling supplied by the
+    enumerator; resolving it here would make equivalent ingest configurations
+    produce different observation values.
+    """
+
+    return str(path.parent)
+
+
 def _count_record_type(counts: dict[str, int], record: dict[str, object]) -> None:
     """Fold one parsed record into the parse_shape histogram (plan §6.1, §8.2).
 
@@ -483,8 +495,31 @@ def parse_scan(
 
     events: list[TranscriptEvent] = []
     session_id = fallback_session_id
+    session_cwd: str | None = None
     invalid_lines = 0
     record_type_counts: dict[str, int] = {}
+
+    # Resume parsing starts in the middle of a file.  Re-read the committed
+    # prefix only to restore the sticky session metadata needed by appended
+    # records whose own line omits cwd.
+    if scan.start_offset and scan.lines:
+        prefix_end = scan.lines[0][0]
+        prefix = twill_cursor.scan_lines(path, 0)
+        for source_line, line in prefix.lines:
+            if source_line >= prefix_end:
+                break
+            if not line.strip():
+                continue
+            try:
+                record = json.loads(line)
+            except json.JSONDecodeError:
+                continue
+            if not isinstance(record, dict):
+                continue
+            cwd = record.get("cwd")
+            if isinstance(cwd, str) and cwd:
+                session_cwd = cwd
+
     for source_line, line in scan.lines:
         if not line.strip():
             continue
@@ -503,7 +538,8 @@ def parse_scan(
         _count_record_type(record_type_counts, record)
         record_type = str(record.get("type") or "session_event")
         cwd = record.get("cwd")
-        cwd_text = cwd if isinstance(cwd, str) else None
+        if isinstance(cwd, str) and cwd:
+            session_cwd = cwd
         for event_index, text in enumerate(_event_texts(record)):
             if not text.strip():
                 continue
@@ -515,7 +551,7 @@ def parse_scan(
                     text=text,
                     source_line=source_line,
                     event_index=event_index,
-                    cwd=cwd_text,
+                    cwd=session_cwd,
                 )
             )
     usage, usage_rows = _extract_usage(
@@ -988,6 +1024,9 @@ class Store:
         stored_session_id = self.redactor.redact_text(session.session_id)
         stored_source_path = self.redactor.redact_text(str(session.path))
         stored_source_kind = self.redactor.redact_text(session.source_kind)
+        stored_launch_dir = self.redactor.redact_text(
+            launch_dir_from_path(session.path)
+        )
         with conn:
             if replace:
                 for stale_id in dict.fromkeys((*stale_session_ids, stored_session_id)):
@@ -1043,6 +1082,7 @@ class Store:
                 key,
                 stored_session_id,
                 self.retention_seconds,
+                stored_launch_dir,
             )
             if cursor_update is not None:
                 twill_cursor.upsert_cursor(
@@ -1145,6 +1185,7 @@ class Store:
         session_key: str,
         session_id: str,
         retention_seconds: float | None = None,
+        launch_dir: str | None = None,
     ) -> int:
         """D-00@1: turn bounded session events into observations.
 
@@ -1179,9 +1220,18 @@ class Store:
             sig_hash = h12(normalized)
             conn.execute(
                 "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
-                "signature, sig_hash, excerpt, cwd) "
-                "VALUES (?, ?, ?, 'session_activity', ?, ?, ?, ?)",
-                (session_id, ts_utc, ts_local, normalized, sig_hash, text, cwd),
+                "signature, sig_hash, excerpt, launch_dir, cwd) "
+                "VALUES (?, ?, ?, 'session_activity', ?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    ts_utc,
+                    ts_local,
+                    normalized,
+                    sig_hash,
+                    text,
+                    launch_dir,
+                    cwd,
+                ),
             )
         row = conn.execute(
             "SELECT count(*) FROM observation WHERE session_id = ? AND kind = 'session_activity'",

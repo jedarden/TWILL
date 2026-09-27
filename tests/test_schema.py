@@ -735,8 +735,9 @@ class StoreIntegrationTests(unittest.TestCase):
         self.assertEqual(rows[0][4], "2026-09-20T12:00:00+00:00")
         self.assertEqual(rows[1][4], "2026-09-20T12:00:01+00:00")
         self.assertEqual(rows[0][3], "/home/coding/TWILL")
-        # The redactor maps an absent cwd to "" before persistence.
-        self.assertEqual(rows[1][3], "")
+        # Session metadata is sticky, so every observation receives the cwd
+        # even when a later transcript record omits it.
+        self.assertEqual(rows[1][3], "/home/coding/TWILL")
         # ts_local renders the same instant in the host's local zone (EC-15).
         local = datetime.fromisoformat(rows[0][5])
         self.assertEqual(

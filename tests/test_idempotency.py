@@ -52,13 +52,14 @@ from twill_cursor import CursorRow  # noqa: E402
 #: cross-store cursor comparison byte-exact instead of bookkeeping-blind.
 PINNED_MTIME_NS = 1_700_000_000_000_000_000
 
-#: Per table, the columns a cross-store comparison may drop: the session key
-#: and source path are derived from *where* the checkout sits, the stamps
-#: from *when* the run happened.  Nothing transcript-derived is droppable.
+#: Per table, the columns a cross-store comparison may drop: the session key,
+#: source path and launch directory are derived from *where* the checkout sits,
+#: the stamps from *when* the run happened.  Nothing transcript-derived is
+#: droppable.
 CROSS_STORE_DROPS = {
     "session": frozenset({"session_key", "source_path", "ingested_at"}),
     "transcript_event": frozenset({"session_key"}),
-    "observation": frozenset(),
+    "observation": frozenset({"launch_dir"}),
 }
 
 #: Cursor fields compared across stores; the omitted three are the path key

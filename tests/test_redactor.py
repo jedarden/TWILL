@@ -32,7 +32,7 @@ class RedactorTests(unittest.TestCase):
         token = "ghp_1234567890abcdefghijklmnop"
         fenced = "Restricted Vendor"
         session = SessionData(
-            path=Path(tempfile.gettempdir()) / f"source-{token}.jsonl",
+            path=Path(tempfile.gettempdir()) / f"source-{token}" / "session.jsonl",
             session_id=f"session-{token}",
             source_kind=f"source-{token}",
             events=(
@@ -56,7 +56,10 @@ class RedactorTests(unittest.TestCase):
                 for table, columns in (
                     ("session", ("session_id", "source_path", "source_kind")),
                     ("transcript_event", ("kind", "text", "cwd")),
-                    ("observation", ("session_id", "kind", "excerpt", "cwd")),
+                    (
+                        "observation",
+                        ("session_id", "kind", "excerpt", "launch_dir", "cwd"),
+                    ),
                 ):
                     selected = ", ".join(columns)
                     values.extend(
