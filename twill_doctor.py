@@ -1,8 +1,9 @@
-"""Read-only health checks for the Phase 1 TWILL pipeline.
+"""Health checks and bounded recovery actions for the Phase 1 TWILL pipeline.
 
-The doctor command is a diagnostic surface rather than a recovery surface. It
-opens the derived database without creating or migrating it, evaluates each
-Phase 1 signal independently, and aggregates the most severe result.
+The ordinary doctor command is a diagnostic surface: it opens the derived
+database without creating or migrating it, evaluates each Phase 1 signal
+independently, and aggregates the most severe result.  Explicit recovery flags
+are separate mutating operations and are run by the CLI under its state lock.
 """
 
 from __future__ import annotations
@@ -10,7 +11,7 @@ from __future__ import annotations
 import math
 import shutil
 import sqlite3
-from collections.abc import Callable, Mapping
+from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -18,7 +19,7 @@ from typing import Any
 from urllib.parse import quote
 
 import twill_schema
-from twill_redactor import redact_text
+from twill_redactor import Redactor, redact_text
 from twill_status import read_status
 
 
@@ -125,6 +126,69 @@ def _result(
 
 def _exception_text(exc: Exception) -> str:
     return redact_text(str(exc) or exc.__class__.__name__)
+
+
+_REDACTION_RESCAN_FIELDS = (
+    # ``transcript_event.text`` is the legacy source row from which the
+    # walking-skeleton detector rebuilds observations.  It is bounded and
+    # redacted at persistence just like ``observation.excerpt``.
+    ("transcript_event", "event_id", "text"),
+    ("observation", "obs_id", "excerpt"),
+)
+
+
+def rescan_redaction(
+    connection: sqlite3.Connection,
+    *,
+    content_fences: Iterable[str] = (),
+) -> dict[str, int]:
+    """Re-apply the current excerpt redactor to stored derived text.
+
+    This is the documented recovery for a redactor regression (§8.2).  The
+    operation is deliberately limited to bounded excerpt fields: identifiers,
+    signatures, and detector keys have their own semantics and are not
+    rewritten as a side effect.  The source ``transcript_event.text`` mirror
+    is included so a later ingest resume cannot regenerate a stale excerpt.
+
+    Rows are updated in one transaction.  Missing legacy tables are skipped so
+    a database containing only the v1 corpus schema can still be repaired.
+    ``None`` stays ``None``; a nullable excerpt is not turned into an empty
+    string merely because the recovery ran.
+    """
+
+    redactor = Redactor(content_fences)
+    rows_scanned = 0
+    rows_changed = 0
+    fields_changed = 0
+    with connection:
+        for table, key_column, excerpt_column in _REDACTION_RESCAN_FIELDS:
+            table_exists = connection.execute(
+                "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = ?",
+                (table,),
+            ).fetchone()
+            if table_exists is None:
+                continue
+            rows = connection.execute(
+                f"SELECT {key_column}, {excerpt_column} FROM {table}"
+            ).fetchall()
+            for key, stored_excerpt in rows:
+                rows_scanned += 1
+                if stored_excerpt is None:
+                    continue
+                redacted_excerpt = redactor.redact_excerpt(stored_excerpt)
+                if redacted_excerpt == stored_excerpt:
+                    continue
+                connection.execute(
+                    f"UPDATE {table} SET {excerpt_column} = ? WHERE {key_column} = ?",
+                    (redacted_excerpt, key),
+                )
+                rows_changed += 1
+                fields_changed += 1
+    return {
+        "rows_scanned": rows_scanned,
+        "rows_changed": rows_changed,
+        "fields_changed": fields_changed,
+    }
 
 
 def _newest_schema_version() -> int:

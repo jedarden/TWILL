@@ -1471,6 +1471,50 @@ def rebuild_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def rescan_redaction_command(args: argparse.Namespace) -> int:
+    """``twill doctor --rescan-redaction``: repair stored excerpts in place."""
+
+    # The configured content fences are part of the current redactor.  Load
+    # them before opening the database so an invalid configuration cannot
+    # leave a partially repaired state behind.
+    config = load_config()
+    state_dir = _state_dir(args.state_dir)
+    db_path = twill_schema.state_db_path(state_dir)
+    if not db_path.is_file():
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            f"state database does not exist: {db_path}",
+            "run a mutating verb such as 'twill ingest' first",
+        )
+    started = perf_counter()
+    connection = twill_schema.connect(state_dir)
+    try:
+        result = twill_doctor.rescan_redaction(
+            connection,
+            content_fences=config.content_fences,
+        )
+    finally:
+        connection.close()
+
+    record_stage(
+        state_dir,
+        "rescan_redaction",
+        perf_counter() - started,
+        {
+            "rows": result["rows_scanned"],
+            "records": result["rows_changed"],
+        },
+    )
+    emit_success(result, json_mode=args.json)
+    if args.json:
+        return EXIT_SUCCESS
+    print(
+        f"rescanned {result['rows_scanned']} stored excerpt row(s); "
+        f"updated {result['rows_changed']} row(s)"
+    )
+    return EXIT_SUCCESS
+
+
 def _window_days(seconds: float) -> int:
     """Convert a ``--window`` duration to whole days (cluster.window_days)."""
 
@@ -2030,6 +2074,8 @@ def status_command(args: argparse.Namespace) -> int:
 def doctor_command(args: argparse.Namespace) -> int:
     if args.rebuild:
         return rebuild_command(args)
+    if args.rescan_redaction:
+        return rescan_redaction_command(args)
     report = twill_doctor.run_doctor(_state_dir(args.state_dir))
     emit_success(
         report.as_dict(),
@@ -2237,10 +2283,16 @@ def build_parser() -> argparse.ArgumentParser:
     doctor = subparsers.add_parser(
         "doctor", help="check Phase 1 pipeline health"
     )
-    doctor.add_argument(
+    recovery = doctor.add_mutually_exclusive_group()
+    recovery.add_argument(
         "--rebuild",
         action="store_true",
         help="recreate the state database and reparse every on-disk session",
+    )
+    recovery.add_argument(
+        "--rescan-redaction",
+        action="store_true",
+        help="re-apply the current redactor to stored excerpts",
     )
     doctor.add_argument("--source", action="append", help="transcript root; may be repeated")
     doctor.add_argument(
@@ -2281,14 +2333,15 @@ def main(argv: Sequence[str] | None = None) -> int:
         if getattr(args, "limit", 1) < 1:
             raise CliError(EXIT_USAGE_ERROR, "--limit must be at least 1")
         writes_artifact = args.command == "digest" and not args.stdout and not args.json
-        # EC-10: --rebuild deletes and rewrites the state database, so the
-        # otherwise read-only doctor verb takes the state lock for it like
-        # any mutating verb — a timer firing mid-recovery queues behind it.
+        # EC-10: doctor recovery flags mutate derived state, so the otherwise
+        # read-only doctor verb takes the state lock for them like any other
+        # mutating verb — a timer firing mid-recovery queues behind it.
         rebuilds_state = args.command == "doctor" and args.rebuild
+        rescans_redaction = args.command == "doctor" and args.rescan_redaction
         needs_lock = args.command in MUTATING_VERBS and not (
             args.command == "explain" and args.dry_run
         )
-        if needs_lock or writes_artifact or rebuilds_state:
+        if needs_lock or writes_artifact or rebuilds_state or rescans_redaction:
             with StateLock(_state_dir(args.state_dir)):
                 return int(args.handler(args))
         return int(args.handler(args))

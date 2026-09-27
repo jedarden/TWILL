@@ -326,6 +326,111 @@ class DoctorChecksTests(unittest.TestCase):
         self.assertNotIn(token, rendered)
         self.assertIn("<redacted:github-token>", rendered)
 
+    def test_rescan_redaction_repairs_observation_and_source_excerpts(self):
+        self.create_database()
+        token = "ghp_" + "1234567890" + "abcdefghijklmnop"
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "CREATE TABLE transcript_event ("
+            "event_id INTEGER PRIMARY KEY, text TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO transcript_event(event_id, text) VALUES (1, ?)",
+            (f"source {token}",),
+        )
+        connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, excerpt) "
+            "VALUES ('s1', 't', 't', 'session_activity', ?)",
+            (f"observation {token}",),
+        )
+        connection.commit()
+
+        result = twill_doctor.rescan_redaction(connection)
+
+        self.assertEqual(result, {"rows_scanned": 2, "rows_changed": 2, "fields_changed": 2})
+        self.assertEqual(
+            connection.execute("SELECT text FROM transcript_event").fetchone()[0],
+            "source <redacted:github-token>",
+        )
+        self.assertEqual(
+            connection.execute("SELECT excerpt FROM observation").fetchone()[0],
+            "observation <redacted:github-token>",
+        )
+        connection.close()
+
+    def test_rescan_redaction_is_idempotent_and_preserves_nulls(self):
+        self.create_database()
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, excerpt) "
+            "VALUES ('s1', 't', 't', 'session_activity', NULL)"
+        )
+        connection.commit()
+
+        first = twill_doctor.rescan_redaction(connection)
+        second = twill_doctor.rescan_redaction(connection)
+
+        self.assertEqual(first["rows_scanned"], 1)
+        self.assertEqual(first["rows_changed"], 0)
+        self.assertEqual(second, first)
+        self.assertIsNone(
+            connection.execute("SELECT excerpt FROM observation").fetchone()[0]
+        )
+        connection.close()
+
+    def test_cli_rescan_redaction_uses_configured_fences_and_records_status(self):
+        self.create_database()
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, excerpt) "
+            "VALUES ('s1', 't', 't', 'session_activity', 'before private.example after')"
+        )
+        connection.commit()
+        connection.close()
+
+        home = self.root / "home"
+        config_dir = home / ".config" / "twill"
+        config_dir.mkdir(parents=True)
+        (config_dir / "config.toml").write_text(
+            f'artifacts_root = "{home / "artifacts"}"\n'
+            'content_fences = ["private.example"]\n',
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [
+                sys.executable,
+                str(CLI),
+                "doctor",
+                "--rescan-redaction",
+                "--json",
+                "--state-dir",
+                str(self.state),
+            ],
+            cwd=ROOT,
+            env={**os.environ, "HOME": str(home)},
+            check=False,
+            text=True,
+            capture_output=True,
+        )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            payload["data"],
+            {"fields_changed": 1, "rows_changed": 1, "rows_scanned": 1},
+        )
+        connection = twill_schema.connect_read_only(self.state)
+        self.assertEqual(
+            connection.execute("SELECT excerpt FROM observation").fetchone()[0],
+            "before <redacted:content-fence> after",
+        )
+        connection.close()
+        status = json.loads((self.state / "status.json").read_text(encoding="utf-8"))
+        self.assertEqual(
+            status["data"]["stages"]["rescan_redaction"]["counts"],
+            {"records": 1, "rows": 1},
+        )
+
 
 if __name__ == "__main__":
     unittest.main()

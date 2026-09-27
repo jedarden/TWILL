@@ -133,7 +133,6 @@ twill doctor --json --state-dir ~/.local/state/twill
 
 The command exits `0` when healthy, `1` when degraded, and `2` when broken. These health exits are
 reported through the normal JSON envelope; argument errors retain the CLI usage-error contract.
-Later health checks and recovery flags are added independently.
 
 `doctor --rebuild` is the one recovery action (plan §5 Scenario 3, §8.2): after database loss or
 corruption it discards `twill.db` and its WAL sidecars, recreates the schema, and reparses every
@@ -145,6 +144,14 @@ re-reading:
 
 ```sh
 twill doctor --rebuild
+```
+
+After reverting a redactor regression, the stored bounded excerpts can be repaired in place with
+the current redactor. The operation takes the state lock, applies configured content fences, and
+records a `rescan_redaction` stage without rereading transcript files:
+
+```sh
+twill doctor --rescan-redaction
 ```
 
 Enumeration happens before the database is touched: a missing source root or a tree whose files are
