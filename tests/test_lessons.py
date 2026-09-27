@@ -291,6 +291,7 @@ class LessonCliTests(unittest.TestCase):
                 TwillConfig(artifacts_root=artifacts),
             )[0]
             lesson_id = path.stem
+            path.write_text(path.read_text() + "\nOperator body for the owner repo.\n")
             state = root / "state"
             with StateLock(state):
                 locked = self.run_cli(
@@ -328,6 +329,17 @@ class LessonCliTests(unittest.TestCase):
             self.assertEqual(
                 json.loads(applied.stdout)["data"]["lesson"]["state"],
                 "applied:environment",
+            )
+            applied_data = json.loads(applied.stdout)["data"]
+            self.assertEqual(
+                applied_data["bead_create_command"].split()[:2],
+                ["bead", "create"],
+            )
+            self.assertIn("--label detector:D-01", applied_data["bead_create_command"])
+            self.assertIn("--description", applied_data["bead_create_command"])
+            self.assertIn(
+                "Operator body for the owner repo.",
+                applied_data["bead_create_command"],
             )
 
 

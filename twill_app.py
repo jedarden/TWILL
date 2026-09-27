@@ -34,6 +34,7 @@ import twill_measure
 import twill_prune
 import twill_ranker
 import twill_rules
+import twill_router
 import twill_schema
 import twill_cursor
 import twill_doctor
@@ -1909,8 +1910,15 @@ def prune_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
-def _lesson_data(record: twill_lessons.LessonRecord) -> dict[str, object]:
-    return {"lesson": record.as_dict()}
+def _lesson_data(
+    record: twill_lessons.LessonRecord,
+    *,
+    bead_command: str | None = None,
+) -> dict[str, object]:
+    data: dict[str, object] = {"lesson": record.as_dict()}
+    if bead_command is not None:
+        data["bead_create_command"] = bead_command
+    return data
 
 
 def _print_lesson(record: twill_lessons.LessonRecord, action: str) -> None:
@@ -1951,9 +1959,18 @@ def apply_command(args: argparse.Namespace) -> int:
         bead=args.bead,
         operator=True,
     )
-    emit_success(_lesson_data(record), json_mode=args.json)
+    bead_command = twill_router.bead_create_command(
+        title=record.summary,
+        body=record.body,
+        detector=record.detector,
+    )
+    emit_success(
+        _lesson_data(record, bead_command=bead_command),
+        json_mode=args.json,
+    )
     if not args.json:
         _print_lesson(record, "applied")
+        print(bead_command)
     return EXIT_SUCCESS
 
 

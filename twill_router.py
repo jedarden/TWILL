@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import shlex
 from collections.abc import Iterable
 from dataclasses import dataclass
 
@@ -84,10 +85,39 @@ def recommend_routing(
     )
 
 
+def bead_create_command(*, title: str, body: str, detector: str) -> str:
+    """Render the bead creation invocation for a human to run in the owner repo.
+
+    This function only serializes arguments.  In particular, it must never
+    invoke the bead CLI: creating work in another repository is an explicit
+    human operation.
+    """
+
+    if not isinstance(title, str) or not title:
+        raise ValidationError("bead title must be non-empty text")
+    if not isinstance(body, str):
+        raise ValidationError("lesson body must be text")
+    if not isinstance(detector, str) or _DETECTOR_RE.fullmatch(detector) is None:
+        raise ValidationError("bead detector must be a detector identifier")
+    return shlex.join(
+        (
+            "bead",
+            "create",
+            "--title",
+            title,
+            "--description",
+            body,
+            "--label",
+            f"detector:{detector}",
+        )
+    )
+
+
 __all__ = [
     "MAX_ROUTING_REASON_LENGTH",
     "ROUTING_LAYER_ORDER",
     "RoutingRecommendation",
+    "bead_create_command",
     "rank_routing_layers",
     "recommend_routing",
 ]

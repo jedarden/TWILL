@@ -1,6 +1,7 @@
 """Tests for deterministic lesson routing recommendations."""
 
 import sys
+import shlex
 import unittest
 from pathlib import Path
 
@@ -10,6 +11,7 @@ sys.path.insert(0, str(ROOT))
 from twill_contract import ValidationError  # noqa: E402
 from twill_router import (  # noqa: E402
     ROUTING_LAYER_ORDER,
+    bead_create_command,
     rank_routing_layers,
     recommend_routing,
 )
@@ -60,6 +62,28 @@ class RoutingTests(unittest.TestCase):
                 key="command-not-found:sqlite3",
                 sessions=0,
             )
+
+    def test_bead_create_command_contains_owner_repo_payload_without_executing(self):
+        command = bead_create_command(
+            title="Repair the recurring command failure",
+            body="Install the missing command before retrying.\nKeep the fix in the owner repo.",
+            detector="D-01",
+        )
+
+        self.assertEqual(
+            shlex.split(command),
+            [
+                "bead",
+                "create",
+                "--title",
+                "Repair the recurring command failure",
+                "--description",
+                "Install the missing command before retrying.\nKeep the fix in the owner repo.",
+                "--label",
+                "detector:D-01",
+            ],
+        )
+        self.assertNotIn("subprocess", command)
 
 
 if __name__ == "__main__":
