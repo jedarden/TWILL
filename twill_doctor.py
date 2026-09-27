@@ -32,6 +32,9 @@ EXIT_HEALTHY = 0
 EXIT_DEGRADED = 1
 EXIT_BROKEN = 2
 
+# EC-13 uses two thresholds: ingest refuses to start below the floor, while
+# doctor warns earlier so an operator has room to recover before writes fail.
+FREE_DISK_INGEST_FLOOR_BYTES = 2 * 1024**3
 FREE_DISK_WARN_BYTES = 5 * 1024**3
 TIMER_INTERVALS = {"ingest": 3600.0}
 DEAD_MAN_WINDOW_SECONDS = 24 * 3600.0
@@ -666,15 +669,22 @@ def _nearest_existing_path(path: Path) -> Path:
     return candidate
 
 
+def _read_free_disk(
+    state_dir: Path,
+    disk_usage: Callable[[Path], Any] | None,
+) -> tuple[Path, int]:
+    target = _nearest_existing_path(state_dir)
+    usage_function = disk_usage or shutil.disk_usage
+    usage = usage_function(target)
+    return target, int(usage.free)
+
+
 def _check_disk_space(
     state_dir: Path,
     disk_usage: Callable[[Path], Any] | None,
 ) -> CheckResult:
-    target = _nearest_existing_path(state_dir)
-    usage_function = disk_usage or shutil.disk_usage
     try:
-        usage = usage_function(target)
-        free = int(usage.free)
+        target, free = _read_free_disk(state_dir, disk_usage)
     except Exception as exc:
         return _result(
             "disk_space",
@@ -698,6 +708,47 @@ def _check_disk_space(
         "disk_space",
         HEALTHY,
         f"free disk is at least {FREE_DISK_WARN_BYTES} bytes",
+        details,
+    )
+
+
+def check_ingest_disk_space(
+    state_dir: Path,
+    disk_usage: Callable[[Path], Any] | None = None,
+) -> CheckResult:
+    """Check EC-13's hard free-space floor before an ingest can write.
+
+    This check does not create the state directory or database.  A missing
+    state directory is measured via its nearest existing parent, and failure
+    to read the filesystem is treated as a blocked ingest rather than as
+    permission to proceed blindly.
+    """
+
+    try:
+        target, free = _read_free_disk(state_dir, disk_usage)
+    except Exception as exc:
+        return _result(
+            "disk_space",
+            BROKEN,
+            f"free disk cannot be read: {_exception_text(exc)}; ingest refused",
+            {"error": _exception_text(exc)},
+        )
+    details = {
+        "path": redact_text(str(target)),
+        "free_bytes": free,
+        "threshold_bytes": FREE_DISK_INGEST_FLOOR_BYTES,
+    }
+    if free < FREE_DISK_INGEST_FLOOR_BYTES:
+        return _result(
+            "disk_space",
+            BROKEN,
+            f"free disk is below {FREE_DISK_INGEST_FLOOR_BYTES} bytes; ingest refused",
+            details,
+        )
+    return _result(
+        "disk_space",
+        HEALTHY,
+        f"free disk is at least {FREE_DISK_INGEST_FLOOR_BYTES} bytes",
         details,
     )
 

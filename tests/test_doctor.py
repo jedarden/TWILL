@@ -306,6 +306,24 @@ class DoctorChecksTests(unittest.TestCase):
         report = self.healthy_report(free=twill_doctor.FREE_DISK_WARN_BYTES)
         self.assertEqual(self.check(report, "disk_space").status, twill_doctor.HEALTHY)
 
+    def test_ingest_free_disk_floor_is_inclusive(self):
+        below = twill_doctor.check_ingest_disk_space(
+            self.state,
+            disk_usage=lambda _: SimpleNamespace(
+                free=twill_doctor.FREE_DISK_INGEST_FLOOR_BYTES - 1
+            ),
+        )
+        self.assertEqual(below.status, twill_doctor.BROKEN)
+        self.assertIn("ingest refused", below.message)
+
+        at_floor = twill_doctor.check_ingest_disk_space(
+            self.state,
+            disk_usage=lambda _: SimpleNamespace(
+                free=twill_doctor.FREE_DISK_INGEST_FLOOR_BYTES
+            ),
+        )
+        self.assertEqual(at_floor.status, twill_doctor.HEALTHY)
+
     def test_cursor_paths_are_redacted_in_machine_output(self):
         self.create_database()
         token = "ghp_" + "1234567890" + "abcdefghijklmnop"

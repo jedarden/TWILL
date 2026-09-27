@@ -24,7 +24,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Iterator, Mapping, Sequence
+from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import twill_detectors
 import twill_digest
@@ -1270,11 +1270,25 @@ def _has_missing_source_root(roots: Sequence[Path | str]) -> bool:
     )
 
 
-def ingest_command(args: argparse.Namespace) -> int:
+def ingest_command(
+    args: argparse.Namespace,
+    *,
+    disk_usage: Callable[[Path], Any] | None = None,
+) -> int:
     # Loaded before anything is read or written so a wrong config fails fast
     # (plan §3: bad config is a startup error, never a convenient fallback).
     config = load_config()
     state_dir = _state_dir(args.state_dir)
+    disk = twill_doctor.check_ingest_disk_space(
+        state_dir,
+        disk_usage=disk_usage,
+    )
+    if disk.status != twill_doctor.HEALTHY:
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            f"ingest refused: {disk.message}",
+            "free at least 2 GiB before running twill ingest",
+        )
     started = perf_counter()
     settle = args.settle if args.settle is not None else config.settle_window
     source_patterns = _source_patterns(args.source, config)
