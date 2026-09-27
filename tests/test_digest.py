@@ -587,6 +587,38 @@ class DigestDiffTests(DigestStateCase):
         self.assertEqual(lesson.read_bytes(), lesson_before)
         self.assertEqual(measurement_path.read_bytes(), measurement_before)
 
+    def test_digest_contains_a_read_only_retirement_proposal(self):
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, stale) "
+            "VALUES ('/rules/dormant.md', 'memory', 'sha-dormant', ?, 0)",
+            ("2026-05-01T00:00:00+00:00",),
+        )
+        self.connection.commit()
+        before = self.connection.execute(
+            "SELECT path, sha, stale FROM rule_doc"
+        ).fetchall()
+
+        report = self.build(registry=())
+
+        self.assertFalse(report.clean)
+        self.assertEqual(len(report.retirements), 1)
+        proposal = report.retirements[0]
+        self.assertEqual(proposal.path, "/rules/dormant.md")
+        self.assertIsNone(proposal.last_occurrence)
+        data = twill_digest.render_data(report)
+        self.assertEqual(data["retirements"][0]["path"], "/rules/dormant.md")
+        self.assertEqual(
+            data["retirements"][0]["removal_owner"],
+            "human edit in the owning layer",
+        )
+        self.assertIn("retirement proposals: 1", twill_digest.render_text(report))
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT path, sha, stale FROM rule_doc"
+            ).fetchall(),
+            before,
+        )
+
     def test_detector_failure_is_visible_and_not_clean(self):
         detector = twill_digest.Detector(
             "D-99",

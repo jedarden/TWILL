@@ -5,6 +5,11 @@ answers the inverse question: for every live rule document, which current
 clusters it covers, how their weekly recurrence changed, and whether the
 document has gone unread long enough to be a deletion candidate.
 
+It also evaluates the Phase 6 retirement rule over the same report: after 90
+days with no observed occurrence, a rule whose document has also been unread
+for 90 days is proposed for retirement.  This is only a proposal; removal is
+still a human edit in the owning layer.
+
 The report is deliberately read-only.  Rule indexing and detector refresh are
 separate mutating stages; ``twill rules`` only consumes their durable rows.
 """
@@ -12,10 +17,11 @@ separate mutating stages; ``twill rules`` only consumes their durable rows.
 from __future__ import annotations
 
 import sqlite3
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
 
 
+RETIREMENT_AFTER_DAYS = 90
 RECURRENCE_UP = "up"
 RECURRENCE_DOWN = "down"
 RECURRENCE_FLAT = "flat"
@@ -201,6 +207,42 @@ class RuleEntry:
 
 
 @dataclass(frozen=True)
+class RetirementProposal:
+    """Evidence for a human decision to retire one rule document."""
+
+    path: str
+    layer: str
+    sha: str
+    last_read: str | None
+    unread_since: str
+    unread_age_days: float | None
+    last_occurrence: str | None
+    occurrence_age_days: float | None
+    covered_clusters: int
+
+    @property
+    def removal_owner(self) -> str:
+        """The owning layer, not TWILL, performs the removal edit."""
+
+        return "human edit in the owning layer"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "path": self.path,
+            "layer": self.layer,
+            "sha": self.sha,
+            "last_read": self.last_read,
+            "last_read_by_agent": self.last_read,
+            "unread_since": self.unread_since,
+            "unread_age_days": self.unread_age_days,
+            "last_occurrence": self.last_occurrence,
+            "occurrence_age_days": self.occurrence_age_days,
+            "covered_clusters": self.covered_clusters,
+            "removal_owner": self.removal_owner,
+        }
+
+
+@dataclass(frozen=True)
 class RulesReport:
     """The complete rule earnings and decay report."""
 
@@ -210,6 +252,7 @@ class RulesReport:
     rules: tuple[RuleEntry, ...]
     stale_rules: tuple[dict[str, object], ...] = ()
     warnings: tuple[str, ...] = ()
+    retirement_proposals: tuple[RetirementProposal, ...] = ()
 
     @property
     def deletion_candidates(self) -> tuple[RuleEntry, ...]:
@@ -223,8 +266,15 @@ class RulesReport:
     def unread_rules(self) -> tuple[RuleEntry, ...]:
         return tuple(rule for rule in self.rules if rule.unread)
 
+    @property
+    def retirements(self) -> tuple[RetirementProposal, ...]:
+        """Short alias for callers that render proposal collections."""
+
+        return self.retirement_proposals
+
     def as_dict(self) -> dict[str, object]:
         candidates = self.deletion_candidates
+        retirements = self.retirement_proposals
         return {
             "as_of": self.as_of,
             "unread_days": self.unread_days,
@@ -232,12 +282,15 @@ class RulesReport:
             "rules": [rule.as_dict() for rule in self.rules],
             "deletion_candidates": [rule.as_dict() for rule in candidates],
             "deletion_candidate_paths": [rule.path for rule in candidates],
+            "retirement_proposals": [item.as_dict() for item in retirements],
+            "retirement_proposal_paths": [item.path for item in retirements],
             "stale_rules": list(self.stale_rules),
             "summary": {
                 "rules": len(self.rules),
                 "covered_rules": len(self.covered_rules),
                 "unread_rules": len(self.unread_rules),
                 "deletion_candidates": len(candidates),
+                "retirement_proposals": len(retirements),
                 "stale_rules": len(self.stale_rules),
             },
         }
@@ -370,6 +423,77 @@ def _stale_rules(connection: sqlite3.Connection) -> tuple[dict[str, object], ...
     )
 
 
+def evaluate_retirements(
+    report: RulesReport,
+    *,
+    zero_days: int = RETIREMENT_AFTER_DAYS,
+) -> tuple[RetirementProposal, ...]:
+    """Propose retirement when both Phase 6 decay signals agree.
+
+    The earnings report is a current snapshot.  A rule with no covered
+    cluster has no observed occurrence in that snapshot; an old covered
+    cluster contributes its ``last_seen`` timestamp instead.  Any recent or
+    malformed covered cluster blocks the proposal because unknown evidence is
+    not proof of zero occurrences.  The document must have been unread for
+    at least the fixed Phase 6 90-day period as well as satisfying the
+    report's unread classification.
+
+    This function only returns data.  It never changes the report or the
+    database, and it never removes a rule document.
+    """
+
+    if isinstance(zero_days, bool) or not isinstance(zero_days, int) or zero_days < 1:
+        raise ValueError("zero_days must be a positive integer")
+    as_of = _clock(report.as_of)
+    proposals: list[RetirementProposal] = []
+
+    for rule in report.rules:
+        if not rule.unread:
+            continue
+        if (
+            rule.unread_age_days is None
+            or rule.unread_age_days < RETIREMENT_AFTER_DAYS
+        ):
+            continue
+
+        last_occurrence: datetime | None = None
+        if rule.clusters:
+            occurrences = [_timestamp(cluster.last_seen) for cluster in rule.clusters]
+            if any(occurrence is None for occurrence in occurrences):
+                continue
+            last_occurrence = max(
+                occurrence for occurrence in occurrences if occurrence is not None
+            )
+            occurrence_age_days = max(
+                0.0,
+                (as_of - last_occurrence).total_seconds() / 86400.0,
+            )
+            if occurrence_age_days < zero_days:
+                continue
+        else:
+            # No current covered cluster is the report's zero-occurrence
+            # signal.  The unread age supplies the available lower bound for
+            # how long that absence has persisted.
+            occurrence_age_days = None
+
+        proposals.append(
+            RetirementProposal(
+                path=rule.path,
+                layer=rule.layer,
+                sha=rule.sha,
+                last_read=rule.last_read,
+                unread_since=rule.unread_since,
+                unread_age_days=rule.unread_age_days,
+                last_occurrence=(
+                    _iso(last_occurrence) if last_occurrence is not None else None
+                ),
+                occurrence_age_days=occurrence_age_days,
+                covered_clusters=len(rule.clusters),
+            )
+        )
+    return tuple(proposals)
+
+
 def build_rules_report(
     connection: sqlite3.Connection,
     *,
@@ -471,7 +595,7 @@ def build_rules_report(
         warnings = (
             f"{len(stale)} stale rule document(s) are excluded from live coverage and deletion candidates",
         )
-    return RulesReport(
+    report = RulesReport(
         as_of=_iso(as_of),
         unread_days=days,
         database=True,
@@ -479,6 +603,7 @@ def build_rules_report(
         stale_rules=stale,
         warnings=warnings,
     )
+    return replace(report, retirement_proposals=evaluate_retirements(report))
 
 
 def empty_rules_report(
@@ -543,6 +668,17 @@ def render_text(report: RulesReport, *, deletion_candidates: bool = False) -> st
             lines.extend(f"- {rule.path}" for rule in candidates)
         else:
             lines.append("- none")
+    if report.retirement_proposals:
+        lines.append(
+            "retirement proposals (removal is a human edit in the owning layer):"
+        )
+        for proposal in report.retirement_proposals:
+            lines.append(
+                f"- {proposal.path} [{proposal.layer}]: last read "
+                f"{proposal.last_read or 'never'}; last occurrence "
+                f"{proposal.last_occurrence or 'none'}; "
+                f"{proposal.covered_clusters} covered cluster(s)"
+            )
     return "\n".join(lines)
 
 
@@ -551,12 +687,15 @@ __all__ = [
     "RECURRENCE_FLAT",
     "RECURRENCE_UNKNOWN",
     "RECURRENCE_UP",
+    "RETIREMENT_AFTER_DAYS",
     "CoveredCluster",
     "RuleEntry",
+    "RetirementProposal",
     "RulesReport",
     "WeeklyRecurrence",
     "build_rules_report",
     "empty_rules_report",
+    "evaluate_retirements",
     "render_rules_report",
     "render_text",
     "rules_report",

@@ -214,6 +214,133 @@ class RulesCommandTests(unittest.TestCase):
         self.assertEqual(payload["data"]["deletion_candidate_paths"], ["/rules/old.md"])
         self.assertEqual(payload["warnings"], [])
 
+class RetirementTests(unittest.TestCase):
+    """Contract tests for the read-only Phase 6 retirement proposal."""
+
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.connection = twill_schema.connect(Path(temporary.name) / "state")
+        self.addCleanup(self.connection.close)
+
+    def add_rule(
+        self,
+        path: str,
+        *,
+        indexed_at: str = "2026-06-01T00:00:00+00:00",
+        last_read: str | None = None,
+        stale: int = 0,
+    ) -> None:
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, last_read_by_agent, stale) "
+            "VALUES (?, 'memory', ?, ?, ?, ?)",
+            (path, f"sha-{path}", indexed_at, last_read, stale),
+        )
+
+    def add_cluster(self, path: str, *, last_seen: str) -> None:
+        self.connection.execute(
+            "INSERT INTO cluster(detector_id, key, window_days, sessions, events, "
+            "first_seen, last_seen, score, covered_by, state) "
+            "VALUES ('D-01', ?, 30, 3, 5, ?, ?, 0.0, ?, 'open')",
+            (
+                f"rule-{path}",
+                "2026-06-01T00:00:00+00:00",
+                last_seen,
+                path,
+            ),
+        )
+
+    def report(self, *, now: str = NOW):
+        self.connection.commit()
+        return twill_rules.build_rules_report(self.connection, now=now)
+
+    def test_old_unread_rule_with_zero_occurrences_is_proposed(self):
+        self.add_rule("/rules/dormant.md")
+
+        report = self.report()
+
+        self.assertEqual(len(report.retirement_proposals), 1)
+        proposal = report.retirement_proposals[0]
+        self.assertEqual(proposal.path, "/rules/dormant.md")
+        self.assertIsNone(proposal.last_occurrence)
+        self.assertEqual(proposal.covered_clusters, 0)
+        self.assertEqual(
+            proposal.removal_owner,
+            "human edit in the owning layer",
+        )
+
+    def test_old_last_occurrence_is_proposed_but_recent_one_is_not(self):
+        self.add_rule("/rules/old.md")
+        self.add_cluster(
+            "/rules/old.md",
+            last_seen="2026-06-15T00:00:00+00:00",
+        )
+        report = self.report()
+        self.assertEqual(
+            report.retirement_proposals[0].last_occurrence,
+            "2026-06-15T00:00:00+00:00",
+        )
+
+        self.add_rule("/rules/recent.md")
+        self.add_cluster(
+            "/rules/recent.md",
+            last_seen="2026-09-27T00:00:00+00:00",
+        )
+        self.assertEqual(
+            [item.path for item in self.report().retirement_proposals],
+            ["/rules/old.md"],
+        )
+
+    def test_recent_read_and_young_rules_are_not_proposed(self):
+        self.add_rule(
+            "/rules/read.md",
+            last_read="2026-09-27T00:00:00+00:00",
+        )
+        self.add_rule(
+            "/rules/young.md",
+            indexed_at="2026-09-27T00:00:00+00:00",
+        )
+
+        self.assertEqual(self.report().retirement_proposals, ())
+
+    def test_malformed_occurrence_evidence_does_not_prove_zero(self):
+        self.add_rule("/rules/mystery.md")
+        self.add_cluster("/rules/mystery.md", last_seen="not-a-timestamp")
+
+        self.assertEqual(self.report().retirement_proposals, ())
+
+    def test_retirement_is_serialized_and_does_not_mutate_state(self):
+        self.add_rule("/rules/dormant.md")
+        self.connection.commit()
+        before = self.connection.execute(
+            "SELECT path, stale FROM rule_doc"
+        ).fetchall()
+
+        payload = self.report().as_dict()
+
+        self.assertEqual(payload["retirement_proposal_paths"], ["/rules/dormant.md"])
+        self.assertEqual(payload["summary"]["retirement_proposals"], 1)
+        self.assertEqual(
+            payload["retirement_proposals"][0]["removal_owner"],
+            "human edit in the owning layer",
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT path, stale FROM rule_doc").fetchall(),
+            before,
+        )
+
+    def test_zero_occurrence_threshold_can_be_evaluated_explicitly(self):
+        self.add_rule("/rules/fading.md")
+        self.add_cluster(
+            "/rules/fading.md",
+            last_seen="2026-08-19T00:00:00+00:00",
+        )
+
+        report = self.report()
+        self.assertEqual(report.retirement_proposals, ())
+        proposals = twill_rules.evaluate_retirements(report, zero_days=30)
+        self.assertEqual([item.path for item in proposals], ["/rules/fading.md"])
+
 
 if __name__ == "__main__":
     unittest.main()

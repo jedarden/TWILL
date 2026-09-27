@@ -17,6 +17,7 @@ from typing import Sequence
 import twill_detectors
 import twill_lessons
 import twill_measure
+import twill_rules
 import twill_trend
 from twill_contract import ValidationError
 from twill_detectors import (
@@ -230,6 +231,7 @@ class DigestReport:
     warnings: tuple[str, ...]
     lesson_flow: LessonFlowHealth
     escalations: tuple[twill_measure.EscalationProposal, ...] = ()
+    retirements: tuple[twill_rules.RetirementProposal, ...] = ()
     trend: twill_trend.TrendReport | None = None
 
     @property
@@ -246,6 +248,7 @@ class DigestReport:
             self.database
             and not self.findings
             and not self.escalations
+            and not self.retirements
             and all(
                 detector.current_status == STATUS_OK
                 and detector.previous_status == STATUS_OK
@@ -693,6 +696,7 @@ def build_digest(
             artifacts_root,
             as_of=report_as_of,
         )
+    retirements: tuple[twill_rules.RetirementProposal, ...] = ()
     db_path = state_db_path(state)
     if not db_path.is_file():
         summaries = tuple(
@@ -727,6 +731,7 @@ def build_digest(
             warnings=(warning,),
             lesson_flow=lesson_flow,
             escalations=escalations,
+            retirements=retirements,
         )
 
     source = connect_read_only(state)
@@ -758,6 +763,15 @@ def build_digest(
         previous_results = _suppress_dismissed(
             _read_window(source, detectors, prior_start, prior_end), dismissed
         )
+        try:
+            retirements = twill_rules.build_rules_report(
+                source,
+                now=report_as_of,
+            ).retirement_proposals
+        except sqlite3.Error:
+            # A database created before the rule corpus tables shipped still
+            # produces a valid digest, just without retirement evidence.
+            retirements = ()
         if detectors:
             try:
                 trend_report = twill_trend.build_trend_report(
@@ -923,6 +937,7 @@ def build_digest(
         warnings=tuple(warnings),
         lesson_flow=lesson_flow,
         escalations=escalations,
+        retirements=retirements,
         trend=trend_report,
     )
 
@@ -992,6 +1007,7 @@ def render_data(report: DigestReport) -> dict[str, object]:
         "trend": _trend_data(report.trend),
         "lesson_flow": report.lesson_flow.as_dict(),
         "escalations": [proposal.as_dict() for proposal in report.escalations],
+        "retirements": [proposal.as_dict() for proposal in report.retirements],
         "reproduction_command": report.command,
     }
 
@@ -1147,6 +1163,21 @@ def render_text(report: DigestReport) -> str:
                     f"{proposal.sessions} sessions/{proposal.events} events "
                     f"vs {proposal.baseline_sessions} sessions/"
                     f"{proposal.baseline_events} events after 21 days",
+                    report.command,
+                )
+            )
+    if report.retirements:
+        lines.append(
+            _line(f"retirement proposals: {len(report.retirements)}", report.command)
+        )
+        for proposal in report.retirements:
+            lines.append(
+                _line(
+                    f"- {proposal.path} [{proposal.layer}]: last read "
+                    f"{proposal.last_read or 'never'}; last occurrence "
+                    f"{proposal.last_occurrence or 'none'}; "
+                    f"{proposal.covered_clusters} covered cluster(s); "
+                    "removal is a human edit in the owning layer",
                     report.command,
                 )
             )
