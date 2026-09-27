@@ -20,11 +20,11 @@ import os
 import re
 import sqlite3
 import sys
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from time import perf_counter
-from typing import Iterator, Sequence
+from typing import Iterator, Mapping, Sequence
 
 import twill_detectors
 import twill_digest
@@ -64,6 +64,11 @@ SIGNATURE_HASH_LENGTH = 12
 MUTATING_VERBS = frozenset(
     {"ingest", "detect", "rank", "accept", "apply", "measure", "prune"}
 )
+
+# Plan §6.1/§8.2: the parse_shape bucket a parsed record lands in when its
+# declared ``type`` is absent or not a string — an untyped record is itself a
+# shape the drift alarm may need to see move, so it stays countable.
+UNTYPED_RECORD_TYPE = "untyped"
 
 _SIGNATURE_SUBSTITUTIONS = (
     (
@@ -256,6 +261,10 @@ class SessionData:
     events: tuple[TranscriptEvent, ...]
     usage: SessionUsage | None = None
     usage_rows: tuple[MessageUsage, ...] = ()
+    # The parse_shape half of one parsed region (plan §6.1, §8.2): records
+    # counted by their declared type, new span only — a resumed codex parse
+    # never re-counts the replayed prefix.  Empty for hand-built sessions.
+    record_type_counts: Mapping[str, int] = field(default_factory=dict)
 
     @property
     def usage_records(self) -> tuple[MessageUsage, ...]:
@@ -364,6 +373,22 @@ def _source_kind(path: Path) -> str:
     return "jsonl"
 
 
+def _count_record_type(counts: dict[str, int], record: dict[str, object]) -> None:
+    """Fold one parsed record into the parse_shape histogram (plan §6.1, §8.2).
+
+    The bucket is the record's declared ``type`` as produced; a record whose
+    type is absent or not a string lands in :data:`UNTYPED_RECORD_TYPE`,
+    because an untyped record is itself a shape whose arrival or departure the
+    drift alarm may need to see.  Lines that never parsed into a dict are not
+    records — those are the cursor's ``parse_errors``, not a histogram bucket.
+    """
+
+    bucket = record.get("type")
+    if not isinstance(bucket, str) or not bucket:
+        bucket = UNTYPED_RECORD_TYPE
+    counts[bucket] = counts.get(bucket, 0) + 1
+
+
 def _parse_codex_scan(
     path: Path,
     scan: twill_cursor.LineScan,
@@ -392,6 +417,7 @@ def _parse_codex_scan(
     session_id = parser.session_id or session_id
     normalized_events = []
     invalid_lines = 0
+    record_type_counts: dict[str, int] = {}
     for source_line, line in scan.lines:
         if not line.strip():
             continue
@@ -404,6 +430,7 @@ def _parse_codex_scan(
             invalid_lines += 1
             continue
         session_id = _session_id(record, session_id)
+        _count_record_type(record_type_counts, record)
         normalized_events.extend(parser.parse_line(line, source_line))
 
     session_id = parser.session_id or session_id
@@ -429,6 +456,7 @@ def _parse_codex_scan(
         events,
         usage=usage,
         usage_rows=usage_rows,
+        record_type_counts=record_type_counts,
     ), invalid_lines
 
 
@@ -451,6 +479,7 @@ def parse_scan(
     events: list[TranscriptEvent] = []
     session_id = fallback_session_id
     invalid_lines = 0
+    record_type_counts: dict[str, int] = {}
     for source_line, line in scan.lines:
         if not line.strip():
             continue
@@ -466,6 +495,7 @@ def parse_scan(
             invalid_lines += 1
             continue
         session_id = _session_id(record, session_id)
+        _count_record_type(record_type_counts, record)
         record_type = str(record.get("type") or "session_event")
         cwd = record.get("cwd")
         cwd_text = cwd if isinstance(cwd, str) else None
@@ -493,6 +523,7 @@ def parse_scan(
         tuple(events),
         usage=usage,
         usage_rows=usage_rows,
+        record_type_counts=record_type_counts,
     ), invalid_lines
 
 
@@ -830,6 +861,11 @@ class Store:
             twill_prune.validate_retention(retention_seconds)
         self.retention_seconds = retention_seconds
         self.connection = twill_schema.connect(state_dir, read_only=read_only)
+        # Plan §6.1/§8.2: one ingest run — one Store lifetime, one CLI
+        # invocation — stamps every parsed span's record-type histogram under
+        # a single lazily minted run_at, so a run that parses nothing new
+        # writes no parse_shape rows at all.
+        self._parse_run_at: str | None = None
         if not read_only:
             self.connection.executescript(SCHEMA)
             _ensure_transcript_event_signature_columns(self.connection)
@@ -884,6 +920,40 @@ class Store:
                 messages,
             ),
         )
+
+    def _record_parse_shape(
+        self,
+        conn: sqlite3.Connection,
+        session: SessionData,
+        stored_source_kind: str,
+    ) -> None:
+        """Fold one parsed span's record-type histogram into ``parse_shape``.
+
+        Plan §6.1/§8.2: the counts ride the span's own transaction, so the
+        histogram and the cursor advance land together, and the trailing
+        median the drift alarm compares against sees exactly the records the
+        parser consumed that run.  Spans of the same run accumulate on the
+        same ``(run_at, source, record_type)`` row; hand-built sessions carry
+        no counts and add nothing.
+        """
+
+        if not session.record_type_counts:
+            return
+        if self._parse_run_at is None:
+            self._parse_run_at = datetime.now(timezone.utc).isoformat()
+        for record_type, count in sorted(session.record_type_counts.items()):
+            conn.execute(
+                "INSERT INTO parse_shape(run_at, source, record_type, n) "
+                "VALUES (?, ?, ?, ?) "
+                "ON CONFLICT(run_at, source, record_type) "
+                "DO UPDATE SET n = n + excluded.n",
+                (
+                    self._parse_run_at,
+                    stored_source_kind,
+                    self.redactor.redact_text(record_type),
+                    count,
+                ),
+            )
 
     def _persist(
         self,
@@ -940,6 +1010,7 @@ class Store:
                 replace=replace,
                 stale_session_ids=stale_session_ids,
             )
+            self._record_parse_shape(conn, session, stored_source_kind)
             for event in session.events:
                 ts_utc, ts_local = _timestamp_pair(event.timestamp)
                 stored_text = self.redactor.redact_excerpt(event.text)

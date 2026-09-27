@@ -547,6 +547,19 @@ property test; the secret-fixture test; `twill ingest` over the real local corpu
 the §12 budget and `doctor` is clean.
 **Does NOT include:** detectors beyond a trivial one (Phase 2), coverage (Phase 3).
 
+**parse_shape@1 decision (2026-09-27):** one run is one ingest invocation: every
+span that invocation parses accumulates on a single lazily minted `run_at`, so an
+invocation that parses nothing new writes no rows at all — the dead-man's switch,
+not an empty row, covers "no work". Counts cover the new span only (a resumed
+codex parse never re-counts its replayed prefix; a reparse counts the full
+replacement bytes), and the rows ride the span's own transaction so the histogram
+and the cursor advance land together. The bucket is the record's declared `type`;
+a record whose type is absent or not a string lands in `untyped`, and a line that
+never parsed into a JSON object stays a cursor `parse_error`, not a histogram
+bucket.
+**Does NOT include (still):** the trailing-median drift comparison itself — that
+is the Phase 2 `doctor` alarm (§8.2, ideas-ledger #68).
+
 ### Phase 2: Detectors + digest
 **Delivers:** `D-01` missing binary, `D-02` recurring error signature, `D-03` retry loop, `D-04` hook denial, `D-05` rejected tool call, `D-06` interrupt-then-correction, `D-10` ICG gate gap
 (an always/never event from ICG's catalog that executed anyway — reported as a hole in the gate, not
