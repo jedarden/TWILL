@@ -355,6 +355,23 @@ class EwmaTrendTests(unittest.TestCase):
 
         self.assertEqual(json.loads(json.dumps(report.as_dict())), report.as_dict())
 
+    def test_through_week_makes_historical_reports_ignore_future_buckets(self):
+        for index in range(6):
+            self.add_week("D-02", "existing", f"2026-W{33 + index:02d}", 1, 1)
+        self.add_week("D-02", "future-key", "2026-W39", 2, 2)
+        self.connection.commit()
+
+        report = twill_trend.build_trend_report(
+            self.connection,
+            detector="D-02",
+            weeks=6,
+            through_week="2026-W38",
+        )
+
+        self.assertEqual(report.latest_week, "2026-W38")
+        self.assertNotIn("future-key", {finding.key for finding in report.findings})
+        self.assertNotIn("2026-W39", {finding.latest_week for finding in report.findings})
+
 
 class TrendCommandTests(unittest.TestCase):
     def test_cli_exposes_detector_weeks_new_only_and_json(self):

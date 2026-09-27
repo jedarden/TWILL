@@ -658,6 +658,7 @@ def build_trend_report(
     minimum_history_weeks: int = MIN_TREND_HISTORY_WEEKS,
     alpha: float = EWMA_ALPHA,
     band_sigmas: float = EWMA_BAND_SIGMAS,
+    through_week: str | None = None,
     now: str | datetime | None = None,
 ) -> TrendReport:
     """Detect new and accelerating weekly friction with an EWMA band.
@@ -678,6 +679,36 @@ def build_trend_report(
     series, valid_weeks_by_detector, seen_detectors = _weekly_rows(
         connection, selected
     )
+    requested_latest = None
+    if through_week is not None:
+        requested_latest = _week_start_label(through_week)
+        if requested_latest is None:
+            raise ValueError("through_week must be an ISO week such as 2026-W38")
+        series = {
+            identity: {
+                week: counts
+                for week, counts in values.items()
+                if _week_start_label(week) <= requested_latest
+            }
+            for identity, values in series.items()
+        }
+        series = {
+            identity: values for identity, values in series.items() if values
+        }
+        valid_weeks_by_detector = {
+            detector_id: {
+                week
+                for week in weeks_seen
+                if _week_start_label(week) <= requested_latest
+            }
+            for detector_id, weeks_seen in valid_weeks_by_detector.items()
+        }
+        valid_weeks_by_detector = {
+            detector_id: weeks_seen
+            for detector_id, weeks_seen in valid_weeks_by_detector.items()
+            if weeks_seen
+        }
+        seen_detectors = tuple(sorted(valid_weeks_by_detector))
     valid_weeks = set().union(*valid_weeks_by_detector.values())
     if not valid_weeks:
         warnings = (
@@ -697,10 +728,10 @@ def build_trend_report(
             warnings=warnings,
         )
 
-    latest_start = max(_week_start_label(week) for week in valid_weeks)
+    latest_start = requested_latest or max(_week_start_label(week) for week in valid_weeks)
     assert latest_start is not None
     detector_latest = {
-        detector_id: max(_week_start_label(week) for week in detector_weeks)
+        detector_id: requested_latest or max(_week_start_label(week) for week in detector_weeks)
         for detector_id, detector_weeks in valid_weeks_by_detector.items()
     }
     detector_labels = {

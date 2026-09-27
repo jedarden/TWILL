@@ -210,6 +210,59 @@ class DigestDiffTests(DigestStateCase):
         self.assertEqual(data["findings"][0]["estimated_waste_window"], "current")
         self.assertIn("estimated waste: 2.000000 USD", twill_digest.render_text(report))
 
+    def test_trend_signals_precede_chronic_waste_in_digest_ranking(self):
+        seed_failure(self.connection, "chronic", 5, IN_WEEK)
+        seed_failure(self.connection, "rising", 4, IN_WEEK)
+        self.connection.executemany(
+            "INSERT INTO session_usage(session_id, input_tokens, output_tokens, "
+            "cache_read_tokens, cost_usd) VALUES (?, ?, ?, ?, ?)",
+            [
+                (f"chronic-session-{index}", 100, 200, 300, 1.0)
+                for index in range(5)
+            ]
+            + [
+                (f"rising-session-{index}", 100, 200, 300, 0.1)
+                for index in range(4)
+            ],
+        )
+        for index in range(7):
+            week = f"2026-W{32 + index:02d}"
+            self.connection.execute(
+                "INSERT INTO cluster_week(detector_id, key, week, sessions, events) "
+                "VALUES ('D-01', ?, ?, ?, ?)",
+                ("command-not-found:chronic", week, 5, 5),
+            )
+            if index < 6:
+                sessions, events = 1, 1
+            else:
+                sessions, events = 4, 4
+            self.connection.execute(
+                "INSERT INTO cluster_week(detector_id, key, week, sessions, events) "
+                "VALUES ('D-01', ?, ?, ?, ?)",
+                ("command-not-found:rising", week, sessions, events),
+            )
+        self.connection.commit()
+
+        report = self.build(registry=(MISSING_BINARY,))
+
+        self.assertEqual(
+            [finding.key for finding in report.findings],
+            ["command-not-found:rising", "command-not-found:chronic"],
+        )
+        rising = report.findings[0]
+        self.assertEqual(rising.trend_status, "accelerating")
+        self.assertEqual(rising.trend_metric, "events")
+        self.assertEqual(report.findings[1].trend_status, None)
+        data = twill_digest.render_data(report)
+        self.assertEqual(data["trend"]["accelerating"], 1)
+        self.assertEqual(data["findings"][0]["trend"], "accelerating")
+        text = twill_digest.render_text(report)
+        self.assertIn("trend: 0 new, 1 accelerating", text)
+        self.assertLess(
+            text.index("command-not-found:rising"),
+            text.index("command-not-found:chronic"),
+        )
+
     def test_production_report_command_reproduces_exact_text(self):
         seed_failure(self.connection, "sqlite3", 2, IN_WEEK)
         self.connection.commit()

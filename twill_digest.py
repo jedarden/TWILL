@@ -17,6 +17,7 @@ from typing import Sequence
 import twill_detectors
 import twill_lessons
 import twill_measure
+import twill_trend
 from twill_detectors import (
     MAX_ERROR_LENGTH,
     STATUS_ERROR,
@@ -44,6 +45,11 @@ VERDICT_ORDER = (
     VERDICT_IMPROVING,
     VERDICT_GONE,
 )
+TREND_ORDER = (
+    twill_trend.TREND_NEW,
+    twill_trend.TREND_ACCELERATING,
+)
+VERDICT_TREND = "trend"
 STATUS_NO_DATABASE = "no-database"
 _WEEK_PATTERN = re.compile(r"^(\d{4})-W(\d{2})$")
 Week = tuple[int, int]
@@ -175,6 +181,9 @@ class Finding:
     week: str
     reproduce: str
     estimated_waste: EstimatedWaste | None = None
+    trend_status: str | None = None
+    trend_metric: str | None = None
+    trend_excess: float | None = None
 
 
 @dataclass(frozen=True)
@@ -220,6 +229,7 @@ class DigestReport:
     warnings: tuple[str, ...]
     lesson_flow: LessonFlowHealth
     escalations: tuple[twill_measure.EscalationProposal, ...] = ()
+    trend: twill_trend.TrendReport | None = None
 
     @property
     def week_id(self) -> str:
@@ -609,7 +619,52 @@ def _finding_data(finding: Finding) -> dict[str, object]:
         ),
         "week": finding.week,
         "reproduce": finding.reproduce,
+        "trend": finding.trend_status,
+        "trend_status": finding.trend_status,
+        "trend_metric": finding.trend_metric,
+        "trend_excess": finding.trend_excess,
         **_finding_waste_data(finding),
+    }
+
+
+def _trend_data(report: twill_trend.TrendReport | None) -> dict[str, object]:
+    if report is None:
+        return {
+            "available": False,
+            "latest_week": None,
+            "history_weeks": 0,
+            "minimum_history_weeks": twill_trend.MIN_TREND_HISTORY_WEEKS,
+            "new": 0,
+            "accelerating": 0,
+            "warnings": [],
+            "findings": [],
+        }
+    findings = tuple(
+        finding
+        for finding in report.findings
+        if finding.status in twill_trend.TREND_SIGNAL_STATUSES
+    )
+    return {
+        "available": report.database,
+        "latest_week": report.latest_week,
+        "history_weeks": report.history_weeks,
+        "minimum_history_weeks": report.minimum_history_weeks,
+        "new": len(report.new_findings),
+        "accelerating": len(report.accelerating_findings),
+        "warnings": list(report.warnings),
+        "findings": [
+            {
+                "detector": finding.detector_id,
+                "key": finding.key,
+                "status": finding.status,
+                "latest_week": finding.latest_week,
+                "current_sessions": finding.current_sessions,
+                "current_events": finding.current_events,
+                "signal_metric": finding.signal_metric,
+                "signal_excess": finding.signal_excess,
+            }
+            for finding in findings
+        ],
     }
 
 
@@ -674,6 +729,8 @@ def build_digest(
         )
 
     source = connect_read_only(state)
+    trend_report: twill_trend.TrendReport | None = None
+    trend_error: str | None = None
     try:
         source.execute("BEGIN")
         observations = int(
@@ -700,12 +757,32 @@ def build_digest(
         previous_results = _suppress_dismissed(
             _read_window(source, detectors, prior_start, prior_end), dismissed
         )
+        if detectors:
+            try:
+                trend_report = twill_trend.build_trend_report(
+                    source,
+                    detector=tuple(detector.detector_id for detector in detectors),
+                    through_week=format_week(week),
+                    now=report_as_of,
+                )
+            except sqlite3.Error as exc:
+                trend_error = _one_line(
+                    f"trend report unavailable: {exc}", MAX_ERROR_LENGTH
+                )
     finally:
         source.close()
 
     summaries: list[DetectorSummary] = []
     warnings: list[str] = []
+    if trend_error is not None:
+        warnings.append(trend_error)
     changes: list[tuple[str, str, str, Counts | None, Counts | None]] = []
+    current_by_detector = {
+        result.detector.full_id: result for result in current_results
+    }
+    previous_by_detector = {
+        result.detector.full_id: result for result in previous_results
+    }
     for current_result, previous_result in zip(current_results, previous_results):
         full_id = current_result.detector.full_id
         summaries.append(
@@ -753,6 +830,39 @@ def build_digest(
                     )
                 )
 
+    trend_by_cluster: dict[tuple[str, str], twill_trend.TrendFinding] = {}
+    if trend_report is not None:
+        full_ids = {detector.detector_id: detector.full_id for detector in detectors}
+        trend_by_cluster = {
+            (full_ids[finding.detector_id], finding.key): finding
+            for finding in trend_report.findings
+            if finding.status in twill_trend.TREND_SIGNAL_STATUSES
+            and finding.detector_id in full_ids
+        }
+        seen = {(detector, key) for _, detector, key, _, _ in changes}
+        for (detector, key), finding in sorted(trend_by_cluster.items()):
+            current_result = current_by_detector.get(detector)
+            previous_result = previous_by_detector.get(detector)
+            if (
+                current_result is None
+                or current_result.status != STATUS_OK
+                or key not in current_result.clusters
+                or (detector, key) in seen
+            ):
+                continue
+            changes.append(
+                (
+                    VERDICT_TREND,
+                    detector,
+                    key,
+                    current_result.clusters[key],
+                    previous_result.clusters.get(key)
+                    if previous_result is not None
+                    else None,
+                )
+            )
+            seen.add((detector, key))
+
     verdict_rank = {verdict: index for index, verdict in enumerate(VERDICT_ORDER)}
     current_estimates = {
         (result.detector.full_id, key): estimate
@@ -768,6 +878,7 @@ def build_digest(
     for verdict, detector, key, current, previous in changes:
         current_waste = current_estimates.get((detector, key))
         previous_waste = previous_estimates.get((detector, key))
+        trend_finding = trend_by_cluster.get((detector, key))
         findings_list.append(
             Finding(
                 n=0,
@@ -780,6 +891,15 @@ def build_digest(
                 reproduce=command,
                 estimated_waste=(
                     current_waste if current is not None else previous_waste
+                ),
+                trend_status=(
+                    trend_finding.status if trend_finding is not None else None
+                ),
+                trend_metric=(
+                    trend_finding.signal_metric if trend_finding is not None else None
+                ),
+                trend_excess=(
+                    trend_finding.signal_excess if trend_finding is not None else None
                 ),
             )
         )
@@ -802,6 +922,7 @@ def build_digest(
         warnings=tuple(warnings),
         lesson_flow=lesson_flow,
         escalations=escalations,
+        trend=trend_report,
     )
 
 
@@ -826,8 +947,12 @@ def _finding_sort_key(
     tokens = estimate.tokens if estimate is not None else None
     known_dollars = isinstance(dollars, (int, float)) and isfinite(float(dollars))
     known_tokens = isinstance(tokens, (int, float)) and isfinite(float(tokens))
+    trend_rank = {
+        status: index for index, status in enumerate(TREND_ORDER)
+    }
     return (
-        verdict_rank[finding.verdict],
+        trend_rank.get(finding.trend_status, len(TREND_ORDER)),
+        verdict_rank.get(finding.verdict, len(verdict_rank)),
         0 if known_dollars else 1,
         -float(dollars) if known_dollars else 0.0,
         0 if known_tokens else 1,
@@ -863,6 +988,7 @@ def render_data(report: DigestReport) -> dict[str, object]:
         "observations_in_previous_week": report.observations_in_previous_week,
         "detectors": [_detector_data(detector) for detector in report.detectors],
         "findings": [_finding_data(finding) for finding in report.findings],
+        "trend": _trend_data(report.trend),
         "lesson_flow": report.lesson_flow.as_dict(),
         "escalations": [proposal.as_dict() for proposal in report.escalations],
         "reproduction_command": report.command,
@@ -931,6 +1057,19 @@ def render_text(report: DigestReport) -> str:
             f"WARNING: {flow.warning}"
         )
     lines.append(_line(flow_text, report.command))
+    if report.trend is None:
+        trend_text = "trend: unavailable"
+    else:
+        trend_text = (
+            f"trend: {len(report.trend.new_findings)} new, "
+            f"{len(report.trend.accelerating_findings)} accelerating; "
+            f"history {report.trend.history_weeks}/"
+            f"{report.trend.minimum_history_weeks} week(s)"
+        )
+    lines.append(_line(trend_text, report.command))
+    if report.trend is not None:
+        for warning in report.trend.warnings:
+            lines.append(_line(f"trend warning: {warning}", report.command))
     for detector in report.detectors:
         if detector.current_error is not None:
             lines.append(
@@ -948,13 +1087,10 @@ def render_text(report: DigestReport) -> str:
                     report.command,
                 )
             )
-    for verdict in VERDICT_ORDER:
-        selected = [
-            finding for finding in report.findings if finding.verdict == verdict
-        ]
+    def render_findings(label: str, selected: Sequence[Finding]) -> None:
         if not selected:
-            continue
-        lines.append(_line(f"{verdict}: {len(selected)}", report.command))
+            return
+        lines.append(_line(f"{label}: {len(selected)}", report.command))
         for finding in selected:
             current = (
                 (finding.current[0], finding.current[1])
@@ -971,10 +1107,34 @@ def render_text(report: DigestReport) -> str:
                     f"- {finding.n} {finding.verdict} {finding.detector} "
                     f"{_display_key(finding.key)} "
                     f"{_count_text(previous)}->{_count_text(current)}; "
-                    f"{_waste_text(finding.estimated_waste)}",
+                    f"{_waste_text(finding.estimated_waste)}"
+                    + (
+                        f"; trend={finding.trend_status}"
+                        if finding.trend_status is not None
+                        else ""
+                    ),
                     report.command,
                 )
             )
+
+    for trend_status in TREND_ORDER:
+        render_findings(
+            f"trend {trend_status}",
+            tuple(
+                finding
+                for finding in report.findings
+                if finding.trend_status == trend_status
+            ),
+        )
+    for verdict in VERDICT_ORDER:
+        render_findings(
+            verdict,
+            tuple(
+                finding
+                for finding in report.findings
+                if finding.trend_status is None and finding.verdict == verdict
+            ),
+        )
     if report.escalations:
         lines.append(_line(f"escalation proposals: {len(report.escalations)}", report.command))
         for proposal in report.escalations:
