@@ -814,7 +814,10 @@ def _transition(
     legal = {
         "draft": {"accepted"},
         "accepted": {target} if target.startswith("applied:") else set(),
-        **{f"applied:{item}": TERMINAL_STATES for item in ROUTING_LAYERS},
+        **{
+            f"applied:{item}": TERMINAL_STATES | {"accepted"}
+            for item in ROUTING_LAYERS
+        },
     }
     if target not in legal.get(current, set()):
         raise _error(
@@ -838,6 +841,10 @@ def _transition(
                 "bead": safe_bead,
             }
         )
+        updates["routing"] = routing
+    elif current.startswith("applied:") and target == "accepted":
+        routing = dict(record.routing)
+        routing["applied"] = None
         updates["routing"] = routing
     _validate_routing(updates.get("routing", record.routing))
     _write_atomic(path, _replace_fields(record, updates))
@@ -911,6 +918,24 @@ def apply_lesson(
         layer=layer,
         bead=bead,
         applied_at=applied_at,
+        operator=operator,
+        repo_root=repo_root,
+    )
+
+
+def unapply_lesson(
+    artifacts_root_or_path: Path,
+    lesson_id: str | None = None,
+    *,
+    operator: bool = True,
+    repo_root: Path | None = None,
+) -> LessonRecord:
+    """Record that an owning layer reverted its applied change."""
+
+    return transition_lesson(
+        artifacts_root_or_path,
+        lesson_id,
+        "accepted",
         operator=operator,
         repo_root=repo_root,
     )
@@ -1014,5 +1039,6 @@ __all__ = [
     "save_lesson",
     "state_category",
     "transition_lesson",
+    "unapply_lesson",
     "resolve_lesson",
 ]

@@ -300,6 +300,30 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(candidates[0].consecutive_days, 21)
         self.assertEqual(candidates[0].first_zero_at, points[0].measured_at)
 
+    def test_unapplied_lesson_does_not_receive_resolution_credit(self):
+        self.lesson("L-00000001", state="applied:environment")
+        record = twill_lessons.unapply_lesson(self.artifacts, "L-00000001")
+        points = tuple(
+            twill_measure.Measurement(
+                lesson_id=record.id,
+                detector_id="D-01@1",
+                measured_at=f"2026-09-{day:02d}T00:00:00Z"
+                if day <= 30
+                else f"2026-10-{day - 30:02d}T00:00:00Z",
+                window_days=7,
+                sessions=0,
+                events=0,
+            )
+            for day in range(21, 42)
+        )
+
+        self.assertEqual(
+            twill_measure.evaluate_resolutions(
+                (record,), points, as_of=points[-1].measured_at
+            ),
+            (),
+        )
+
     def test_resolution_ignores_gaps_nonzero_counts_and_terminal_lessons(self):
         self.lesson("L-00000001", state="applied:environment")
         self.lesson("L-00000002", state="resolved", key="command-not-found:resolved")

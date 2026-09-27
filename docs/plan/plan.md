@@ -739,7 +739,7 @@ same empty block.
 ### Phase 5: Route + apply + review states
 **Delivers:** routing recommendation per lesson, `twill apply <id>` emitting the exact
 `bead create` command for the owning repo (never executing it), state transitions
-`accept`/`apply`/`dismiss`, `twill lessons` listing, and the **guard generator**: each lesson ships
+`accept`/`apply`/`unapply`/`dismiss`, `twill lessons` listing, and the **guard generator**: each lesson ships
 the mechanical artifact that would stop it at its recommended layer — an `org-rule-guard`/ICG
 matcher fragment, a wrapper-script skeleton, a gate line, an `AGENTS.md` paragraph, or a memory leaf
 with frontmatter — written to `guards/<lesson-id>.*` inside TWILL and installed by nobody but a
@@ -914,6 +914,7 @@ twill rules    [--unread-days 90] [--deletion-candidates] [--json]   # rule earn
 twill trend    [--detector D-02] [--weeks 12] [--new-only] [--json]  # change-point view
 twill brief    <repo|launch-dir> [--top 10] [--json]                 # pull-only pre-flight
 twill accept <id> | dismiss <id> --reason TEXT | apply <id> --layer LAYER [--bead ID] [--emit-guard]
+twill unapply <id>   # `un-apply` is accepted as an alias after the owning layer reverts its change
 twill measure  [--lesson ID] [--json]
 twill prune    [--older-than 180d]
 twill status   [--json]

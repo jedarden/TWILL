@@ -28,6 +28,7 @@ from twill_lessons import (  # noqa: E402
     resolve_lesson,
     retire_lesson,
     transition_lesson,
+    unapply_lesson,
 )
 from twill_ranker import RankedCluster  # noqa: E402
 from twill_lock import StateLock  # noqa: E402
@@ -103,6 +104,27 @@ class LessonLifecycleTests(unittest.TestCase):
         self.assertEqual(applied.routing["bead"], "twill-example")
         self.assertIn("state: applied:environment\n", path.read_text())
         self.assertIn("applied: environment", path.read_text())
+
+    def test_unapply_clears_applied_and_returns_to_accepted(self):
+        path = self.write_draft()
+        lesson_id = path.stem
+        accept_lesson(self.artifacts, lesson_id)
+        apply_lesson(
+            self.artifacts,
+            lesson_id,
+            layer="environment",
+            bead="twill-example",
+            applied_at="2026-09-24T12:00:00Z",
+        )
+
+        unapplied = unapply_lesson(self.artifacts, lesson_id)
+
+        self.assertEqual(unapplied.state, "accepted")
+        self.assertIsNone(unapplied.routing["applied"])
+        self.assertEqual(unapplied.routing["applied_at"], "2026-09-24T12:00:00Z")
+        self.assertEqual(unapplied.routing["bead"], "twill-example")
+        self.assertIn("state: accepted\n", path.read_text())
+        self.assertIn("applied: null", path.read_text())
 
     def test_each_terminal_state_is_reachable_only_from_applied(self):
         for target, operation in (
@@ -341,6 +363,18 @@ class LessonCliTests(unittest.TestCase):
                 "Operator body for the owner repo.",
                 applied_data["bead_create_command"],
             )
+
+            unapplied = self.run_cli(
+                "un-apply",
+                lesson_id,
+                "--json",
+                "--state-dir",
+                str(root / "state"),
+            )
+            self.assertEqual(unapplied.returncode, 0, unapplied.stderr)
+            unapplied_data = json.loads(unapplied.stdout)["data"]["lesson"]
+            self.assertEqual(unapplied_data["state"], "accepted")
+            self.assertIsNone(unapplied_data["routing"]["applied"])
 
 
 if __name__ == "__main__":

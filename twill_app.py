@@ -69,7 +69,18 @@ MAX_OBSERVATIONS_PER_SESSION = 1000
 SIGNATURE_INPUT_LIMIT = 400
 SIGNATURE_HASH_LENGTH = 12
 MUTATING_VERBS = frozenset(
-    {"ingest", "detect", "rank", "explain", "accept", "apply", "measure", "prune"}
+    {
+        "ingest",
+        "detect",
+        "rank",
+        "explain",
+        "accept",
+        "apply",
+        "unapply",
+        "un-apply",
+        "measure",
+        "prune",
+    }
 )
 
 # Plan §6.1/§8.2: the parse_shape bucket a parsed record lands in when its
@@ -2193,6 +2204,19 @@ def apply_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def unapply_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    record = twill_lessons.unapply_lesson(
+        config.require_artifacts_root(),
+        args.lesson_id,
+        operator=True,
+    )
+    emit_success(_lesson_data(record), json_mode=args.json)
+    if not args.json:
+        _print_lesson(record, "unapplied")
+    return EXIT_SUCCESS
+
+
 def lessons_command(args: argparse.Namespace) -> int:
     config = load_config()
     records = twill_lessons.list_lessons(
@@ -2519,6 +2543,16 @@ def build_parser() -> argparse.ArgumentParser:
     apply.add_argument("--state-dir")
     apply.add_argument("--json", action="store_true")
     apply.set_defaults(handler=apply_command)
+
+    unapply = subparsers.add_parser(
+        "unapply",
+        aliases=("un-apply",),
+        help="clear an applied lesson after its owning layer reverts the change",
+    )
+    unapply.add_argument("lesson_id", metavar="ID")
+    unapply.add_argument("--state-dir")
+    unapply.add_argument("--json", action="store_true")
+    unapply.set_defaults(handler=unapply_command)
 
     lessons = subparsers.add_parser("lessons", help="list lesson files by state")
     lessons.add_argument(
