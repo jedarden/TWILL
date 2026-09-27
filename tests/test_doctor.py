@@ -96,6 +96,28 @@ class DoctorChecksTests(unittest.TestCase):
         self.assertIsNotNone(status["data"]["stages"]["ingest"]["last_success"])
         self.assertIn("last_failure", status["data"]["stages"]["ingest"])
 
+    def test_later_phase_budget_miss_is_broken(self):
+        self.create_database()
+        detect_miss = twill_perf.assess_detect(
+            twill_perf.DETECT_PASS_WALL_TIME_BUDGET_SECONDS
+        )
+        record_stage(
+            self.state,
+            "detect",
+            twill_perf.DETECT_PASS_WALL_TIME_BUDGET_SECONDS,
+            {"detectors": 8},
+            succeeded=False,
+            performance=detect_miss,
+        )
+        report = twill_doctor.run_doctor(
+            self.state,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+        check = self.check(report, "performance_budgets")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertEqual(check.details["stage"], "detect")
+        self.assertTrue(check.details["misses"])
+
     def add_cursor(self, *, now, first_seen=None, mtime_ns=None, session_id="s1"):
         first_seen = first_seen or now
         mtime_ns = (

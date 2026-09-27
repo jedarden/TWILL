@@ -132,6 +132,11 @@ Ingest records its wall time, the slowest single-file parse time, and the proces
 `twill doctor` reports a recorded miss as broken so a failed run cannot look healthy merely because
 an older ingest succeeded.
 
+The detector pass uses the same strict budget harness: `twill detect --time` measures the complete
+30-day registry pass, records it in `status.json`, and aborts when it reaches 20 seconds. The daily
+retention pass records the SQLite database footprint (including WAL and shared-memory sidecars) as
+`db_bytes`; it aborts above the 2 GiB budget and `doctor` reports either miss.
+
 ## Health checks
 
 `twill doctor` is the read-only Phase 1 health entry point. It checks SQLite integrity and schema

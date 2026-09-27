@@ -44,5 +44,40 @@ class IngestPerformanceTests(unittest.TestCase):
         self.assertIn("VmHWM", unavailable["misses"][0])
 
 
+class LaterPhasePerformanceTests(unittest.TestCase):
+    def test_detect_budget_is_strict(self):
+        passing = twill_perf.assess_detect(
+            twill_perf.DETECT_PASS_WALL_TIME_BUDGET_SECONDS - 0.001
+        )
+        self.assertEqual(passing["misses"], [])
+
+        at_boundary = twill_perf.assess_detect(
+            twill_perf.DETECT_PASS_WALL_TIME_BUDGET_SECONDS
+        )
+        self.assertEqual(len(at_boundary["misses"]), 1)
+        self.assertIn("wall_time_seconds", at_boundary["misses"][0])
+
+    def test_db_size_includes_sqlite_sidecars_and_is_strict(self):
+        with tempfile.TemporaryDirectory() as directory:
+            state = Path(directory)
+            (state / "twill.db").write_bytes(b"db")
+            (state / "twill.db-wal").write_bytes(b"wal")
+            (state / "twill.db-shm").write_bytes(b"shm")
+            self.assertEqual(twill_perf.read_db_size_bytes(state), 8)
+
+        passing = twill_perf.assess_db_size(
+            twill_perf.DB_SIZE_BUDGET_BYTES - 1
+        )
+        self.assertEqual(passing["misses"], [])
+        at_boundary = twill_perf.assess_db_size(twill_perf.DB_SIZE_BUDGET_BYTES)
+        self.assertEqual(len(at_boundary["misses"]), 1)
+        self.assertIn("db_bytes", at_boundary["misses"][0])
+
+    def test_missing_database_size_is_a_measurement_failure(self):
+        with tempfile.TemporaryDirectory() as directory:
+            with self.assertRaises(twill_perf.PerformanceMeasurementError):
+                twill_perf.read_db_size_bytes(Path(directory))
+
+
 if __name__ == "__main__":
     unittest.main()

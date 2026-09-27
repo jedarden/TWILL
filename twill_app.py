@@ -1636,7 +1636,22 @@ def detect_command(args: argparse.Namespace) -> int:
     finally:
         connection.close()
 
+    wall_time_seconds = perf_counter() - started
+    performance = twill_perf.assess_detect(wall_time_seconds)
+    counts = {
+        "detectors": len(report.outcomes),
+        "clusters": sum(outcome.clusters for outcome in report.outcomes),
+    }
+
     if report.exit_code != EXIT_SUCCESS:
+        record_stage(
+            state_dir,
+            "detect",
+            wall_time_seconds,
+            counts,
+            succeeded=False,
+            performance=performance,
+        )
         failures = "; ".join(
             f"{outcome.full_id}: {outcome.error}"
             for outcome in report.failed
@@ -1654,15 +1669,29 @@ def detect_command(args: argparse.Namespace) -> int:
             _detect_failure_hint(report),
         )
 
+    if performance["misses"]:
+        record_stage(
+            state_dir,
+            "detect",
+            wall_time_seconds,
+            counts,
+            succeeded=False,
+            performance=performance,
+        )
+        misses = "; ".join(str(miss) for miss in performance["misses"])
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            f"detect aborted: performance budget miss: {misses}",
+            "run 'twill doctor --json' to inspect the recorded measurements",
+        )
+
     warnings: list[str] = []
     record_stage(
         state_dir,
         "detect",
-        perf_counter() - started,
-        {
-            "detectors": len(report.outcomes),
-            "clusters": sum(outcome.clusters for outcome in report.outcomes),
-        },
+        wall_time_seconds,
+        counts,
+        performance=performance,
     )
     if not report.outcomes:
         warnings.append(
@@ -1683,6 +1712,7 @@ def detect_command(args: argparse.Namespace) -> int:
                 }
                 for outcome in report.outcomes
             ],
+            "performance": performance,
         },
         json_mode=args.json,
         warnings=warnings,
@@ -1699,6 +1729,8 @@ def detect_command(args: argparse.Namespace) -> int:
         print(f"{outcome.full_id}: {outcome.clusters} cluster(s)")
     total_clusters = sum(outcome.clusters for outcome in report.outcomes)
     print(f"{len(report.outcomes)} detector(s) ran; {total_clusters} cluster(s)")
+    if getattr(args, "time", False):
+        print(f"timing: wall={performance['wall_time_seconds']:.6f}s")
     return EXIT_SUCCESS
 
 
@@ -1960,19 +1992,26 @@ def prune_command(args: argparse.Namespace) -> int:
     finally:
         connection.close()
 
+    db_bytes = twill_perf.read_db_size_bytes(state_dir)
+    db_performance = twill_perf.assess_db_size(db_bytes)
+    elapsed = perf_counter() - started
+    counts = {
+        "observations": report.remaining_observations,
+        "pruned_observations": report.pruned_observations,
+        "remaining_observations": report.remaining_observations,
+        "clusters": report.clusters,
+        "detectors": len(report.detector_report.outcomes),
+        "db_bytes": db_bytes,
+    }
+
     if report.exit_code != EXIT_SUCCESS:
         record_stage(
             state_dir,
             "prune",
-            perf_counter() - started,
-            {
-                "observations": report.remaining_observations,
-                "pruned_observations": report.pruned_observations,
-                "remaining_observations": report.remaining_observations,
-                "clusters": report.clusters,
-                "detectors": len(report.detector_report.outcomes),
-            },
+            elapsed,
+            counts,
             succeeded=False,
+            performance=db_performance,
         )
         failures = "; ".join(
             f"{outcome.full_id}: {outcome.error}"
@@ -1992,19 +2031,33 @@ def prune_command(args: argparse.Namespace) -> int:
         )
         raise CliError(report.exit_code, message, hint)
 
+    if db_performance["misses"]:
+        record_stage(
+            state_dir,
+            "prune",
+            elapsed,
+            counts,
+            succeeded=False,
+            performance=db_performance,
+        )
+        misses = "; ".join(str(miss) for miss in db_performance["misses"])
+        raise CliError(
+            EXIT_RUNTIME_ERROR,
+            f"prune aborted: database-size budget miss: {misses}",
+            "run 'twill doctor --json' to inspect the recorded measurements",
+        )
+
     record_stage(
         state_dir,
         "prune",
-        perf_counter() - started,
-        {
-            "observations": report.remaining_observations,
-            "pruned_observations": report.pruned_observations,
-            "remaining_observations": report.remaining_observations,
-            "clusters": report.clusters,
-            "detectors": len(report.detector_report.outcomes),
-        },
+        elapsed,
+        counts,
+        performance=db_performance,
     )
-    emit_success(report.as_dict(), json_mode=args.json)
+    result = report.as_dict()
+    result["db_bytes"] = db_bytes
+    result["performance"] = db_performance
+    emit_success(result, json_mode=args.json)
     if args.json:
         return EXIT_SUCCESS
     print("TWILL prune")
@@ -2020,6 +2073,7 @@ def prune_command(args: argparse.Namespace) -> int:
         f"{report.remaining_observations} observation(s) remain; "
         f"{report.clusters} cluster(s) recomputed"
     )
+    print(f"database size: {db_bytes} bytes")
     return EXIT_SUCCESS
 
 
@@ -2258,6 +2312,11 @@ def build_parser() -> argparse.ArgumentParser:
     )
     detect.add_argument("--state-dir")
     detect.add_argument("--json", action="store_true")
+    detect.add_argument(
+        "--time",
+        action="store_true",
+        help="print the all-detector pass wall time",
+    )
     detect.set_defaults(handler=detect_command)
 
     rank = subparsers.add_parser(

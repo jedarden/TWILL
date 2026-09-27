@@ -1150,8 +1150,8 @@ def _check_disk_space(
     )
 
 
-def _check_ingest_performance(state_dir: Path) -> CheckResult:
-    """Report the latest ingest budget result without changing state."""
+def _check_performance_budgets(state_dir: Path) -> CheckResult:
+    """Report the latest ingest, detect, and DB-size budgets."""
 
     try:
         payload = read_status(state_dir)
@@ -1164,46 +1164,76 @@ def _check_ingest_performance(state_dir: Path) -> CheckResult:
         )
 
     stages = payload.get("data", {}).get("stages", {})
-    ingest = stages.get("ingest") if isinstance(stages, Mapping) else None
-    if not isinstance(ingest, Mapping):
+    if not isinstance(stages, Mapping):
         return _result(
             "performance_budgets",
             HEALTHY,
-            "no ingest performance run has been recorded",
+            "no performance budget run has been recorded",
             {"measured": False},
         )
 
-    # A failed attempt is kept beside the last successful stage so the
-    # operator can still see when ingest last succeeded.  It takes priority
-    # over that older successful measurement for health purposes.
-    performance = ingest.get("last_failure", {}).get("performance")
-    if not isinstance(performance, Mapping):
-        performance = ingest.get("performance")
-    if not isinstance(performance, Mapping):
+    measurements: dict[str, Mapping[str, object]] = {}
+    misses: list[tuple[str, list[str]]] = []
+    for stage_name in ("ingest", "detect", "prune"):
+        stage = stages.get(stage_name)
+        if not isinstance(stage, Mapping):
+            continue
+        # A failed attempt is kept beside the last successful stage so the
+        # operator can still see when the stage last succeeded.  It takes
+        # priority over that older successful measurement for health.
+        performance = stage.get("last_failure", {}).get("performance")
+        if not isinstance(performance, Mapping):
+            performance = stage.get("performance")
+        if not isinstance(performance, Mapping):
+            continue
+        measurements[stage_name] = performance
+        stage_misses = performance.get("misses")
+        if isinstance(stage_misses, list) and stage_misses:
+            misses.append((stage_name, [str(miss) for miss in stage_misses]))
+
+    if not measurements:
         return _result(
             "performance_budgets",
             HEALTHY,
-            "ingest has no performance measurement",
+            "no performance measurement has been recorded",
             {"measured": False},
         )
 
-    details = dict(performance)
-    details["measured"] = True
-    misses = performance.get("misses")
-    if isinstance(misses, list) and misses:
+    if misses:
+        stage_name, stage_misses = misses[0]
+        details = dict(measurements[stage_name])
+        details["stage"] = stage_name
+        details["measurements"] = {
+            name: dict(value) for name, value in measurements.items()
+        }
         return _result(
             "performance_budgets",
             BROKEN,
-            "ingest aborted after a performance budget miss: "
-            + "; ".join(str(miss) for miss in misses),
+            f"{stage_name} aborted after a performance budget miss: "
+            + "; ".join(stage_misses),
             details,
         )
+    if len(measurements) == 1:
+        details = dict(next(iter(measurements.values())))
+    else:
+        details = {
+            "measurements": {
+                name: dict(value) for name, value in measurements.items()
+            }
+        }
+    details["measured"] = True
     return _result(
         "performance_budgets",
         HEALTHY,
-        "ingest performance budgets passed",
+        "performance budgets passed",
         details,
     )
+
+
+def _check_ingest_performance(state_dir: Path) -> CheckResult:
+    """Backward-compatible name for the aggregate performance check."""
+
+    return _check_performance_budgets(state_dir)
 
 
 def check_ingest_disk_space(

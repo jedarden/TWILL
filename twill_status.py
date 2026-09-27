@@ -55,6 +55,14 @@ PERFORMANCE_FIELDS = frozenset(
 PERFORMANCE_BUDGET_FIELDS = frozenset(
     {"wall_time_seconds", "single_file_parse_seconds", "peak_rss_bytes"}
 )
+DETECT_PERFORMANCE_FIELDS = frozenset(
+    {"checked_at", "wall_time_seconds", "budgets", "misses"}
+)
+DETECT_PERFORMANCE_BUDGET_FIELDS = frozenset({"wall_time_seconds"})
+DB_SIZE_PERFORMANCE_FIELDS = frozenset(
+    {"checked_at", "db_bytes", "budgets", "misses"}
+)
+DB_SIZE_PERFORMANCE_BUDGET_FIELDS = frozenset({"db_bytes"})
 
 
 def status_path(state_dir: Path) -> Path:
@@ -152,26 +160,50 @@ def _validate_status(payload: object, path: Path) -> None:
 
 
 def _validate_performance(value: object, path: Path, context: str) -> None:
-    if not isinstance(value, dict) or set(value) != PERFORMANCE_FIELDS:
+    if not isinstance(value, dict):
+        _invalid_status(path, f"{context} performance has an invalid field set")
+    fields = frozenset(value)
+    if fields not in (
+        PERFORMANCE_FIELDS,
+        DETECT_PERFORMANCE_FIELDS,
+        DB_SIZE_PERFORMANCE_FIELDS,
+    ):
         _invalid_status(path, f"{context} performance has an invalid field set")
     if not _is_timestamp(value["checked_at"]):
         _invalid_status(path, f"{context} performance checked_at must be a timestamp")
-    for name in ("wall_time_seconds", "single_file_parse_seconds"):
-        metric = value[name]
+    if fields == PERFORMANCE_FIELDS:
+        for name in ("wall_time_seconds", "single_file_parse_seconds"):
+            metric = value[name]
+            if (
+                isinstance(metric, bool)
+                or not isinstance(metric, (int, float))
+                or not math.isfinite(metric)
+                or metric < 0
+            ):
+                _invalid_status(path, f"{context} performance {name} must be non-negative numeric")
+        rss = value["peak_rss_bytes"]
+        if rss is not None and (
+            isinstance(rss, bool) or not isinstance(rss, int) or rss < 0
+        ):
+            _invalid_status(path, f"{context} performance peak_rss_bytes must be a non-negative integer or null")
+        budget_fields = PERFORMANCE_BUDGET_FIELDS
+    elif fields == DETECT_PERFORMANCE_FIELDS:
+        metric = value["wall_time_seconds"]
         if (
             isinstance(metric, bool)
             or not isinstance(metric, (int, float))
             or not math.isfinite(metric)
             or metric < 0
         ):
-            _invalid_status(path, f"{context} performance {name} must be non-negative numeric")
-    rss = value["peak_rss_bytes"]
-    if rss is not None and (
-        isinstance(rss, bool) or not isinstance(rss, int) or rss < 0
-    ):
-        _invalid_status(path, f"{context} performance peak_rss_bytes must be a non-negative integer or null")
+            _invalid_status(path, f"{context} performance wall_time_seconds must be non-negative numeric")
+        budget_fields = DETECT_PERFORMANCE_BUDGET_FIELDS
+    else:
+        db_bytes = value["db_bytes"]
+        if isinstance(db_bytes, bool) or not isinstance(db_bytes, int) or db_bytes < 0:
+            _invalid_status(path, f"{context} performance db_bytes must be a non-negative integer")
+        budget_fields = DB_SIZE_PERFORMANCE_BUDGET_FIELDS
     budgets = value["budgets"]
-    if not isinstance(budgets, dict) or set(budgets) != PERFORMANCE_BUDGET_FIELDS:
+    if not isinstance(budgets, dict) or set(budgets) != budget_fields:
         _invalid_status(path, f"{context} performance budgets have an invalid field set")
     for name, budget in budgets.items():
         if (
@@ -250,16 +282,18 @@ def _normalise_counts(counts: Mapping[str, object]) -> dict[str, int | float]:
 def _normalise_performance(performance: Mapping[str, object]) -> dict[str, object]:
     if not isinstance(performance, Mapping):
         raise ValueError("status performance must be an object")
-    if set(performance) != PERFORMANCE_FIELDS:
+    fields = frozenset(performance)
+    if fields not in (
+        PERFORMANCE_FIELDS,
+        DETECT_PERFORMANCE_FIELDS,
+        DB_SIZE_PERFORMANCE_FIELDS,
+    ):
         raise ValueError("status performance has an invalid field set")
     checked_at = performance["checked_at"]
     if not _is_timestamp(checked_at):
         raise ValueError("status performance checked_at must be a timestamp")
-    normalised = {
+    normalised: dict[str, object] = {
         "checked_at": checked_at,
-        "wall_time_seconds": float(performance["wall_time_seconds"]),
-        "single_file_parse_seconds": float(performance["single_file_parse_seconds"]),
-        "peak_rss_bytes": performance["peak_rss_bytes"],
         "budgets": dict(sorted(performance["budgets"].items()))
         if isinstance(performance["budgets"], Mapping)
         else performance["budgets"],
@@ -267,6 +301,18 @@ def _normalise_performance(performance: Mapping[str, object]) -> dict[str, objec
         if isinstance(performance["misses"], list)
         else performance["misses"],
     }
+    if fields == PERFORMANCE_FIELDS:
+        normalised.update(
+            {
+                "wall_time_seconds": float(performance["wall_time_seconds"]),
+                "single_file_parse_seconds": float(performance["single_file_parse_seconds"]),
+                "peak_rss_bytes": performance["peak_rss_bytes"],
+            }
+        )
+    elif fields == DETECT_PERFORMANCE_FIELDS:
+        normalised["wall_time_seconds"] = float(performance["wall_time_seconds"])
+    else:
+        normalised["db_bytes"] = performance["db_bytes"]
     # Reuse the same strict rules used for data loaded from disk.  A temporary
     # path is not needed: these checks raise ValueError before any write.
     try:

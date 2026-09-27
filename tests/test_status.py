@@ -11,6 +11,7 @@ CLI = ROOT / "twill"
 sys.path.insert(0, str(ROOT))
 
 from twill_status import read_status, record_stage, status_path  # noqa: E402
+import twill_perf  # noqa: E402
 
 
 class StatusRecordTests(unittest.TestCase):
@@ -69,6 +70,28 @@ class StatusRecordTests(unittest.TestCase):
         for counts in ({"secret": 1}, {"clusters": "3"}, {"clusters": True}):
             with self.subTest(counts=counts), self.assertRaises(ValueError):
                 record_stage(self.state, "ingest", 0.1, counts)
+
+    def test_later_phase_budget_records_are_validated_and_persisted(self):
+        detect = record_stage(
+            self.state,
+            "detect",
+            0.1,
+            {"detectors": 8},
+            performance=twill_perf.assess_detect(0.1),
+        )
+        self.assertEqual(detect["performance"]["budgets"], {"wall_time_seconds": 20.0})
+
+        prune = record_stage(
+            self.state,
+            "prune",
+            0.1,
+            {"db_bytes": 1024},
+            performance=twill_perf.assess_db_size(1024),
+        )
+        self.assertEqual(prune["performance"]["db_bytes"], 1024)
+        self.assertEqual(
+            read_status(self.state)["data"]["stages"]["prune"], prune
+        )
 
 
 class StatusCliTests(unittest.TestCase):
@@ -214,6 +237,11 @@ class StatusCliTests(unittest.TestCase):
             record = read_status(state)["data"]["stages"]["detect"]
             self.assertEqual(record["counts"]["detectors"], 8)
             self.assertEqual(record["counts"]["clusters"], 0)
+            self.assertEqual(record["performance"]["misses"], [])
+            self.assertEqual(
+                record["performance"]["budgets"],
+                {"wall_time_seconds": 20.0},
+            )
 
     def test_missing_status_is_a_successful_empty_status(self):
         with tempfile.TemporaryDirectory() as directory:

@@ -326,6 +326,13 @@ class PruneCliTests(unittest.TestCase):
         self.assertEqual(payload["data"]["remaining_observations"], 0)
         status = json.loads((self.state / "status.json").read_text())
         self.assertEqual(status["data"]["stages"]["prune"]["counts"]["pruned_observations"], 1)
+        prune_status = status["data"]["stages"]["prune"]
+        self.assertGreater(prune_status["counts"]["db_bytes"], 0)
+        self.assertEqual(prune_status["performance"]["misses"], [])
+        self.assertEqual(
+            prune_status["performance"]["db_bytes"],
+            prune_status["counts"]["db_bytes"],
+        )
 
     def test_ingest_does_not_resurrect_pruned_observations(self):
         config = self.home / ".config" / "twill" / "config.toml"
