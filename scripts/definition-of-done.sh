@@ -42,6 +42,11 @@ run() {
   return 0
 }
 
+# Backstop for the third artifact-containment guard (§10.2): CI runs this
+# definition against the published checkout, so reject any private artifact
+# that made it into that tree before running the rest of the gates.
+run sh scripts/check-published-tree.sh .
+
 # The gated suite: the open-path stop-ship gate plus every unit test,
 # including the mandatory secret-fixture and idempotency property tests.
 run make test
