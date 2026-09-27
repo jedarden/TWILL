@@ -8,8 +8,9 @@ import re
 import shlex
 import sqlite3
 import tempfile
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import date, datetime, timedelta, timezone
+from math import isfinite
 from pathlib import Path
 from typing import Sequence
 
@@ -23,6 +24,7 @@ from twill_detectors import (
     read_clusters,
 )
 from twill_redactor import redact_text
+from twill_ranker import EstimatedWaste
 from twill_schema import connect_read_only, state_db_path
 
 
@@ -140,6 +142,7 @@ class _DetectorWindow:
     status: str
     clusters: dict[str, Counts]
     error: str | None
+    estimated_waste: dict[str, EstimatedWaste]
 
 
 @dataclass(frozen=True)
@@ -168,6 +171,7 @@ class Finding:
     previous: Counts | None
     week: str
     reproduce: str
+    estimated_waste: EstimatedWaste | None = None
 
 
 @dataclass(frozen=True)
@@ -254,9 +258,29 @@ def _read_window(
                 f"INSERT INTO rule_doc ({rule_quoted_columns}) VALUES ({rule_placeholders})",
                 source.execute(f"SELECT {rule_quoted_columns} FROM rule_doc"),
             )
+        usage_columns = tuple(
+            (str(row[1]), str(row[2] or "TEXT"))
+            for row in source.execute("PRAGMA table_info(session_usage)")
+        )
+        if usage_columns:
+            usage_quoted_columns = ", ".join(
+                '"' + name.replace('"', '""') + '"'
+                for name, _ in usage_columns
+            )
+            usage_declarations = ", ".join(
+                '"' + name.replace('"', '""') + '" ' + declaration
+                for name, declaration in usage_columns
+            )
+            usage_placeholders = ", ".join("?" for _ in usage_columns)
+            memory.execute(f"CREATE TABLE session_usage ({usage_declarations})")
+            memory.executemany(
+                f"INSERT INTO session_usage ({usage_quoted_columns}) VALUES ({usage_placeholders})",
+                source.execute(f"SELECT {usage_quoted_columns} FROM session_usage"),
+            )
         memory.execute("PRAGMA query_only = ON")
 
         results: list[_DetectorWindow] = []
+        session_hits: list[tuple[str, str, str]] = []
         for detector in detectors:
             try:
                 twill_detectors.validate_detector_semantics(source, detector)
@@ -266,6 +290,20 @@ def _read_window(
                     window_start_utc=start,
                     window_days=7,
                 )
+                if detector.session_hits_sql is not None:
+                    hit_cursor = memory.execute(
+                        detector.session_hits_sql,
+                        {"window_start_utc": start, "window_days": 7},
+                    )
+                    hits = twill_detectors._collect_session_hits(
+                        detector,
+                        hit_cursor,
+                        clusters,
+                    )
+                    session_hits.extend(
+                        (detector.detector_id, key, session_id)
+                        for key, session_id in hits
+                    )
             except (sqlite3.Error, DetectorContractError) as exc:
                 results.append(
                     _DetectorWindow(
@@ -273,6 +311,7 @@ def _read_window(
                         status=STATUS_ERROR,
                         clusters={},
                         error=_one_line(exc, MAX_ERROR_LENGTH),
+                        estimated_waste={},
                     )
                 )
             else:
@@ -282,11 +321,114 @@ def _read_window(
                         status=STATUS_OK,
                         clusters=clusters,
                         error=None,
+                        estimated_waste={},
                     )
                 )
-        return tuple(results)
+        estimates = _attribute_waste(memory, session_hits)
+        return tuple(
+            replace(
+                result,
+                estimated_waste={
+                    key: estimates[(result.detector.detector_id, key)]
+                    for key in result.clusters
+                    if (result.detector.detector_id, key) in estimates
+                },
+            )
+            for result in results
+        )
     finally:
         memory.close()
+
+
+def _known_token(value: object) -> int | None:
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        return None
+    return value
+
+
+def _known_cost(value: object) -> float | None:
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    resolved = float(value)
+    if resolved < 0 or not isfinite(resolved):
+        return None
+    return resolved
+
+
+def _attribute_waste(
+    connection: sqlite3.Connection,
+    session_hits: Sequence[tuple[str, str, str]],
+) -> dict[tuple[str, str], EstimatedWaste]:
+    """Attribute this digest window's usage across all distinct cluster hits."""
+
+    hits = set(session_hits)
+    if not hits:
+        return {}
+    try:
+        usage_rows = connection.execute(
+            "SELECT session_id, input_tokens, output_tokens, "
+            "cache_read_tokens, cost_usd FROM session_usage"
+        ).fetchall()
+    except sqlite3.Error:
+        usage_rows = []
+    usage = {str(row[0]): row[1:] for row in usage_rows}
+    cluster_hits_by_session: dict[str, int] = {}
+    for _, _, session_id in hits:
+        cluster_hits_by_session[session_id] = (
+            cluster_hits_by_session.get(session_id, 0) + 1
+        )
+
+    token_columns = ("input_tokens", "output_tokens", "cache_read_tokens")
+    token_values: dict[tuple[str, str], dict[str, float]] = {}
+    token_counts: dict[tuple[str, str], dict[str, int]] = {}
+    cost_values: dict[tuple[str, str], float] = {}
+    cost_counts: dict[tuple[str, str], int] = {}
+    hit_counts: dict[tuple[str, str], int] = {}
+    for detector_id, key, session_id in sorted(hits):
+        cluster = (detector_id, key)
+        hit_counts[cluster] = hit_counts.get(cluster, 0) + 1
+        values = token_values.setdefault(
+            cluster, {column: 0.0 for column in token_columns}
+        )
+        counts = token_counts.setdefault(
+            cluster, {column: 0 for column in token_columns}
+        )
+        session_usage = usage.get(session_id)
+        if session_usage is None:
+            continue
+        denominator = cluster_hits_by_session[session_id]
+        for index, column in enumerate(token_columns):
+            token = _known_token(session_usage[index])
+            if token is None:
+                continue
+            values[column] += token / denominator
+            counts[column] += 1
+        cost = _known_cost(session_usage[3])
+        if cost is not None:
+            cost_values[cluster] = (
+                cost_values.get(cluster, 0.0) + cost / denominator
+            )
+            cost_counts[cluster] = cost_counts.get(cluster, 0) + 1
+
+    estimates: dict[tuple[str, str], EstimatedWaste] = {}
+    for cluster, hits_for_cluster in hit_counts.items():
+        values = token_values[cluster]
+        counts = token_counts[cluster]
+        components = {
+            column: values[column] if counts[column] == hits_for_cluster else None
+            for column in token_columns
+        }
+        estimates[cluster] = EstimatedWaste(
+            components["input_tokens"],
+            components["output_tokens"],
+            components["cache_read_tokens"],
+            (
+                cost_values[cluster]
+                if cost_counts.get(cluster, 0) == hits_for_cluster
+                else None
+            ),
+        )
+    return estimates
 
 
 def _verdict(current: Counts | None, previous: Counts | None) -> str | None:
@@ -327,6 +469,7 @@ def _finding_data(finding: Finding) -> dict[str, object]:
         ),
         "week": finding.week,
         "reproduce": finding.reproduce,
+        **_finding_waste_data(finding),
     }
 
 
@@ -452,22 +595,39 @@ def build_digest(
                 )
 
     verdict_rank = {verdict: index for index, verdict in enumerate(VERDICT_ORDER)}
-    changes.sort(key=lambda row: (verdict_rank[row[0]], row[1], row[2]))
+    current_estimates = {
+        (result.detector.full_id, key): estimate
+        for result in current_results
+        for key, estimate in result.estimated_waste.items()
+    }
+    previous_estimates = {
+        (result.detector.full_id, key): estimate
+        for result in previous_results
+        for key, estimate in result.estimated_waste.items()
+    }
+    findings_list: list[Finding] = []
+    for verdict, detector, key, current, previous in changes:
+        current_waste = current_estimates.get((detector, key))
+        previous_waste = previous_estimates.get((detector, key))
+        findings_list.append(
+            Finding(
+                n=0,
+                verdict=verdict,
+                detector=detector,
+                key=key,
+                current=current,
+                previous=previous,
+                week=format_week(week),
+                reproduce=command,
+                estimated_waste=(
+                    current_waste if current is not None else previous_waste
+                ),
+            )
+        )
+    findings_list.sort(key=lambda finding: _finding_sort_key(finding, verdict_rank))
     findings = tuple(
-        Finding(
-            n=index,
-            verdict=verdict,
-            detector=detector,
-            key=key,
-            current=current,
-            previous=previous,
-            week=format_week(week),
-            reproduce=command,
-        )
-        for index, (verdict, detector, key, current, previous) in enumerate(
-            changes,
-            start=1,
-        )
+        replace(finding, n=index)
+        for index, finding in enumerate(findings_list, start=1)
     )
     return DigestReport(
         state_dir=state,
@@ -496,6 +656,36 @@ def _detector_data(detector: DetectorSummary) -> dict[str, object]:
     }
 
 
+def _finding_sort_key(
+    finding: Finding,
+    verdict_rank: dict[str, int],
+) -> tuple[object, ...]:
+    estimate = finding.estimated_waste
+    dollars = estimate.waste_usd if estimate is not None else None
+    tokens = estimate.tokens if estimate is not None else None
+    known_dollars = isinstance(dollars, (int, float)) and isfinite(float(dollars))
+    known_tokens = isinstance(tokens, (int, float)) and isfinite(float(tokens))
+    return (
+        verdict_rank[finding.verdict],
+        0 if known_dollars else 1,
+        -float(dollars) if known_dollars else 0.0,
+        0 if known_tokens else 1,
+        -float(tokens) if known_tokens else 0.0,
+        finding.detector,
+        finding.key,
+    )
+
+
+def _finding_waste_data(finding: Finding) -> dict[str, object]:
+    estimate = finding.estimated_waste or EstimatedWaste(None, None, None, None)
+    return {
+        **estimate.as_dict(),
+        "estimated_waste_window": (
+            "current" if finding.current is not None else "previous"
+        ),
+    }
+
+
 def render_data(report: DigestReport) -> dict[str, object]:
     start, end = week_bounds(report.week)
     prior_start, prior_end = week_bounds(report.prior_week)
@@ -520,6 +710,18 @@ def _count_text(count: tuple[int, int] | None) -> str:
     if count is None:
         return "? sessions/? events"
     return f"{count[0]} sessions/{count[1]} events"
+
+
+def _waste_text(estimate: EstimatedWaste | None) -> str:
+    if estimate is None or estimate.waste_usd is None:
+        dollars = "unavailable"
+    else:
+        dollars = f"{estimate.waste_usd:.6f}"
+    if estimate is None or estimate.tokens is None:
+        tokens = "unavailable"
+    else:
+        tokens = f"{estimate.tokens:,.2f}"
+    return f"estimated waste: {dollars} USD; estimated tokens: {tokens}"
 
 
 def render_text(report: DigestReport) -> str:
@@ -590,7 +792,8 @@ def render_text(report: DigestReport) -> str:
                 _line(
                     f"- {finding.n} {finding.verdict} {finding.detector} "
                     f"{_display_key(finding.key)} "
-                    f"{_count_text(previous)}->{_count_text(current)}",
+                    f"{_count_text(previous)}->{_count_text(current)}; "
+                    f"{_waste_text(finding.estimated_waste)}",
                     report.command,
                 )
             )

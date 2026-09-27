@@ -178,6 +178,38 @@ class DigestDiffTests(DigestStateCase):
 
         self.assertIn("'\"'\"'", report.command)
 
+    def test_findings_are_ranked_by_estimated_waste_not_session_count(self):
+        seed_failure(self.connection, "alpha", 2, IN_WEEK)
+        seed_failure(self.connection, "beta", 3, IN_WEEK)
+        self.connection.executemany(
+            "INSERT INTO session_usage(session_id, input_tokens, output_tokens, "
+            "cache_read_tokens, cost_usd) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("alpha-session-0", 100, 200, 300, 1.0),
+                ("alpha-session-1", 100, 200, 300, 1.0),
+                ("beta-session-0", 100, 200, 300, 0.5),
+                ("beta-session-1", 100, 200, 300, 0.5),
+                ("beta-session-2", 100, 200, 300, 0.5),
+            ],
+        )
+        self.connection.commit()
+
+        report = self.build(registry=(MISSING_BINARY,))
+
+        self.assertEqual(
+            [finding.key for finding in report.findings],
+            ["command-not-found:alpha", "command-not-found:beta"],
+        )
+        data = twill_digest.render_data(report)
+        self.assertEqual(
+            [finding["key"] for finding in data["findings"]],
+            ["command-not-found:alpha", "command-not-found:beta"],
+        )
+        self.assertEqual(data["findings"][0]["estimated_waste_usd"], 2.0)
+        self.assertEqual(data["findings"][1]["estimated_waste_usd"], 1.5)
+        self.assertEqual(data["findings"][0]["estimated_waste_window"], "current")
+        self.assertIn("estimated waste: 2.000000 USD", twill_digest.render_text(report))
+
     def test_production_report_command_reproduces_exact_text(self):
         seed_failure(self.connection, "sqlite3", 2, IN_WEEK)
         self.connection.commit()
