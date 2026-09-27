@@ -28,6 +28,7 @@ MEASUREMENT_DIR_MODE = 0o700
 MEASUREMENT_FILE_MODE = 0o600
 DEFAULT_MEASUREMENT_WINDOW_DAYS = 7
 ESCALATION_AFTER_DAYS = 21
+RESOLUTION_AFTER_DAYS = 21
 MEASURABLE_STATES = frozenset(
     {"accepted"} | {f"applied:{layer}" for layer in twill_lessons.ROUTING_LAYERS}
 )
@@ -131,12 +132,37 @@ class EscalationProposal:
 
 
 @dataclass(frozen=True)
+class ResolutionCandidate:
+    """A lesson whose measured zero series qualifies it for resolution."""
+
+    lesson_id: str
+    detector_id: str
+    key: str
+    applied_at: str
+    first_zero_at: str
+    resolved_at: str
+    consecutive_days: int
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "lesson_id": self.lesson_id,
+            "detector_id": self.detector_id,
+            "key": self.key,
+            "applied_at": self.applied_at,
+            "first_zero_at": self.first_zero_at,
+            "resolved_at": self.resolved_at,
+            "consecutive_days": self.consecutive_days,
+        }
+
+
+@dataclass(frozen=True)
 class MeasurementReport:
     window_days: int
     window_start_utc: str
     measured_at: str
     measurements: tuple[Measurement, ...]
     skipped: tuple[str, ...] = ()
+    resolved: tuple[str, ...] = ()
 
     @property
     def points(self) -> tuple[Measurement, ...]:
@@ -153,6 +179,7 @@ class MeasurementReport:
             "measured_at": self.measured_at,
             "measurements": [item.as_dict() for item in self.measurements],
             "skipped": list(self.skipped),
+            "resolved": list(self.resolved),
         }
 
 
@@ -557,6 +584,92 @@ def escalation_proposals(
     )
 
 
+def evaluate_resolutions(
+    lessons: Iterable[twill_lessons.LessonRecord],
+    measurements: Iterable[Measurement],
+    *,
+    as_of: str | datetime | None = None,
+) -> tuple[ResolutionCandidate, ...]:
+    """Find applied lessons with 21 consecutive zero-count measurement days.
+
+    Resolution is based on the durable daily series, not merely on elapsed
+    time.  A missing day or a non-zero point breaks a run, and points recorded
+    before the applied-at timestamp cannot receive credit for the fix.
+    """
+
+    cutoff = _clock(as_of)
+    by_lesson: dict[str, list[Measurement]] = {}
+    for point in measurements:
+        by_lesson.setdefault(point.lesson_id, []).append(point)
+
+    candidates: list[ResolutionCandidate] = []
+    for lesson in sorted(lessons, key=lambda item: item.id):
+        if not lesson.state.startswith("applied:"):
+            continue
+        raw_applied_at = lesson.routing.get("applied_at")
+        if not isinstance(raw_applied_at, str):
+            continue
+        applied_at = _timestamp(raw_applied_at)
+        daily: dict[str, Measurement] = {}
+        for point in by_lesson.get(lesson.id, ()):
+            measured_at = _timestamp(point.measured_at)
+            if (
+                measured_at <= applied_at
+                or measured_at > cutoff
+                or point.window_days != DEFAULT_MEASUREMENT_WINDOW_DAYS
+            ):
+                continue
+            day = point.day
+            previous = daily.get(day)
+            if previous is None or measured_at > _timestamp(previous.measured_at):
+                daily[day] = point
+
+        run: list[Measurement] = []
+        for point in sorted(daily.values(), key=lambda item: item.day):
+            if point.sessions != 0 or point.events != 0:
+                run = []
+                continue
+            if run:
+                previous_day = _timestamp(run[-1].measured_at).date()
+                current_day = _timestamp(point.measured_at).date()
+                if current_day != previous_day + timedelta(days=1):
+                    run = []
+            run.append(point)
+            if len(run) < RESOLUTION_AFTER_DAYS:
+                continue
+            first = run[-RESOLUTION_AFTER_DAYS]
+            resolved = run[-1]
+            candidates.append(
+                ResolutionCandidate(
+                    lesson_id=lesson.id,
+                    detector_id=resolved.detector_id,
+                    key=lesson.key,
+                    applied_at=_format_timestamp(applied_at),
+                    first_zero_at=first.measured_at,
+                    resolved_at=resolved.measured_at,
+                    consecutive_days=RESOLUTION_AFTER_DAYS,
+                )
+            )
+            break
+    return tuple(candidates)
+
+
+def resolution_candidates(
+    artifacts_root: Path,
+    *,
+    as_of: str | datetime | None = None,
+    repo_root: Path | None = None,
+) -> tuple[ResolutionCandidate, ...]:
+    """Evaluate external lesson and measurement artifacts without mutating them."""
+
+    root = _validate_root(artifacts_root, repo_root)
+    return evaluate_resolutions(
+        twill_lessons.list_lessons(root, repo_root=repo_root),
+        read_measurements(root, repo_root=repo_root),
+        as_of=as_of,
+    )
+
+
 def _detector_for(
     detector_id: str, registry: Sequence[twill_detectors.Detector]
 ) -> twill_detectors.Detector:
@@ -868,12 +981,21 @@ def measure_lessons(
     except BaseException:
         _cleanup_staged(staged)
         raise
+    resolved: list[str] = []
+    for candidate in evaluate_resolutions(records, history.values(), as_of=current):
+        twill_lessons.resolve_lesson(
+            artifacts_root,
+            candidate.lesson_id,
+            repo_root=repo_root,
+        )
+        resolved.append(candidate.lesson_id)
     return MeasurementReport(
         window_days=window_days,
         window_start_utc=window_start,
         measured_at=measured_at,
         measurements=tuple(points),
         skipped=tuple(skipped),
+        resolved=tuple(resolved),
     )
 
 
@@ -934,18 +1056,22 @@ def restore_measurements(
 __all__ = [
     "DEFAULT_MEASUREMENT_WINDOW_DAYS",
     "ESCALATION_AFTER_DAYS",
+    "RESOLUTION_AFTER_DAYS",
     "MEASURABLE_STATES",
     "MEASUREMENT_DIRNAME",
     "MEASUREMENT_DIR_MODE",
     "MEASUREMENT_FILE_MODE",
     "Measurement",
     "EscalationProposal",
+    "ResolutionCandidate",
     "MeasurementError",
     "MeasurementReport",
     "MeasurementValidationError",
     "measure_lessons",
     "evaluate_escalations",
+    "evaluate_resolutions",
     "escalation_proposals",
+    "resolution_candidates",
     "measurement_dir",
     "measurement_path",
     "read_measurements",

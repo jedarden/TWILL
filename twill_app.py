@@ -1807,6 +1807,7 @@ def measure_command(args: argparse.Namespace) -> int:
         {
             "lessons": len(report.measurements),
             "measurements": len(report.measurements),
+            "resolved": len(report.resolved),
         },
     )
     emit_success(report.as_dict(), json_mode=args.json)

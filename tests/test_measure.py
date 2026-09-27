@@ -270,6 +270,112 @@ class MeasurementTests(unittest.TestCase):
             (),
         )
 
+    def test_resolution_requires_21_consecutive_zero_days_after_application(self):
+        self.lesson("L-00000001", state="applied:environment")
+        record = twill_lessons.load_lesson(self.artifacts, "L-00000001")
+        points = tuple(
+            twill_measure.Measurement(
+                lesson_id=record.id,
+                detector_id="D-01@1",
+                measured_at=f"2026-09-{day:02d}T00:00:00Z"
+                if day <= 30
+                else f"2026-10-{day - 30:02d}T00:00:00Z",
+                window_days=7,
+                sessions=0,
+                events=0,
+            )
+            for day in range(21, 42)
+        )
+
+        self.assertEqual(
+            twill_measure.evaluate_resolutions(
+                (record,), points[:-1], as_of=points[-2].measured_at
+            ),
+            (),
+        )
+        candidates = twill_measure.evaluate_resolutions(
+            (record,), points, as_of=points[-1].measured_at
+        )
+        self.assertEqual(len(candidates), 1)
+        self.assertEqual(candidates[0].consecutive_days, 21)
+        self.assertEqual(candidates[0].first_zero_at, points[0].measured_at)
+
+    def test_resolution_ignores_gaps_nonzero_counts_and_terminal_lessons(self):
+        self.lesson("L-00000001", state="applied:environment")
+        self.lesson("L-00000002", state="resolved", key="command-not-found:resolved")
+        records = tuple(
+            twill_lessons.load_lesson(self.artifacts, lesson_id)
+            for lesson_id in ("L-00000001", "L-00000002")
+        )
+        points = tuple(
+            twill_measure.Measurement(
+                lesson_id=records[0].id,
+                detector_id="D-01@1",
+                measured_at=(
+                    f"2026-09-{day:02d}T00:00:00Z"
+                    if day <= 30
+                    else f"2026-10-{day - 30:02d}T00:00:00Z"
+                ),
+                window_days=7,
+                sessions=1 if day == 30 else 0,
+                events=1 if day == 30 else 0,
+            )
+            for day in range(21, 42)
+        )
+        terminal_point = twill_measure.Measurement(
+            lesson_id=records[1].id,
+            detector_id="D-01@1",
+            measured_at="2026-10-11T00:00:00Z",
+            window_days=7,
+            sessions=0,
+            events=0,
+        )
+        gapped_points = points[:9] + points[10:]
+
+        self.assertEqual(
+            twill_measure.evaluate_resolutions(
+                records,
+                (*points, terminal_point),
+                as_of="2026-10-11T00:00:00Z",
+            ),
+            (),
+        )
+        self.assertEqual(
+            twill_measure.evaluate_resolutions(
+                (records[0],),
+                gapped_points,
+                as_of="2026-10-11T00:00:00Z",
+            ),
+            (),
+        )
+
+    def test_measure_resolves_only_after_the_durable_zero_series_qualifies(self):
+        self.lesson("L-00000001", state="applied:environment")
+        connection = twill_schema.connect(self.state)
+        self.addCleanup(connection.close)
+
+        final_report = None
+        for day in range(21, 42):
+            date = (
+                f"2026-09-{day:02d}T00:00:00Z"
+                if day <= 30
+                else f"2026-10-{day - 30:02d}T00:00:00Z"
+            )
+            final_report = twill_measure.measure_lessons(
+                connection, self.artifacts, now=date
+            )
+            state = twill_lessons.load_lesson(
+                self.artifacts, "L-00000001"
+            ).state
+            if day < 41:
+                self.assertEqual(state, "applied:environment")
+        assert final_report is not None
+        self.assertEqual(final_report.resolved, ("L-00000001",))
+        self.assertEqual(
+            twill_lessons.load_lesson(self.artifacts, "L-00000001").state,
+            "resolved",
+        )
+
 
 class MeasurementCliTests(unittest.TestCase):
     def setUp(self):

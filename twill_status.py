@@ -37,6 +37,7 @@ COUNT_FIELDS = frozenset(
         "pruned_observations",
         "remaining_observations",
         "records",
+        "resolved",
         "rows",
         "sessions",
     }
