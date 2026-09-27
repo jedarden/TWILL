@@ -23,6 +23,7 @@ from twill_config import ConfigError, TwillConfig  # noqa: E402
 from twill_contract import EXIT_VALIDATION_FAILURE, ValidationError  # noqa: E402
 from twill_lessons import load_lesson  # noqa: E402
 from twill_ranker import RankedCluster  # noqa: E402
+from twill_redactor import CONTENT_FENCE_MARKER  # noqa: E402
 
 
 class ExplainerTestCase(unittest.TestCase):
@@ -432,6 +433,29 @@ class ExplainerTestCase(unittest.TestCase):
         )
         self.assertEqual(repeated, paths)
         self.assertEqual(path.read_bytes(), text.encode("utf-8"))
+
+    def test_lesson_write_redacts_fenced_entity_from_model_summary(self):
+        fenced = "Restricted Vendor"
+        config = TwillConfig(
+            artifacts_root=self.root / "artifacts",
+            content_fences=(fenced,),
+        )
+        path = twill_explainer.write_lesson_files(
+            (
+                self.draft(
+                    summary=(
+                        f"The {fenced} appears in the explanation. "
+                        "Use the documented remedy instead."
+                    )
+                ),
+            ),
+            (self.candidate(),),
+            config,
+        )[0]
+
+        text = path.read_text(encoding="utf-8")
+        self.assertNotIn(fenced, text)
+        self.assertIn(CONTENT_FENCE_MARKER, text)
 
     def test_generic_recurrence_lesson_records_retrieval_only_reason(self):
         key = "tool rejected: invalid input"

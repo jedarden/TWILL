@@ -1035,11 +1035,12 @@ def _prepare_lessons(
     source: object,
     lessons_dir: Path,
     backtest_for: Callable[[str, str], LessonBacktest],
+    redactor: Redactor,
 ) -> tuple[_PreparedLesson, ...]:
     draft_records = tuple(drafts)
     if not draft_records:
         return ()
-    safe_redactor = Redactor()
+    safe_redactor = redactor
     items = _writer_items(source, safe_redactor)
     item_by_id: dict[str, _NormalizedItem] = {}
     for item in items:
@@ -1064,7 +1065,10 @@ def _prepare_lessons(
                 "does not name a supplied candidate cluster",
             )
         try:
-            summary = _validate_summary(draft.summary, f"{path_name}.summary")
+            summary = _validate_summary(
+                _redact_text(draft.summary, safe_redactor, MAX_LESSON_SUMMARY_LENGTH),
+                f"{path_name}.summary",
+            )
         except ValidationError as error:
             _invalid_lesson_write(f"{path_name}.summary", error.message)
         item = item_by_id[cluster_id]
@@ -1274,7 +1278,13 @@ def write_lesson_files(
             window_start_utc=window_start,
         )
 
-    prepared = _prepare_lessons(drafts, source, lessons_dir, backtest_for)
+    prepared = _prepare_lessons(
+        drafts,
+        source,
+        lessons_dir,
+        backtest_for,
+        Redactor(config.content_fences),
+    )
     if not prepared:
         return ()
     repository = (Path(__file__).resolve().parent if repo_root is None else repo_root).resolve()
