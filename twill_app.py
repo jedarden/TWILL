@@ -32,6 +32,7 @@ import twill_lessons
 import twill_measure
 import twill_prune
 import twill_ranker
+import twill_rules
 import twill_schema
 import twill_cursor
 import twill_doctor
@@ -1682,6 +1683,36 @@ def rank_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def rules_command(args: argparse.Namespace) -> int:
+    """Render the read-only inverse view of rule coverage and decay."""
+
+    unread_days = args.unread_days
+    if isinstance(unread_days, bool) or not isinstance(unread_days, int) or unread_days < 1:
+        raise UsageError("--unread-days must be a positive integer")
+    state_dir = _state_dir(args.state_dir)
+    db_path = twill_schema.state_db_path(state_dir)
+    if not db_path.is_file():
+        report = twill_rules.empty_rules_report(unread_days=unread_days)
+    else:
+        connection = twill_schema.connect_read_only(state_dir)
+        try:
+            report = twill_rules.build_rules_report(
+                connection,
+                unread_days=unread_days,
+            )
+        finally:
+            connection.close()
+    emit_success(
+        report.as_dict(),
+        json_mode=args.json,
+        warnings=report.warnings,
+    )
+    if args.json:
+        return EXIT_SUCCESS
+    print(twill_rules.render_text(report, deletion_candidates=args.deletion_candidates))
+    return EXIT_SUCCESS
+
+
 def measure_command(args: argparse.Namespace) -> int:
     config = load_config()
     artifacts_root = config.require_artifacts_root()
@@ -2013,6 +2044,24 @@ def build_parser() -> argparse.ArgumentParser:
     rank.add_argument("--state-dir")
     rank.add_argument("--json", action="store_true")
     rank.set_defaults(handler=rank_command)
+
+    rules = subparsers.add_parser(
+        "rules", help="show per-rule earnings, recurrence trends, and decay"
+    )
+    rules.add_argument(
+        "--unread-days",
+        type=int,
+        default=90,
+        help="days without a read before a rule is considered decayed (default: 90)",
+    )
+    rules.add_argument(
+        "--deletion-candidates",
+        action="store_true",
+        help="include the deletion-candidate list in human-readable output",
+    )
+    rules.add_argument("--state-dir")
+    rules.add_argument("--json", action="store_true")
+    rules.set_defaults(handler=rules_command)
 
     measure = subparsers.add_parser(
         "measure", help="replay accepted lesson detectors and append measurements"

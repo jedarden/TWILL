@@ -15,6 +15,7 @@ here: a one-off error is noise, the same one across six hundred sessions is a le
 |---|---|
 | **Detect** | Versioned SQL detectors over observations parsed from transcripts — failed commands, hook denials, rejected tool calls, interruptions, rediscovered facts |
 | **Rank** | Cluster and score findings, then check them against the rules that already exist (MEMORY.md and its leaves, CLAUDE.md, repo `AGENTS.md`, skills). A rule that exists and still gets broken is an escalation, not a new lesson |
+| **Rules** | Invert coverage into a per-rule earnings and decay report: covered clusters, rising or falling weekly recurrence, last read time, and deletion candidates |
 | **Explain** | One bounded, schema-validated `claude -p` pass writes up the top clusters as draft lessons. Never runs on raw sessions |
 | **Apply** | Route each lesson to the strongest layer that would actually stop it: environment fix > hook/gate > wrapper > skill > `AGENTS.md` > memory > retrieval-only. TWILL emits the change; a human applies it |
 | **Measure** | Every lesson carries the detector that found it. Re-run it: if the problem did not stop, escalate a layer; if it has not appeared in 90 days, propose retiring the rule |
