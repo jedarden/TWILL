@@ -579,6 +579,16 @@ qualifying sessions descending, latest `last_seen` descending, then command asce
 clusters retain `score = 0.0`; the Phase 3 ranker consumes these counts and timestamps for global
 ranking.
 
+**D-05@1 decision (2026-09-27):** D-05 pairs a `tool_rejected` observation with the immediately
+following `user_turn_after_correction` observation in the same session. The pair is ignored when the
+tool name or correction excerpt is empty, or when another observation intervenes. Its key is
+`tool-rejected:<tool>:<redacted correction>`, bounded to 240 characters by the detector runner;
+`sessions` counts distinct sessions and `events` counts rejected/correction pairs. There is no
+recurrence threshold because a user correction is already a high-signal label. The first/last seen
+timestamps use the rejected-call observation, and output is ordered by sessions descending, latest
+`last_seen` descending, then key ascending. Session-hit, week-hit, and weekly-series queries use the
+same pairing rule; persisted clusters retain `score = 0.0` for the Phase 3 ranker.
+
 **D-09@1 decision (2026-09-24):** D-09 emits one cluster for each live indexed rule document whose
 newest `last_read_by_agent` value for its content hash is missing or earlier than the trailing-window
 start and which has no matching `file_read` observation in the window. Reading either copy of identical

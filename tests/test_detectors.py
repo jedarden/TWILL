@@ -1280,6 +1280,167 @@ class RetryLoopDetectorTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["alpha", "gamma", "beta"])
 
 
+class RejectedToolCallDetectorTests(unittest.TestCase):
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def seed_pair(
+        self,
+        *,
+        session_id: str,
+        tool: str | None,
+        correction: str | None,
+        days_ago: float = 1.0,
+    ) -> None:
+        seed_observation(
+            self.connection,
+            session_id=session_id,
+            kind="tool_rejected",
+            tool=tool,
+            excerpt="rejected",
+            days_ago=days_ago,
+        )
+        seed_observation(
+            self.connection,
+            session_id=session_id,
+            kind="user_turn_after_correction",
+            tool=None,
+            excerpt=correction,
+            days_ago=days_ago - 0.01,
+        )
+
+    def test_d05_pairs_adjacent_rejections_with_the_next_correction(self):
+        self.seed_pair(
+            session_id="session-a",
+            tool="Bash",
+            correction="use the read-only endpoint instead",
+            days_ago=5,
+        )
+        self.seed_pair(
+            session_id="session-b",
+            tool="Bash",
+            correction="use the read-only endpoint instead",
+            days_ago=4,
+        )
+        self.seed_pair(
+            session_id="session-c",
+            tool="Edit",
+            correction="make the change in scratch first",
+            days_ago=2,
+        )
+
+        # A rejection without a tool, an empty correction, and a correction
+        # separated by another observation are not detector findings.
+        seed_observation(
+            self.connection,
+            session_id="ignored-empty-tool",
+            kind="tool_rejected",
+            tool=" ",
+            days_ago=1,
+        )
+        seed_observation(
+            self.connection,
+            session_id="ignored-empty-tool",
+            kind="user_turn_after_correction",
+            excerpt="try again",
+            days_ago=0.99,
+        )
+        self.seed_pair(
+            session_id="ignored-empty-correction",
+            tool="Bash",
+            correction=" ",
+            days_ago=1,
+        )
+        seed_observation(
+            self.connection,
+            session_id="ignored-intervening-event",
+            kind="tool_rejected",
+            tool="Bash",
+            days_ago=3,
+        )
+        seed_observation(
+            self.connection,
+            session_id="ignored-intervening-event",
+            kind="tool_error",
+            tool="Bash",
+            days_ago=2.99,
+        )
+        seed_observation(
+            self.connection,
+            session_id="ignored-intervening-event",
+            kind="user_turn_after_correction",
+            excerpt="this is a new instruction",
+            days_ago=2.98,
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.REJECTED_TOOL_CALL,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-05@1", "ok", 2)],
+        )
+        rows = cluster_rows(self.connection, "D-05")
+        self.assertEqual(
+            [row[1] for row in rows],
+            [
+                "tool-rejected:Bash:use the read-only endpoint instead",
+                "tool-rejected:Edit:make the change in scratch first",
+            ],
+        )
+        self.assertEqual([(row[3], row[4]) for row in rows], [(2, 2), (1, 1)])
+        self.assertEqual(rows[0][7], 0.0)
+        self.assertEqual(rows[0][9], "open")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT key, session_id FROM cluster_session "
+                "WHERE detector_id = 'D-05' ORDER BY key, session_id"
+            ).fetchall(),
+            [
+                ("tool-rejected:Bash:use the read-only endpoint instead", "session-a"),
+                ("tool-rejected:Bash:use the read-only endpoint instead", "session-b"),
+                ("tool-rejected:Edit:make the change in scratch first", "session-c"),
+            ],
+        )
+
+    def test_d05_uses_rejection_order_and_window_for_pairing(self):
+        self.seed_pair(
+            session_id="in-window",
+            tool="Bash",
+            correction="dry run",
+            days_ago=2,
+        )
+        self.seed_pair(
+            session_id="old-rejection",
+            tool="Bash",
+            correction="old correction",
+            days_ago=31,
+        )
+
+        rows = self.connection.execute(
+            twill_detectors.REJECTED_TOOL_CALL_SQL,
+            {
+                "window_start_utc": (
+                    datetime.now(timezone.utc) - timedelta(days=30)
+                ).isoformat(),
+                "window_days": 30,
+            },
+        ).fetchall()
+
+        self.assertEqual(
+            [(row[0], row[1], row[2]) for row in rows],
+            [("tool-rejected:Bash:dry run", 1, 1)],
+        )
+
+
 class UnreadRuleDocDetectorTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -1594,6 +1755,14 @@ class DetectCliTests(unittest.TestCase):
                         "error": None,
                     },
                     {
+                        "detector_id": "D-05",
+                        "version": 1,
+                        "full_id": "D-05@1",
+                        "status": "ok",
+                        "clusters": 0,
+                        "error": None,
+                    },
+                    {
                         "detector_id": "D-09",
                         "version": 1,
                         "full_id": "D-09@1",
@@ -1612,6 +1781,7 @@ class DetectCliTests(unittest.TestCase):
             self.assertIn("D-01@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-02@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-03@1: 0 cluster(s)", human.stdout)
+            self.assertIn("D-05@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-09@1: 0 cluster(s)", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):

@@ -663,6 +663,161 @@ RETRY_LOOP = Detector(
 )
 
 
+REJECTED_TOOL_CALL_SQL = """
+    WITH paired AS (
+        SELECT r.obs_id AS rejection_id,
+               r.session_id,
+               trim(r.tool) AS tool,
+               r.ts_utc AS rejected_at,
+               trim(c.excerpt) AS correction
+        FROM observation AS r
+        JOIN observation AS c
+          ON c.session_id = r.session_id
+         AND c.kind = 'user_turn_after_correction'
+         AND c.ts_utc >= :window_start_utc
+         AND c.obs_id > r.obs_id
+         AND NOT EXISTS (
+             SELECT 1
+             FROM observation AS between_events
+             WHERE between_events.session_id = r.session_id
+               AND between_events.obs_id > r.obs_id
+               AND between_events.obs_id < c.obs_id
+         )
+        WHERE r.ts_utc >= :window_start_utc
+          AND r.kind = 'tool_rejected'
+          AND r.tool IS NOT NULL
+          AND trim(r.tool) <> ''
+          AND c.excerpt IS NOT NULL
+          AND trim(c.excerpt) <> ''
+    )
+    SELECT substr('tool-rejected:' || tool || ':' || correction, 1, 240) AS key,
+           count(DISTINCT session_id) AS sessions,
+           count(*) AS events,
+           min(rejected_at) AS first_seen,
+           max(rejected_at) AS last_seen
+    FROM paired
+    GROUP BY substr('tool-rejected:' || tool || ':' || correction, 1, 240)
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+REJECTED_TOOL_CALL_HIT_SQL = """
+    WITH paired AS (
+        SELECT r.obs_id AS rejection_id,
+               r.session_id,
+               trim(r.tool) AS tool,
+               trim(c.excerpt) AS correction
+        FROM observation AS r
+        JOIN observation AS c
+          ON c.session_id = r.session_id
+         AND c.kind = 'user_turn_after_correction'
+         AND c.ts_utc >= :window_start_utc
+         AND c.obs_id > r.obs_id
+         AND NOT EXISTS (
+             SELECT 1
+             FROM observation AS between_events
+             WHERE between_events.session_id = r.session_id
+               AND between_events.obs_id > r.obs_id
+               AND between_events.obs_id < c.obs_id
+         )
+        WHERE r.ts_utc >= :window_start_utc
+          AND r.kind = 'tool_rejected'
+          AND r.tool IS NOT NULL
+          AND trim(r.tool) <> ''
+          AND c.excerpt IS NOT NULL
+          AND trim(c.excerpt) <> ''
+    )
+    SELECT substr('tool-rejected:' || tool || ':' || correction, 1, 240) AS key,
+           session_id
+    FROM paired
+    GROUP BY substr('tool-rejected:' || tool || ':' || correction, 1, 240), session_id
+    ORDER BY key ASC, session_id ASC
+"""
+
+REJECTED_TOOL_CALL_WEEK_HIT_SQL = """
+    WITH paired AS (
+        SELECT r.obs_id AS rejection_id,
+               r.session_id,
+               r.ts_utc AS rejected_at,
+               trim(r.tool) AS tool,
+               trim(c.excerpt) AS correction
+        FROM observation AS r
+        JOIN observation AS c
+          ON c.session_id = r.session_id
+         AND c.kind = 'user_turn_after_correction'
+         AND c.ts_utc >= :window_start_utc
+         AND c.obs_id > r.obs_id
+         AND NOT EXISTS (
+             SELECT 1
+             FROM observation AS between_events
+             WHERE between_events.session_id = r.session_id
+               AND between_events.obs_id > r.obs_id
+               AND between_events.obs_id < c.obs_id
+         )
+        WHERE r.ts_utc >= :window_start_utc
+          AND r.kind = 'tool_rejected'
+          AND r.tool IS NOT NULL
+          AND trim(r.tool) <> ''
+          AND c.excerpt IS NOT NULL
+          AND trim(c.excerpt) <> ''
+    )
+    SELECT substr('tool-rejected:' || tool || ':' || correction, 1, 240) AS key,
+           strftime('%G-W%V', rejected_at) AS week
+    FROM paired
+    GROUP BY substr('tool-rejected:' || tool || ':' || correction, 1, 240),
+             strftime('%G-W%V', rejected_at)
+    ORDER BY key ASC, week ASC
+"""
+
+REJECTED_TOOL_CALL_WEEKLY_HIT_SQL = """
+    WITH paired AS (
+        SELECT r.obs_id AS rejection_id,
+               r.session_id,
+               r.ts_utc AS rejected_at,
+               trim(r.tool) AS tool,
+               trim(c.excerpt) AS correction
+        FROM observation AS r
+        JOIN observation AS c
+          ON c.session_id = r.session_id
+         AND c.kind = 'user_turn_after_correction'
+         AND c.ts_utc >= :window_start_utc
+         AND c.ts_utc < :window_end_utc
+         AND c.obs_id > r.obs_id
+         AND NOT EXISTS (
+             SELECT 1
+             FROM observation AS between_events
+             WHERE between_events.session_id = r.session_id
+               AND between_events.obs_id > r.obs_id
+               AND between_events.obs_id < c.obs_id
+         )
+        WHERE r.ts_utc >= :window_start_utc
+          AND r.ts_utc < :window_end_utc
+          AND r.kind = 'tool_rejected'
+          AND r.tool IS NOT NULL
+          AND trim(r.tool) <> ''
+          AND c.excerpt IS NOT NULL
+          AND trim(c.excerpt) <> ''
+    )
+    SELECT substr('tool-rejected:' || tool || ':' || correction, 1, 240) AS key,
+           strftime('%G-W%V', rejected_at) AS week,
+           count(DISTINCT session_id) AS sessions,
+           count(*) AS events
+    FROM paired
+    GROUP BY substr('tool-rejected:' || tool || ':' || correction, 1, 240),
+             strftime('%G-W%V', rejected_at)
+    ORDER BY key ASC, week ASC
+"""
+
+REJECTED_TOOL_CALL = Detector(
+    "D-05",
+    1,
+    "tool calls rejected by the user and immediately corrected with a next user turn",
+    REJECTED_TOOL_CALL_SQL,
+    session_hits_sql=REJECTED_TOOL_CALL_HIT_SQL,
+    week_hits_sql=REJECTED_TOOL_CALL_WEEK_HIT_SQL,
+    weekly_hits_sql=REJECTED_TOOL_CALL_WEEKLY_HIT_SQL,
+)
+
+
 UNREAD_RULE_DOC_SQL = """
     WITH read_state AS (
         SELECT sha, max(last_read_by_agent) AS last_read
@@ -703,7 +858,11 @@ UNREAD_RULE_DOC = Detector(
 # recurring error signature, ... D-10 ICG gate gap) append their entries here;
 # an entry leaves this tuple when its successor version lands.
 REGISTRY: tuple[Detector, ...] = build_registry(
-    MISSING_BINARY, RECURRING_ERROR_SIGNATURE, RETRY_LOOP, UNREAD_RULE_DOC
+    MISSING_BINARY,
+    RECURRING_ERROR_SIGNATURE,
+    RETRY_LOOP,
+    REJECTED_TOOL_CALL,
+    UNREAD_RULE_DOC,
 )
 
 

@@ -136,6 +136,22 @@ are excluded. Session-hit and weekly queries use the same qualification rule. Ou
 sessions descending, latest `last_seen` descending, then command ascending; the registry keeps
 `cluster.score` at zero for Phase 3's ranker.
 
+## D-05@1: rejected tool call
+
+D-05 pairs each `tool_rejected` observation with the immediately following
+`user_turn_after_correction` observation in the same session. The pair is
+discarded when either the tool name or the correction excerpt is empty, or
+when any other observation intervenes; the parser's correction event contract
+then supplies the turn-order guarantee. The key is
+`tool-rejected:<tool>:<redacted correction>`, bounded to 240 characters by the
+detector runner. `sessions` counts distinct sessions, `events` counts
+rejected/correction pairs, and `first_seen`/`last_seen` use the rejected-call
+timestamp. There is no recurrence threshold: a user correction is itself a
+high-signal finding. Session-hit, week-hit, and weekly-series queries use the
+same pairing rule. Output is ordered by sessions descending, latest
+`last_seen` descending, then key ascending; the registry keeps `cluster.score`
+at zero for Phase 3's ranker.
+
 ## D-09@1: unread rule document
 
 D-09 emits one cluster for each live indexed rule document whose newest `last_read_by_agent` value
