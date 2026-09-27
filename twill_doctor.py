@@ -12,6 +12,7 @@ import math
 import re
 import shutil
 import sqlite3
+import statistics
 from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
@@ -44,6 +45,16 @@ FREE_DISK_WARN_BYTES = 5 * 1024**3
 TIMER_INTERVALS = {"ingest": 3600.0}
 DEAD_MAN_WINDOW_SECONDS = 24 * 3600.0
 ZERO_OUTPUT_CONSECUTIVE_WEEKS = 2
+# §8.2's parser-drift tolerance lives in how the trailing median is taken:
+# "current" pools the newest runs so one sparse ingest — a lone settled
+# append of three records — cannot read as a vanished type (the zero-output
+# verdict's two-consecutive-samples rule), and a type only counts as
+# vanished when a strict majority of the trailing window carried it, which
+# is what a positive lower median over per-run counts means.  Three history
+# runs is the smallest window that can express a majority at all.
+PARSE_DRIFT_CURRENT_RUNS = 2
+PARSE_DRIFT_HISTORY_RUNS = 8
+PARSE_DRIFT_MIN_HISTORY_RUNS = 3
 # §13.3's detector self-test replays the registry over a fixture with the
 # detectors' default trailing window.
 SELFTEST_WINDOW_DAYS = 30
@@ -799,6 +810,179 @@ def _check_dead_man_switch(
         "dead_man_switch",
         BROKEN,
         "dead-man's switch: transcript files arrived but zero observations were ingested in the last 24 hours",
+        details,
+    )
+
+
+def _check_parse_shape_drift(
+    connection: sqlite3.Connection | None,
+    open_error: str | None,
+) -> CheckResult:
+    """§8.2/§13.3's second silent-death alarm: the parser's shape must hold.
+
+    An upstream transcript format change otherwise reads as a quiet week: the
+    parser keeps running, it simply extracts less.  This check compares each
+    source's current record-type distribution in ``parse_shape`` against the
+    trailing median of its own prior runs and fails naming the source and the
+    vanished or new record type, so the loss is an alarm rather than silence.
+
+    ``Current`` is the newest :data:`PARSE_DRIFT_CURRENT_RUNS` runs pooled: a
+    single sparse ingest must not read as a vanished type.  A type is
+    vanished when the lower median of its per-run counts over the trailing
+    window is positive (majority presence is the tolerance §8.2 names) and
+    the pooled current count is zero, and new when the pooled count is
+    positive while the type appears nowhere in the window.  Runs, not
+    wall-clock, are the unit (the parse_shape@1 decision), so a source's
+    series simply skips runs that parsed nothing new for it, and how old the
+    newest run is stays the dead-man's switch's question.  The window trails,
+    so an un-acted-upon change stops alarming once it becomes the new norm —
+    the loud catch at the moment of change is this alarm's job.
+    """
+
+    if connection is None:
+        return _result(
+            "parse_shape_drift",
+            BROKEN,
+            f"database unavailable: {open_error or 'could not open state database'}",
+            {"error": open_error or "could not open state database"},
+        )
+    try:
+        rows = connection.execute(
+            "SELECT run_at, source, record_type, n FROM parse_shape"
+        ).fetchall()
+    except Exception as exc:
+        return _result(
+            "parse_shape_drift",
+            BROKEN,
+            f"parse_shape history cannot be read: {_exception_text(exc)}",
+            {"error": _exception_text(exc)},
+        )
+
+    runs_by_source: dict[str, dict[str, dict[str, int]]] = {}
+    for row_index, row in enumerate(rows):
+        if len(row) != 4:
+            return _result(
+                "parse_shape_drift",
+                BROKEN,
+                f"parse_shape row {row_index} has an invalid shape",
+                {"row": row_index},
+            )
+        run_at, source, record_type, count = row
+        if (
+            not isinstance(run_at, str)
+            or not run_at
+            or not isinstance(source, str)
+            or not source
+            or not isinstance(record_type, str)
+            or not record_type
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+        ):
+            return _result(
+                "parse_shape_drift",
+                BROKEN,
+                f"parse_shape row {row_index} has invalid histogram fields",
+                {"row": row_index},
+            )
+        runs_by_source.setdefault(source, {}).setdefault(run_at, {})[record_type] = count
+
+    details: dict[str, object] = {
+        "current_runs": PARSE_DRIFT_CURRENT_RUNS,
+        "history_runs": PARSE_DRIFT_HISTORY_RUNS,
+        "min_history_runs": PARSE_DRIFT_MIN_HISTORY_RUNS,
+        "sources": {},
+    }
+    if not runs_by_source:
+        return _result(
+            "parse_shape_drift",
+            HEALTHY,
+            "no parse_shape history has been recorded yet",
+            details,
+        )
+
+    findings: list[str] = []
+    sources: dict[str, dict[str, object]] = {}
+    for source in sorted(runs_by_source):
+        # run_at values are UTC isoformat strings from one writer, so
+        # lexicographic order is chronological order.
+        ordered_runs = sorted(runs_by_source[source])
+        history = ordered_runs[: -PARSE_DRIFT_CURRENT_RUNS]
+        current = ordered_runs[len(history) :]
+        entry: dict[str, object] = {
+            "runs_seen": len(ordered_runs),
+            "current_run_at": current[-1],
+        }
+        sources[source] = entry
+        if len(history) < PARSE_DRIFT_MIN_HISTORY_RUNS:
+            entry["armed"] = False
+            continue
+        window = history[-PARSE_DRIFT_HISTORY_RUNS :]
+        entry["armed"] = True
+        entry["window_runs"] = len(window)
+        current_counts: dict[str, int] = {}
+        for run_at in current:
+            for record_type, count in runs_by_source[source][run_at].items():
+                current_counts[record_type] = current_counts.get(record_type, 0) + count
+        window_types = {
+            record_type
+            for run_at in window
+            for record_type in runs_by_source[source][run_at]
+        }
+        entry["types"] = len(window_types | set(current_counts))
+        vanished: list[dict[str, object]] = []
+        new_types: list[dict[str, object]] = []
+        for record_type in sorted(window_types | set(current_counts)):
+            history_counts = [
+                runs_by_source[source][run_at].get(record_type, 0) for run_at in window
+            ]
+            median = statistics.median_low(history_counts)
+            current_count = current_counts.get(record_type, 0)
+            if median > 0 and current_count == 0:
+                vanished.append(
+                    {"record_type": record_type, "median_per_run": median}
+                )
+            if current_count > 0 and max(history_counts) == 0:
+                new_types.append(
+                    {"record_type": record_type, "current_count": current_count}
+                )
+        if not vanished and not new_types:
+            continue
+        entry["vanished"] = vanished
+        entry["new"] = new_types
+        parts = []
+        if vanished:
+            parts.append(
+                "vanished record type(s): "
+                + ", ".join(str(item["record_type"]) for item in vanished)
+            )
+        if new_types:
+            parts.append(
+                "new record type(s): "
+                + ", ".join(str(item["record_type"]) for item in new_types)
+            )
+        findings.append(f"source {source}: " + "; ".join(parts))
+    details["sources"] = sources
+
+    if findings:
+        return _result(
+            "parse_shape_drift",
+            BROKEN,
+            "parse_shape drift against the trailing median: " + "; ".join(findings),
+            details,
+        )
+    armed_sources = sum(1 for entry in sources.values() if entry.get("armed"))
+    if armed_sources:
+        return _result(
+            "parse_shape_drift",
+            HEALTHY,
+            f"{armed_sources} source(s) match their trailing record-type medians",
+            details,
+        )
+    return _result(
+        "parse_shape_drift",
+        HEALTHY,
+        "no source has enough parse_shape history to compare yet",
         details,
     )
 
@@ -1576,6 +1760,7 @@ def run_doctor(
         cursor = _check_cursor_health(connection, open_error)
         rule_corpus = _check_rule_corpus(connection, open_error)
         dead_man = _check_dead_man_switch(connection, open_error, reference)
+        parse_drift = _check_parse_shape_drift(connection, open_error)
     finally:
         if connection is not None:
             connection.close()
@@ -1595,6 +1780,7 @@ def run_doctor(
             cursor,
             rule_corpus,
             dead_man,
+            parse_drift,
             self_test,
             optional_inputs,
             zero_output,

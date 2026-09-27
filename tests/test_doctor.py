@@ -60,6 +60,7 @@ class DoctorChecksTests(unittest.TestCase):
                 "cursor_health",
                 "rule_corpus",
                 "dead_man_switch",
+                "parse_shape_drift",
                 "detector_self_test",
                 "optional_inputs",
                 "zero_output_verdict",
@@ -188,6 +189,194 @@ class DoctorChecksTests(unittest.TestCase):
             disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
         )
         self.assertEqual(self.check(report, "dead_man_switch").status, twill_doctor.HEALTHY)
+
+    def add_parse_shape(self, rows):
+        connection = twill_schema.connect(self.state)
+        connection.executemany(
+            "INSERT INTO parse_shape(run_at, source, record_type, n) VALUES (?, ?, ?, ?)",
+            rows,
+        )
+        connection.commit()
+        connection.close()
+
+    @staticmethod
+    def shape_run(hour):
+        return f"2026-09-27T{hour:02d}:00:00+00:00"
+
+    def drift_report(self):
+        return twill_doctor.run_doctor(
+            self.state,
+            now=datetime(2026, 9, 27, 14, 0, tzinfo=timezone.utc),
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+    def test_parse_shape_drift_fails_naming_a_vanished_record_type(self):
+        self.create_database()
+        rows = []
+        for hour in (9, 10, 11):
+            rows += [
+                (self.shape_run(hour), "claude", "user", 4),
+                (self.shape_run(hour), "claude", "assistant", 6),
+            ]
+        # The newest two runs parsed records, but no longer any user record.
+        rows += [
+            (self.shape_run(12), "claude", "assistant", 5),
+            (self.shape_run(13), "claude", "assistant", 3),
+        ]
+        self.add_parse_shape(rows)
+
+        report = self.drift_report()
+        check = self.check(report, "parse_shape_drift")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn("source claude", check.message)
+        self.assertIn("vanished record type(s): user", check.message)
+        self.assertNotIn("assistant", check.message)
+        self.assertEqual(
+            [item["record_type"] for item in check.details["sources"]["claude"]["vanished"]],
+            ["user"],
+        )
+        self.assertEqual(report.exit_code, twill_doctor.EXIT_BROKEN)
+
+    def test_parse_shape_drift_fails_naming_a_new_record_type(self):
+        self.create_database()
+        rows = []
+        for hour in (9, 10, 11):
+            rows += [
+                (self.shape_run(hour), "claude", "user", 4),
+                (self.shape_run(hour), "claude", "assistant", 6),
+            ]
+        rows += [
+            (self.shape_run(12), "claude", "user", 2),
+            (self.shape_run(12), "claude", "assistant", 2),
+            (self.shape_run(12), "claude", "human_turn", 3),
+            (self.shape_run(13), "claude", "human_turn", 4),
+            (self.shape_run(13), "claude", "assistant", 2),
+        ]
+        self.add_parse_shape(rows)
+
+        report = self.drift_report()
+        check = self.check(report, "parse_shape_drift")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn("source claude", check.message)
+        self.assertIn("new record type(s): human_turn", check.message)
+        self.assertNotIn("vanished", check.message)
+        self.assertEqual(
+            [item["record_type"] for item in check.details["sources"]["claude"]["new"]],
+            ["human_turn"],
+        )
+        self.assertEqual(report.exit_code, twill_doctor.EXIT_BROKEN)
+
+    def test_parse_shape_drift_requires_two_consecutive_absences(self):
+        self.create_database()
+        rows = []
+        for source in ("claude", "codex"):
+            for hour in (9, 10, 11):
+                rows += [
+                    (self.shape_run(hour), source, "user", 4),
+                    (self.shape_run(hour), source, "assistant", 6),
+                ]
+        # claude's first current run keeps the user type and the second drops
+        # it; codex's drops it and then keeps it.  Pooled, neither source lost
+        # anything — a single sparse run is not a vanished type.
+        rows += [
+            (self.shape_run(12), "claude", "user", 2),
+            (self.shape_run(12), "claude", "assistant", 1),
+            (self.shape_run(13), "claude", "assistant", 3),
+            (self.shape_run(12), "codex", "assistant", 1),
+            (self.shape_run(13), "codex", "user", 2),
+            (self.shape_run(13), "codex", "assistant", 3),
+        ]
+        self.add_parse_shape(rows)
+
+        check = self.check(self.drift_report(), "parse_shape_drift")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+
+    def test_parse_shape_drift_ignores_sparse_record_types(self):
+        self.create_database()
+        rows = []
+        for hour in (9, 10, 11):
+            rows += [
+                (self.shape_run(hour), "claude", "user", 4),
+                (self.shape_run(hour), "claude", "assistant", 6),
+            ]
+        # summary appeared in one history run of three: its lower median is
+        # zero, so its absence from the current runs is not a drift.
+        rows.append((self.shape_run(9), "claude", "summary", 1))
+        rows += [
+            (self.shape_run(12), "claude", "user", 2),
+            (self.shape_run(12), "claude", "assistant", 1),
+            (self.shape_run(13), "claude", "user", 1),
+            (self.shape_run(13), "claude", "assistant", 3),
+        ]
+        self.add_parse_shape(rows)
+
+        check = self.check(self.drift_report(), "parse_shape_drift")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        entry = check.details["sources"]["claude"]
+        self.assertTrue(entry["armed"])
+        self.assertNotIn("vanished", entry)
+
+    def test_parse_shape_drift_is_evaluated_per_source(self):
+        self.create_database()
+        rows = []
+        for hour in (9, 10, 11):
+            rows += [
+                (self.shape_run(hour), "claude", "user", 4),
+                (self.shape_run(hour), "claude", "assistant", 6),
+                (self.shape_run(hour), "codex", "session_meta", 1),
+                (self.shape_run(hour), "codex", "response_item", 5),
+            ]
+        rows += [
+            (self.shape_run(12), "claude", "assistant", 5),
+            (self.shape_run(13), "claude", "assistant", 3),
+            (self.shape_run(12), "codex", "session_meta", 1),
+            (self.shape_run(12), "codex", "response_item", 2),
+            (self.shape_run(13), "codex", "response_item", 4),
+        ]
+        # A source with a single run contributes no comparison, and must not
+        # block the armed source from alarming.
+        rows.append((self.shape_run(13), "jsonl", "untyped", 2))
+        self.add_parse_shape(rows)
+
+        report = self.drift_report()
+        check = self.check(report, "parse_shape_drift")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn("source claude", check.message)
+        self.assertNotIn("codex", check.message)
+        self.assertNotIn("jsonl", check.message)
+        self.assertTrue(check.details["sources"]["codex"]["armed"])
+        self.assertFalse(check.details["sources"]["jsonl"]["armed"])
+
+    def test_parse_shape_drift_stays_unarmed_until_history_exists(self):
+        self.create_database()
+        self.add_parse_shape(
+            [
+                (self.shape_run(12), "claude", "user", 4),
+                (self.shape_run(12), "claude", "assistant", 6),
+                (self.shape_run(13), "claude", "assistant", 3),
+            ]
+        )
+
+        check = self.check(self.drift_report(), "parse_shape_drift")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertIn("enough parse_shape history", check.message)
+        entry = check.details["sources"]["claude"]
+        self.assertFalse(entry["armed"])
+        self.assertEqual(entry["runs_seen"], 2)
+
+    def test_parse_shape_drift_reports_corrupt_histogram_rows(self):
+        self.create_database()
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "INSERT INTO parse_shape(run_at, source, record_type, n) "
+            "VALUES ('2026-09-27T09:00:00+00:00', 'claude', 'user', 'many')"
+        )
+        connection.commit()
+        connection.close()
+
+        check = self.check(self.drift_report(), "parse_shape_drift")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn("invalid histogram fields", check.message)
 
     def test_missing_database_is_broken_without_creating_state(self):
         report = twill_doctor.run_doctor(

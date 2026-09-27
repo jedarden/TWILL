@@ -659,6 +659,22 @@ ambiguous between "nothing found" and "nothing ran".
 
 **Dead-man's switch:** `doctor` fails when 24 h pass with transcript files arriving and zero
 observations ingested, or when `parse_shape` drifts beyond tolerance against its trailing median.
+
+**parse_shape drift alarm decision (2026-09-27):** the trailing-median comparison is a read-only
+`doctor` check (`parse_shape_drift`) computed from the `parse_shape` series, per source. "Current"
+is the newest two runs pooled — one sparse ingest (a lone settled append of three records) must not
+read as a vanished type, the same two-consecutive-samples rule as the zero-output verdict. The
+trailing median is the lower median of each record type's per-run counts over the eight runs before
+those: a type is **vanished** when that median is positive (presence in a strict majority of the
+window — this is the tolerance §8.2 names) and the pooled current count is zero, and **new** when
+the pooled count is positive while the type appears nowhere in the window. Three history runs arm
+the comparison; fewer, or no rows at all, is healthy and says why. Runs are the unit (parse_shape@1),
+so a source's series skips runs that parsed nothing new for it, and the age of the newest run stays
+the dead-man's switch's question, not this check's. Any finding is broken with the source and type
+names. Because the window trails, an un-acted-upon change stops alarming once it becomes the new
+norm — the loud catch at the moment of change is this alarm's job; the weekly digest and the
+dead-man's switch carry the persistent signals.
+
 **Completion criteria:** each detector has a fixture-driven test with a known expected count; the
 digest for the last 30 days reproduces the three known-true findings from the 2026-09-19 probe
 (`sqlite3` 1,096 / `bf` 697 / `go` 632 sessions, ±5% for parser differences) — a real regression oracle.
