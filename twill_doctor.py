@@ -11,15 +11,16 @@ from __future__ import annotations
 import math
 import shutil
 import sqlite3
-from collections.abc import Callable, Iterable, Mapping
+from collections.abc import Callable, Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
-import twill_schema
+import twill_detectors
 import twill_rulecorpus
+import twill_schema
 from twill_redactor import Redactor, redact_text
 from twill_status import read_status
 
@@ -39,6 +40,27 @@ FREE_DISK_INGEST_FLOOR_BYTES = 2 * 1024**3
 FREE_DISK_WARN_BYTES = 5 * 1024**3
 TIMER_INTERVALS = {"ingest": 3600.0}
 DEAD_MAN_WINDOW_SECONDS = 24 * 3600.0
+# §13.3's detector self-test replays the registry over a fixture with the
+# detectors' default trailing window.
+SELFTEST_WINDOW_DAYS = 30
+# What the self-test fixture is known to hold for the shipped catalog: a
+# detector listed here that emits fewer clusters than this against the fixture
+# has broken semantics even though its SQL still parses and runs — the
+# runtime analogue of §10.1's "fixture-driven test with a known expected
+# count", and the alarm for a detector that quietly stops selecting anything.
+# A detector absent from the map (a custom or test registry) is only required
+# to parse and run; the suite pins the map to the shipped registry's ids so a
+# new catalog entry cannot quietly opt out of the expectation.
+SELFTEST_EXPECTED_CLUSTERS = {
+    "D-01": 1,
+    "D-02": 1,
+    "D-03": 1,
+    "D-05": 1,
+    "D-06": 1,
+    "D-07": 1,
+    "D-08": 1,
+    "D-09": 1,
+}
 REQUIRED_TABLES = (
     "cluster",
     "cluster_week",
@@ -777,6 +799,304 @@ def _check_dead_man_switch(
     )
 
 
+def _seed_selftest_observation(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime,
+    session_id: str,
+    days_ago: float,
+    kind: str,
+    **columns: object,
+) -> None:
+    observed_at = (now - timedelta(days=days_ago)).isoformat()
+    row: dict[str, object] = {
+        "session_id": session_id,
+        "ts_utc": observed_at,
+        "ts_local": observed_at,
+        "kind": kind,
+        **columns,
+    }
+    names = ", ".join(row)
+    placeholders = ", ".join("?" for _ in row)
+    connection.execute(
+        f"INSERT INTO observation({names}) VALUES ({placeholders})",
+        tuple(row.values()),
+    )
+
+
+def _seed_selftest_fixture(connection: sqlite3.Connection, now: datetime) -> None:
+    """Seed the self-test corpus: one known-true finding per shipped detector.
+
+    Every timestamp is relative to ``now`` so the fixture is deterministic
+    under any clock.  Rows exist to exercise a detector's real join and
+    grouping paths, not to look like production traffic: each block below
+    names the detector it is known to make fire, and
+    :data:`SELFTEST_EXPECTED_CLUSTERS` is the contract those blocks keep.
+    """
+
+    # D-01 (missing binary): command-not-found for one program across two
+    # sessions, inside the window.
+    for session_id, days_ago in (("selftest-a", 1.0), ("selftest-b", 2.0)):
+        _seed_selftest_observation(
+            connection,
+            now=now,
+            session_id=session_id,
+            days_ago=days_ago,
+            kind="run_failed",
+            program="sqlite3",
+            command="sqlite3 --dump",
+            signature="sqlite3: command not found",
+            sig_hash="selftest-sha-command-not-found",
+        )
+    # D-02 (recurring signature): one normalized error signature recurring
+    # across two sessions, independent of the command-not-found rows.
+    for session_id in ("selftest-a", "selftest-b"):
+        _seed_selftest_observation(
+            connection,
+            now=now,
+            session_id=session_id,
+            days_ago=1.0,
+            kind="tool_error",
+            signature="TypeError: unsupported operand type(s) for +",
+            sig_hash="selftest-sha-typeerror",
+        )
+    # D-03 (retry loop): one command failing three times in a single session
+    # with no later success to cancel it.
+    for _ in range(3):
+        _seed_selftest_observation(
+            connection,
+            now=now,
+            session_id="selftest-c",
+            days_ago=1.0,
+            kind="run_failed",
+            command="cargo build --release",
+            signature="error: could not compile twill",
+            sig_hash="selftest-sha-cargo",
+        )
+    # D-05 (rejected tool call): a rejection immediately followed by the
+    # corrective user turn, with nothing between.
+    _seed_selftest_observation(
+        connection,
+        now=now,
+        session_id="selftest-d",
+        days_ago=1.0,
+        kind="tool_rejected",
+        tool="Bash",
+    )
+    _seed_selftest_observation(
+        connection,
+        now=now,
+        session_id="selftest-d",
+        days_ago=1.0,
+        kind="user_turn_after_correction",
+        excerpt="use the file reader instead of a raw grep",
+    )
+    # D-06 (interrupt correction): an interrupt immediately followed by a
+    # corrective user turn, in its own session so it cannot pair with D-05's.
+    _seed_selftest_observation(
+        connection,
+        now=now,
+        session_id="selftest-e",
+        days_ago=1.0,
+        kind="interrupt",
+    )
+    _seed_selftest_observation(
+        connection,
+        now=now,
+        session_id="selftest-e",
+        days_ago=1.0,
+        kind="user_turn_after_correction",
+        excerpt="stop and summarise the plan instead",
+    )
+    # D-07 (rediscovery): one never-edited path read on two days across two
+    # sessions, and one exploratory command run in two sessions.
+    for session_id, days_ago in (("selftest-a", 2.0), ("selftest-b", 1.0)):
+        _seed_selftest_observation(
+            connection,
+            now=now,
+            session_id=session_id,
+            days_ago=days_ago,
+            kind="file_read",
+            path="/docs/selftest-arch.md",
+        )
+        _seed_selftest_observation(
+            connection,
+            now=now,
+            session_id=session_id,
+            days_ago=1.0,
+            kind="run",
+            command="grep -r selftest /docs",
+        )
+    # D-08 and D-09 (rule corpus): one live rule document that names the
+    # missing binary and a host that has gone silent, and has never been
+    # read.  The retired host's only observation sits outside the window so
+    # the silent-host path has a real EXCEPT to compute.
+    connection.execute(
+        "INSERT INTO rule_doc(path, layer, sha, indexed_at, last_read_by_agent, stale) "
+        "VALUES ('/rules/selftest.md', 'memory', 'selftest-sha-rule', ?, NULL, 0)",
+        ((now - timedelta(days=1)).isoformat(),),
+    )
+    connection.execute(
+        "INSERT INTO rule_fts(text, path) VALUES (?, '/rules/selftest.md')",
+        ("run sqlite3 for local dumps; the retired-host mirror is gone",),
+    )
+    _seed_selftest_observation(
+        connection,
+        now=now,
+        session_id="selftest-f",
+        days_ago=SELFTEST_WINDOW_DAYS + 10.0,
+        kind="file_read",
+        path="/mirror/selftest.log",
+        host="retired-host",
+    )
+
+
+def _selftest_fixture(now: datetime) -> sqlite3.Connection:
+    """Build the in-memory fixture the self-test replays the registry over.
+
+    The schema is exactly what a fresh state database would carry, so a
+    detector whose SQL no longer matches the shipped tables or columns fails
+    here before a digest is built from it.  ``:memory:`` keeps the doctor
+    surface read-only: no file, no lock, no state-directory side effects.
+    """
+
+    connection = sqlite3.connect(":memory:")
+    try:
+        connection.executescript(twill_schema.V1_SCHEMA)
+        _seed_selftest_fixture(connection, now)
+    except BaseException:
+        connection.close()
+        raise
+    return connection
+
+
+def _selftest_detector(
+    connection: sqlite3.Connection, detector: twill_detectors.Detector, now: datetime
+) -> int:
+    """Run one detector's whole query family against the fixture.
+
+    Every SQL variant a digest, backtest or weekly series can execute is
+    executed: the cluster query, the session-hit query (whose counts must
+    agree with the cluster rows), the week-hit query for each emitted key,
+    and the weekly-count query.  Returns the number of clusters emitted.
+    """
+
+    window_start = (now - timedelta(days=SELFTEST_WINDOW_DAYS)).isoformat()
+    parameters = {
+        "window_start_utc": window_start,
+        "window_days": SELFTEST_WINDOW_DAYS,
+    }
+    clusters = twill_detectors.read_clusters(
+        connection,
+        detector,
+        window_start_utc=window_start,
+        window_days=SELFTEST_WINDOW_DAYS,
+    )
+    if detector.session_hits_sql is not None:
+        cursor = connection.execute(detector.session_hits_sql, parameters)
+        twill_detectors._collect_session_hits(detector, cursor, clusters)
+    if detector.week_hits_sql is not None:
+        for key in clusters:
+            twill_detectors.read_cluster_weeks(
+                connection,
+                detector,
+                key,
+                window_start_utc=window_start,
+                window_days=SELFTEST_WINDOW_DAYS,
+            )
+    if detector.weekly_hits_sql is not None:
+        twill_detectors.read_weekly_counts(
+            connection,
+            detector,
+            window_start_utc=window_start,
+            window_days=SELFTEST_WINDOW_DAYS,
+            window_end_utc=now.isoformat(),
+        )
+    return len(clusters)
+
+
+def _check_detector_self_test(
+    registry: Sequence[twill_detectors.Detector], now: datetime
+) -> CheckResult:
+    """§13.3's detector self-test: the registry must run before a digest.
+
+    The weekly digest replays every registered detector's SQL over an
+    in-memory window, so a detector that cannot parse against the shipped
+    schema or breaks its emission contract would surface there as an errored
+    line in a report a human skims.  This check runs the same replay over a
+    fixed corpus up front, where a failure names the detector and blocks
+    trust in everything downstream of the registry.  A failure is BROKEN,
+    not degraded: §14 classes a detector self-test failure as a validation
+    failure, and a digest built from a broken registry is not partially
+    trustworthy.
+    """
+
+    detectors = tuple(registry)
+    if not detectors:
+        return _result(
+            "detector_self_test",
+            HEALTHY,
+            "no detectors registered",
+        )
+    try:
+        connection = _selftest_fixture(now)
+    except Exception as exc:
+        return _result(
+            "detector_self_test",
+            BROKEN,
+            f"self-test fixture cannot be built: {_exception_text(exc)}",
+            {"error": _exception_text(exc)},
+        )
+    outcomes: dict[str, dict[str, object]] = {}
+    failed: list[str] = []
+    try:
+        for detector in detectors:
+            entry: dict[str, object]
+            try:
+                clusters = _selftest_detector(connection, detector, now)
+                expected = SELFTEST_EXPECTED_CLUSTERS.get(detector.detector_id)
+                if expected is not None and clusters < expected:
+                    entry = {
+                        "status": "error",
+                        "clusters": clusters,
+                        "error": (
+                            f"emitted {clusters} cluster(s); the self-test "
+                            f"fixture is known to hold at least {expected}"
+                        ),
+                    }
+                else:
+                    entry = {"status": "ok", "clusters": clusters}
+            except (sqlite3.Error, twill_detectors.DetectorContractError) as exc:
+                entry = {
+                    "status": "error",
+                    "clusters": 0,
+                    "error": _exception_text(exc),
+                }
+            outcomes[detector.full_id] = entry
+            if entry["status"] != "ok":
+                failed.append(detector.full_id)
+    finally:
+        connection.close()
+    details: dict[str, object] = {
+        "window_days": SELFTEST_WINDOW_DAYS,
+        "detectors": outcomes,
+    }
+    if failed:
+        return _result(
+            "detector_self_test",
+            BROKEN,
+            f"{len(failed)} of {len(detectors)} registered detector(s) "
+            f"failed the fixture self-test: {', '.join(sorted(failed))}",
+            details,
+        )
+    return _result(
+        "detector_self_test",
+        HEALTHY,
+        f"all {len(detectors)} registered detector(s) passed the fixture self-test",
+        details,
+    )
+
+
 def _nearest_existing_path(path: Path) -> Path:
     candidate = path
     while not candidate.exists():
@@ -877,12 +1197,16 @@ def run_doctor(
     now: datetime | None = None,
     disk_usage: Callable[[Path], Any] | None = None,
     intervals: Mapping[str, float] | None = None,
+    registry: Sequence[twill_detectors.Detector] | None = None,
 ) -> DoctorReport:
     """Evaluate the Phase 1 health checks without changing state."""
 
     state_dir = Path(state_dir).expanduser()
     reference = _as_utc(now) if now is not None else datetime.now(timezone.utc)
     effective_intervals = dict(TIMER_INTERVALS if intervals is None else intervals)
+    effective_registry = (
+        twill_detectors.REGISTRY if registry is None else tuple(registry)
+    )
 
     connection: sqlite3.Connection | None
     open_error: str | None
@@ -904,5 +1228,8 @@ def run_doctor(
             connection.close()
 
     timer = _check_timer_freshness(state_dir, reference, effective_intervals)
+    self_test = _check_detector_self_test(effective_registry, reference)
     disk = _check_disk_space(state_dir, disk_usage)
-    return DoctorReport((integrity, schema, timer, cursor, rule_corpus, dead_man, disk))
+    return DoctorReport(
+        (integrity, schema, timer, cursor, rule_corpus, dead_man, self_test, disk)
+    )

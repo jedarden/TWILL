@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "twill"
 sys.path.insert(0, str(ROOT))
 
+import twill_detectors  # noqa: E402
 import twill_doctor  # noqa: E402
 import twill_rulecorpus  # noqa: E402
 import twill_schema  # noqa: E402
@@ -55,6 +56,7 @@ class DoctorChecksTests(unittest.TestCase):
                 "cursor_health",
                 "rule_corpus",
                 "dead_man_switch",
+                "detector_self_test",
                 "disk_space",
             ],
         )
@@ -505,6 +507,173 @@ class DoctorChecksTests(unittest.TestCase):
         self.assertEqual(
             status["data"]["stages"]["rescan_redaction"]["counts"],
             {"records": 1, "rows": 1},
+        )
+
+
+class DetectorSelfTestTests(unittest.TestCase):
+    """§13.3's detector self-test: the registry must run before a digest."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        # Deliberately absent: the self-test replays the registry over its
+        # own in-memory fixture and must not need the state database.
+        self.state = Path(self._temporary.name) / "state"
+        self.now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+
+    def report(self, registry=None):
+        return twill_doctor.run_doctor(
+            self.state,
+            now=self.now,
+            registry=registry,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+    def self_test(self, report):
+        return next(
+            check for check in report.checks if check.name == "detector_self_test"
+        )
+
+    def detector(self, detector_id, sql, **kwargs):
+        return twill_detectors.Detector(detector_id, 1, "self-test probe", sql, **kwargs)
+
+    def test_self_test_passes_the_shipped_registry_over_the_fixture(self):
+        check = self.self_test(self.report())
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertIn(
+            f"all {len(twill_detectors.REGISTRY)} registered detector(s) passed",
+            check.message,
+        )
+        self.assertEqual(
+            set(check.details["detectors"]),
+            {detector.full_id for detector in twill_detectors.REGISTRY},
+        )
+        self.assertTrue(
+            all(
+                entry["status"] == "ok" and entry["clusters"] >= 1
+                for entry in check.details["detectors"].values()
+            )
+        )
+
+    def test_self_test_runs_without_a_state_database(self):
+        check = self.self_test(self.report())
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertFalse(self.state.exists())
+
+    def test_expectation_map_exactly_covers_the_shipped_registry(self):
+        self.assertEqual(
+            set(twill_doctor.SELFTEST_EXPECTED_CLUSTERS),
+            {detector.detector_id for detector in twill_detectors.REGISTRY},
+        )
+
+    def test_self_test_flags_sql_that_cannot_parse(self):
+        broken = self.detector(
+            "D-98",
+            "SELECT no_such_column AS key, "
+            "count(DISTINCT session_id) AS sessions, count(*) AS events, "
+            "min(ts_utc) AS first_seen, max(ts_utc) AS last_seen "
+            "FROM observation WHERE ts_utc >= :window_start_utc "
+            "GROUP BY no_such_column",
+        )
+        report = self.report(registry=(broken,))
+        check = self.self_test(report)
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn("D-98@1", check.message)
+        self.assertIn(
+            "no such column",
+            check.details["detectors"]["D-98@1"]["error"],
+        )
+        self.assertEqual(report.exit_code, twill_doctor.EXIT_BROKEN)
+
+    def test_self_test_flags_a_contract_violation(self):
+        shapeless = self.detector(
+            "D-98",
+            "SELECT program AS key, count(*) AS events "
+            "FROM observation WHERE ts_utc >= :window_start_utc GROUP BY program",
+        )
+        check = self.self_test(self.report(registry=(shapeless,)))
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn(
+            "must emit the columns",
+            check.details["detectors"]["D-98@1"]["error"],
+        )
+
+    def test_self_test_flags_a_detector_that_silently_selects_nothing(self):
+        dead = self.detector(
+            "D-01",
+            "SELECT program AS key, "
+            "count(DISTINCT session_id) AS sessions, count(*) AS events, "
+            "min(ts_utc) AS first_seen, max(ts_utc) AS last_seen "
+            "FROM observation "
+            "WHERE kind = 'never_happens' AND ts_utc >= :window_start_utc "
+            "GROUP BY program",
+        )
+        check = self.self_test(self.report(registry=(dead,)))
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn(
+            "the self-test fixture is known to hold at least 1",
+            check.details["detectors"]["D-01@1"]["error"],
+        )
+
+    def test_unlisted_detectors_are_only_required_to_run(self):
+        quiet = self.detector(
+            "D-97",
+            "SELECT program AS key, "
+            "count(DISTINCT session_id) AS sessions, count(*) AS events, "
+            "min(ts_utc) AS first_seen, max(ts_utc) AS last_seen "
+            "FROM observation "
+            "WHERE kind = 'never_happens' AND ts_utc >= :window_start_utc "
+            "GROUP BY program",
+        )
+        check = self.self_test(self.report(registry=(quiet,)))
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["detectors"]["D-97@1"]["clusters"], 0)
+
+    def test_self_test_flags_a_session_hit_count_mismatch(self):
+        cluster_sql = (
+            "SELECT program AS key, "
+            "count(DISTINCT session_id) AS sessions, count(*) AS events, "
+            "min(ts_utc) AS first_seen, max(ts_utc) AS last_seen "
+            "FROM observation "
+            "WHERE ts_utc >= :window_start_utc AND program = 'sqlite3' "
+            "GROUP BY program"
+        )
+        hit_sql = (
+            "SELECT program AS key, session_id FROM observation "
+            "WHERE ts_utc >= :window_start_utc AND program = 'sqlite3' "
+            "AND session_id = 'selftest-a' "
+            "GROUP BY program, session_id"
+        )
+        mismatch = self.detector("D-95", cluster_sql, session_hits_sql=hit_sql)
+        check = self.self_test(self.report(registry=(mismatch,)))
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn(
+            "session hit(s)",
+            check.details["detectors"]["D-95@1"]["error"],
+        )
+
+    def test_self_test_flags_a_non_iso_weekly_week(self):
+        cluster_sql = (
+            "SELECT program AS key, "
+            "count(DISTINCT session_id) AS sessions, count(*) AS events, "
+            "min(ts_utc) AS first_seen, max(ts_utc) AS last_seen "
+            "FROM observation "
+            "WHERE ts_utc >= :window_start_utc AND program IS NOT NULL "
+            "GROUP BY program"
+        )
+        weekly_sql = (
+            "SELECT program AS key, '2026-W99' AS week, "
+            "count(DISTINCT session_id) AS sessions, count(*) AS events "
+            "FROM observation "
+            "WHERE ts_utc >= :window_start_utc AND program IS NOT NULL "
+            "GROUP BY program"
+        )
+        broken_week = self.detector("D-96", cluster_sql, weekly_hits_sql=weekly_sql)
+        check = self.self_test(self.report(registry=(broken_week,)))
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn(
+            "non-ISO week",
+            check.details["detectors"]["D-96@1"]["error"],
         )
 
 

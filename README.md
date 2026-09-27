@@ -129,7 +129,13 @@ live in the engine.
 
 `twill doctor` is the read-only Phase 1 health entry point. It checks SQLite integrity and schema
 version, ingest timer freshness, cursor parse or missing-path anomalies, rule-corpus hash drift or
-vanished paths, and free disk space:
+vanished paths, the detector self-test, and free disk space:
+
+The detector self-test (plan §13.3) replays every registered detector's whole query family —
+cluster, session-hit, week-hit, and weekly SQL — against a small in-memory fixture built from the
+shipped schema and seeded with one known-true finding per catalog detector. A detector that fails
+to parse, breaks its emission contract, or quietly stops selecting its fixture finding is reported
+broken by name before a weekly digest is built from the registry.
 
 Ingest refuses to start below 2 GiB free space (exit 1); doctor warns below 5 GiB so the operator
 has time to recover before writes fail.
