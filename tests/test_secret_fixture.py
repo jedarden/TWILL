@@ -1,12 +1,10 @@
 """The secret-fixture test at the persistence boundary (plan §5 Scenario 4, §9 Phase 1).
 
 Scenario 4 drives the secret-bearing fixture corpus through the shipped verbs
-— ``twill ingest && twill detect && twill digest`` — and greps the resulting
-state for every fixture credential.  This module owns the state-DB half of
-that scenario: no fixture credential value may appear anywhere in the
-persisted state, and the error signature must still be captured.  The Explain
-prompt assertion lands with ``twill explain --dry-run``; the digest- and
-lesson-file assertions have their own bead.
+— ingest, detect, rank, digest, and Explain — and greps the resulting state,
+prompt, digest, and lesson files for every fixture credential.  No fixture
+credential value may appear outside the fixture itself, and the error
+signature must still be captured.
 
 The credential values are never spelled in this source file: they are
 discovered in the fixture corpus itself (tests/fixtures/transcripts/README.md
@@ -35,6 +33,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 try:
     import pytest
@@ -48,6 +47,8 @@ sys.path.insert(0, str(ROOT))
 
 from twill_redactor import CREDENTIAL_PATTERNS, Redactor  # noqa: E402
 import twill_schema  # noqa: E402
+import twill_app  # noqa: E402
+import twill_explainer  # noqa: E402
 
 
 # Credential kinds the secret fixtures must exercise (plan §5 Scenario 4: a
@@ -231,15 +232,15 @@ def _credential_atoms(text):
 
 
 class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
-    """Scenario 4 (§5) at the persistence boundary, through the real verbs.
+    """Scenario 4 (§5) across every persisted and rendered safety boundary.
 
     ``setUpClass`` runs the pipeline once per class: both secret-bearing
     fixtures are copied into a source tree (under ``.claude/`` and ``.codex/``
-    so each takes its real parser), ingested, detected and digested through
-    the shipped CLI, then the state directory is snapshotted — raw bytes of
-    every state file, and every string value in every table and column of the
-    database, opened read-only.  The individual tests assert against that
-    snapshot.
+    so each takes its real parser), ingested, detected, ranked, digested, and
+    explained through the shipped CLI, then the state and artifact directories
+    are snapshotted.  The individual tests assert against raw state bytes,
+    every string value in every table and column of the database, the Explain
+    prompt, the rendered digest, and the written lesson file.
     """
 
     @classmethod
@@ -250,6 +251,7 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
         cls.addClassCleanup(cls._work.cleanup)
         home = Path(cls._home.name)
         work = Path(cls._work.name)
+        cls.artifacts_root = home / "artifacts"
 
         # ingest and detect load config at startup and artifacts_root has no
         # default (plan §13.1): every CLI run needs a config that sets it,
@@ -257,11 +259,12 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
         config_dir = home / ".config" / "twill"
         config_dir.mkdir(parents=True)
         (config_dir / "config.toml").write_text(
-            f'artifacts_root = "{home / "artifacts"}"\n'
+            f'artifacts_root = "{cls.artifacts_root}"\n'
         )
 
         cls.state_dir = work / "state"
         cls.fixtures = {}
+        cls.fixture_paths = {}
         manifest = json.loads((FIXTURE_ROOT / "manifest.json").read_text())
         for source, source_data in manifest["sources"].items():
             fixture = cls._fixture_path(manifest, source)
@@ -279,6 +282,7 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
             session_dir.mkdir(parents=True)
             target = session_dir / fixture.name
             shutil.copyfile(fixture, target)
+            cls.fixture_paths[source] = target
             cls.run_cli(
                 "ingest",
                 "--file",
@@ -289,7 +293,9 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
                 str(cls.state_dir),
             )
 
+        cls._seed_detector_observations()
         cls.run_cli("detect", "--state-dir", str(cls.state_dir))
+        cls.run_cli("rank", "--state-dir", str(cls.state_dir))
         cls.run_cli("digest", "--stdout", "--state-dir", str(cls.state_dir))
         cls.explain_prompt = cls.run_cli(
             "explain",
@@ -297,17 +303,122 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
             "--state-dir",
             str(cls.state_dir),
         ).stdout
+        cls.run_cli("digest", "--state-dir", str(cls.state_dir))
+        cls._write_draft_lessons()
 
-        # Snapshot the persisted state before anything else can touch it:
-        # every byte of every state file (the plan's grep across twill.db,
-        # including the -wal sibling WAL writes land in), and every string
-        # value in every table and column.
+        cls.digest_blobs = {
+            path.name: path.read_bytes()
+            for path in sorted((cls.artifacts_root / "digests").glob("*.txt"))
+        }
+        cls.lesson_blobs = {
+            path.name: path.read_bytes()
+            for path in sorted((cls.artifacts_root / "lessons").glob("*.md"))
+        }
+        if not cls.digest_blobs:
+            raise AssertionError("the digest command wrote no digest artifact")
+        if not cls.lesson_blobs:
+            raise AssertionError("the Explain command wrote no lesson artifact")
+
+        # Snapshot the final persisted state: every byte of every state file
+        # (the plan's grep across twill.db, including the -wal sibling WAL
+        # writes land in), and every string value in every table and column.
         cls.state_blobs = {
             path.name: path.read_bytes()
             for path in sorted(cls.state_dir.iterdir())
             if path.is_file()
         }
         cls.stored_texts = tuple(cls._dump_state_text(cls.state_dir))
+
+    @classmethod
+    def _write_draft_lessons(cls):
+        """Run the real lesson-writing path with a deterministic model response."""
+
+        connection = twill_schema.connect_read_only(cls.state_dir)
+        try:
+            candidates = twill_explainer.load_candidate_prompt_clusters(connection)
+        finally:
+            connection.close()
+        candidate = next(
+            (
+                item
+                for item in candidates
+                if item.cluster.detector_id == "D-01"
+            ),
+            None,
+        )
+        if candidate is None:
+            raise AssertionError("the secret fixtures produced no lesson candidate")
+
+        output = json.dumps(
+            {
+                "lessons": [
+                    {
+                        "cluster_id": (
+                            f"{candidate.cluster.detector_id}:{candidate.cluster.key}"
+                        ),
+                        # Exercise the lesson writer's model-output redaction
+                        # with a fixture-derived value without spelling one
+                        # in the repository.
+                        "summary": (
+                            f"A recurring command failure includes "
+                            f"{next(iter(cls.fixtures.values()))['atoms'][0]}. "
+                            "Install the missing command before retrying."
+                        ),
+                    }
+                ]
+            },
+            separators=(",", ":"),
+        )
+        with mock.patch.dict(os.environ, {"HOME": str(cls._home.name)}), mock.patch.object(
+            twill_explainer,
+            "load_candidate_prompt_clusters",
+            return_value=(candidate,),
+        ), mock.patch.object(
+            twill_explainer, "invoke_claude", return_value=output
+        ):
+            exit_code = twill_app.main(
+                [
+                    "explain",
+                    "--state-dir",
+                    str(cls.state_dir),
+                ]
+            )
+        if exit_code != 0:
+            raise AssertionError(f"Explain lesson write failed with exit {exit_code}")
+
+    @classmethod
+    def _seed_detector_observations(cls):
+        """Adapt parser events to D-01's normalized detector input contract."""
+
+        connection = twill_schema.connect(cls.state_dir)
+        try:
+            for index, (source, fixture) in enumerate(cls.fixtures.items()):
+                row = connection.execute(
+                    "SELECT session_id FROM session WHERE source_path = ?",
+                    (str(cls.fixture_paths[source]),),
+                ).fetchone()
+                if row is None:
+                    raise AssertionError(f"{source}: ingested session is missing")
+                normalized = twill_app.signature(fixture["error_line"])
+                timestamp = f"2026-09-20T16:00:0{index + 3}+00:00"
+                connection.execute(
+                    "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
+                    "program, command, signature, sig_hash, excerpt) "
+                    "VALUES (?, ?, ?, 'run_failed', ?, ?, ?, ?, ?)",
+                    (
+                        row[0],
+                        timestamp,
+                        timestamp,
+                        "deployctl",
+                        "deployctl",
+                        normalized,
+                        twill_app.h12(normalized),
+                        fixture["error_line"],
+                    ),
+                )
+            connection.commit()
+        finally:
+            connection.close()
 
     @classmethod
     def _fixture_path(cls, manifest, source):
@@ -440,6 +551,24 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
             if value in self.explain_prompt
         ]
         self.assertEqual(offenders, [], "fixture credentials leaked into the Explain prompt")
+
+    def test_no_fixture_credential_appears_in_the_rendered_digest(self):
+        offenders = []
+        for value in self.forbidden_values():
+            encoded = value.encode("utf-8")
+            for name, blob in self.digest_blobs.items():
+                if encoded in blob:
+                    offenders.append(f"{value[:24]!r}… in {name}")
+        self.assertEqual(offenders, [], "fixture credentials leaked into a digest")
+
+    def test_no_fixture_credential_appears_in_a_written_lesson_file(self):
+        offenders = []
+        for value in self.forbidden_values():
+            encoded = value.encode("utf-8")
+            for name, blob in self.lesson_blobs.items():
+                if encoded in blob:
+                    offenders.append(f"{value[:24]!r}… in {name}")
+        self.assertEqual(offenders, [], "fixture credentials leaked into a lesson")
 
     def test_every_credential_kind_lands_as_a_redaction_marker(self):
         # Positive control for the absence assertions: the pipeline actually
