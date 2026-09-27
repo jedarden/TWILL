@@ -43,6 +43,7 @@ import twill_doctor
 from codex_reader import CodexRolloutLineParser, CodexRolloutReader, TokenUsage
 from twill_reader import ClaudeCodeLineParser, MessageUsage
 from twill_config import (
+    CONFIG_PATH,
     ConfigError,
     TwillConfig,
     load_config,
@@ -2305,7 +2306,21 @@ def doctor_command(args: argparse.Namespace) -> int:
         return rebuild_command(args)
     if args.rescan_redaction:
         return rescan_redaction_command(args)
-    report = twill_doctor.run_doctor(_state_dir(args.state_dir))
+    artifacts_root = None
+    try:
+        config = load_config()
+    except ConfigError:
+        # Keep the read-only health surface useful before first configuration.
+        # A present config is still fail-closed: malformed config or a missing
+        # artifacts_root must not be silently treated as a clean install.
+        if CONFIG_PATH.expanduser().is_file():
+            raise
+    else:
+        artifacts_root = config.require_artifacts_root()
+    report = twill_doctor.run_doctor(
+        _state_dir(args.state_dir),
+        artifacts_root=artifacts_root,
+    )
     emit_success(
         report.as_dict(),
         json_mode=args.json,

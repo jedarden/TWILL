@@ -9,6 +9,7 @@ are separate mutating operations and are run by the CLI under its state lock.
 from __future__ import annotations
 
 import math
+import re
 import shutil
 import sqlite3
 from collections.abc import Callable, Iterable, Mapping, Sequence
@@ -19,6 +20,7 @@ from typing import Any
 from urllib.parse import quote
 
 import twill_detectors
+import twill_digest
 import twill_reader
 import twill_rulecorpus
 import twill_schema
@@ -41,6 +43,7 @@ FREE_DISK_INGEST_FLOOR_BYTES = 2 * 1024**3
 FREE_DISK_WARN_BYTES = 5 * 1024**3
 TIMER_INTERVALS = {"ingest": 3600.0}
 DEAD_MAN_WINDOW_SECONDS = 24 * 3600.0
+ZERO_OUTPUT_CONSECUTIVE_WEEKS = 2
 # §13.3's detector self-test replays the registry over a fixture with the
 # detectors' default trailing window.
 SELFTEST_WINDOW_DAYS = 30
@@ -800,6 +803,192 @@ def _check_dead_man_switch(
     )
 
 
+_DIGEST_WEEK_RE = re.compile(r"^week: (?P<week>\d{4}-W\d{2})\b")
+_DIGEST_DETECTORS_RE = re.compile(
+    r"^(?P<detector>\S+) (?P<status>ok|error|no-database) "
+    r"(?P<current>\d+)/(?P<previous>\d+)$"
+)
+_DIGEST_LESSONS_RE = re.compile(
+    r"^lesson flow \(last \d+ days\): drafted (?P<drafted>\d+), "
+    r"accepted (?P<accepted>\d+), applied (?P<applied>\d+), "
+    r"resolved (?P<resolved>\d+)(?: — WARNING: .*)?$"
+)
+
+
+def _digest_claim_lines(text: str) -> tuple[str, ...]:
+    """Return the stable claim portion of each rendered digest line."""
+
+    return tuple(line.split(" | $ ", 1)[0] for line in text.splitlines())
+
+
+def _read_zero_output_digest(path: Path, week: str) -> dict[str, object]:
+    """Read the health facts already rendered into one weekly digest.
+
+    The digest artifact is the durable record of what the weekly pass reported.
+    Re-running the detector against today's database would make this check
+    answer a different question after retention or later ingest changed the
+    state.  The parser therefore consumes only the bounded, stable summary
+    lines emitted by :func:`twill_digest.render_text`.
+    """
+
+    try:
+        claims = _digest_claim_lines(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeError) as exc:
+        raise ValueError(f"digest cannot be read: {_exception_text(exc)}") from exc
+
+    week_claim = next(
+        (match for line in claims if (match := _DIGEST_WEEK_RE.match(line))),
+        None,
+    )
+    if week_claim is None or week_claim.group("week") != week:
+        actual = week_claim.group("week") if week_claim is not None else "missing"
+        raise ValueError(f"digest week is {actual}, expected {week}")
+
+    detector_line = next(
+        (line for line in claims if line.startswith("detectors current/previous: ")),
+        None,
+    )
+    if detector_line is None:
+        raise ValueError("digest does not report detector output")
+    detector_text = detector_line.removeprefix("detectors current/previous: ")
+    detector_rows: list[dict[str, object]] = []
+    if detector_text != "none registered":
+        for item in detector_text.split(", "):
+            match = _DIGEST_DETECTORS_RE.fullmatch(item)
+            if match is None:
+                raise ValueError(f"digest has invalid detector summary: {item}")
+            detector_rows.append(
+                {
+                    "detector": match.group("detector"),
+                    "status": match.group("status"),
+                    "current_clusters": int(match.group("current")),
+                    "previous_clusters": int(match.group("previous")),
+                }
+            )
+
+    lesson_line = next(
+        (line for line in claims if line.startswith("lesson flow (last ")),
+        None,
+    )
+    if lesson_line is None:
+        raise ValueError("digest does not report lesson output")
+    lesson_match = _DIGEST_LESSONS_RE.fullmatch(lesson_line)
+    if lesson_match is None:
+        # A digest made without an artifacts_root says lesson flow is
+        # unavailable.  It is a valid digest, but not evidence for a
+        # zero-lessons verdict.
+        if "unavailable" in lesson_line:
+            raise ValueError("digest lesson output is unavailable")
+        raise ValueError("digest has invalid lesson summary")
+    lesson_counts = {
+        name: int(lesson_match.group(name))
+        for name in ("drafted", "accepted", "applied", "resolved")
+    }
+    clusters = sum(int(row["current_clusters"]) for row in detector_rows)
+    lessons = sum(lesson_counts.values())
+    return {
+        "week": week,
+        "detectors": detector_rows,
+        "detectors_ran": bool(detector_rows)
+        and all(row["status"] == "ok" for row in detector_rows),
+        "clusters": clusters,
+        "lessons": lessons,
+        "lesson_counts": lesson_counts,
+        "zero_output": clusters == 0 and lessons == 0,
+    }
+
+
+def _check_zero_output_verdict(
+    artifacts_root: Path | None,
+    now: datetime,
+) -> CheckResult:
+    """Explain two consecutive empty digest weeks as broken or clean.
+
+    A digest with no current clusters is only evidence of a clean environment
+    when its detector summaries say the registry actually ran.  Missing
+    database or detector failures are the other branch of the same empty
+    output and are reported as a broken TWILL pipeline.  This check is kept
+    independent of the 24-hour arrival/observation dead-man switch.
+    """
+
+    details: dict[str, object] = {
+        "required_weeks": ZERO_OUTPUT_CONSECUTIVE_WEEKS,
+        "available": False,
+        "verdict": None,
+        "weeks": [],
+    }
+    if artifacts_root is None:
+        return _result(
+            "zero_output_verdict",
+            HEALTHY,
+            "zero-output verdict unavailable: artifacts_root is not configured",
+            details,
+        )
+
+    root = Path(artifacts_root).expanduser().resolve()
+    latest = twill_digest.default_week(now)
+    weeks = (latest, twill_digest.previous_week(latest))
+    digest_dir = root / "digests"
+    paths = [digest_dir / f"{twill_digest.format_week(week)}.txt" for week in weeks]
+    missing = [
+        twill_digest.format_week(week)
+        for week, path in zip(weeks, paths)
+        if not path.is_file()
+    ]
+    if missing:
+        details["missing_weeks"] = missing
+        return _result(
+            "zero_output_verdict",
+            HEALTHY,
+            "zero-output verdict unavailable: fewer than two consecutive weekly digests",
+            details,
+        )
+
+    summaries: list[dict[str, object]] = []
+    for week, path in zip(weeks, paths):
+        week_id = twill_digest.format_week(week)
+        try:
+            summary = _read_zero_output_digest(path, week_id)
+        except ValueError as exc:
+            details["weeks"] = summaries
+            details["error"] = _exception_text(exc)
+            return _result(
+                "zero_output_verdict",
+                DEGRADED,
+                f"zero-output verdict unavailable: {details['error']}",
+                details,
+            )
+        summary["path"] = str(path)
+        summaries.append(summary)
+    details["available"] = True
+    details["weeks"] = summaries
+
+    if not all(bool(summary["zero_output"]) for summary in summaries):
+        return _result(
+            "zero_output_verdict",
+            HEALTHY,
+            "two consecutive zero-output weeks have not been reported",
+            details,
+        )
+    if not all(bool(summary["detectors_ran"]) for summary in summaries):
+        details["verdict"] = "twill_broken"
+        return _result(
+            "zero_output_verdict",
+            BROKEN,
+            "two consecutive zero-output digests indicate TWILL is broken: "
+            "one or more detector registries did not run successfully",
+            details,
+        )
+
+    details["verdict"] = "environment_clean"
+    return _result(
+        "zero_output_verdict",
+        HEALTHY,
+        "two consecutive zero-output digests indicate the environment is genuinely clean",
+        details,
+    )
+
+
 def _seed_selftest_observation(
     connection: sqlite3.Connection,
     *,
@@ -1358,6 +1547,7 @@ def run_doctor(
     intervals: Mapping[str, float] | None = None,
     registry: Sequence[twill_detectors.Detector] | None = None,
     reader_registry: Sequence[twill_reader.ReaderRegistration] | None = None,
+    artifacts_root: Path | None = None,
 ) -> DoctorReport:
     """Evaluate the Phase 1 health checks without changing state."""
 
@@ -1394,6 +1584,7 @@ def run_doctor(
     performance = _check_ingest_performance(state_dir)
     self_test = _check_detector_self_test(effective_registry, reference)
     optional_inputs = _check_optional_inputs(effective_reader_registry)
+    zero_output = _check_zero_output_verdict(artifacts_root, reference)
     disk = _check_disk_space(state_dir, disk_usage)
     return DoctorReport(
         (
@@ -1406,6 +1597,7 @@ def run_doctor(
             dead_man,
             self_test,
             optional_inputs,
+            zero_output,
             disk,
         )
     )

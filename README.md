@@ -150,6 +150,10 @@ shipped schema and seeded with one known-true finding per catalog detector. A de
 to parse, breaks its emission contract, or quietly stops selecting its fixture finding is reported
 broken by name before a weekly digest is built from the registry.
 
+When two consecutive weekly digest artifacts report zero current clusters and zero lesson output,
+doctor identifies whether the detector registry failed to run (TWILL is broken) or the environment
+is genuinely clean. The check remains unavailable until both completed digest artifacts exist.
+
 Ingest refuses to start below 2 GiB free space (exit 1); doctor warns below 5 GiB so the operator
 has time to recover before writes fail.
 

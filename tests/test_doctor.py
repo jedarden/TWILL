@@ -14,6 +14,7 @@ CLI = ROOT / "twill"
 sys.path.insert(0, str(ROOT))
 
 import twill_detectors  # noqa: E402
+import twill_digest  # noqa: E402
 import twill_doctor  # noqa: E402
 import twill_perf  # noqa: E402
 import twill_reader  # noqa: E402
@@ -61,6 +62,7 @@ class DoctorChecksTests(unittest.TestCase):
                 "dead_man_switch",
                 "detector_self_test",
                 "optional_inputs",
+                "zero_output_verdict",
                 "disk_space",
             ],
         )
@@ -461,6 +463,102 @@ class DoctorChecksTests(unittest.TestCase):
         rendered = json.dumps(report.as_dict())
         self.assertNotIn(token, rendered)
         self.assertIn("<redacted:github-token>", rendered)
+
+    def write_digest_summary(
+        self,
+        artifacts: Path,
+        week: tuple[int, int],
+        *,
+        detector_status: str = "ok",
+        lesson_counts: tuple[int, int, int, int] = (0, 0, 0, 0),
+    ):
+        artifacts.joinpath("digests").mkdir(parents=True, exist_ok=True)
+        drafted, accepted, applied, resolved = lesson_counts
+        week_id = twill_digest.format_week(week)
+        (artifacts / "digests" / f"{week_id}.txt").write_text(
+            "\n".join(
+                [
+                    f"week: {week_id} (start to end)",
+                    f"detectors current/previous: D-01@1 {detector_status} 0/0",
+                    "lesson flow (last 60 days): "
+                    f"drafted {drafted}, accepted {accepted}, "
+                    f"applied {applied}, resolved {resolved}",
+                ]
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+    def test_two_zero_output_weeks_can_confirm_a_clean_environment(self):
+        now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        artifacts = self.root / "artifacts"
+        latest = twill_digest.default_week(now)
+        self.write_digest_summary(artifacts, latest)
+        self.write_digest_summary(artifacts, twill_digest.previous_week(latest))
+
+        report = twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            artifacts_root=artifacts,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+        check = self.check(report, "zero_output_verdict")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["verdict"], "environment_clean")
+        self.assertIn("environment is genuinely clean", check.message)
+        self.assertEqual([week["clusters"] for week in check.details["weeks"]], [0, 0])
+        self.assertEqual([week["lessons"] for week in check.details["weeks"]], [0, 0])
+
+    def test_two_zero_output_weeks_with_failed_detectors_identify_broken_twill(self):
+        now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        artifacts = self.root / "artifacts"
+        latest = twill_digest.default_week(now)
+        self.write_digest_summary(artifacts, latest, detector_status="error")
+        self.write_digest_summary(
+            artifacts,
+            twill_digest.previous_week(latest),
+            detector_status="no-database",
+        )
+
+        report = twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            artifacts_root=artifacts,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+        check = self.check(report, "zero_output_verdict")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertEqual(check.details["verdict"], "twill_broken")
+        self.assertIn("TWILL is broken", check.message)
+        self.assertEqual(report.exit_code, twill_doctor.EXIT_BROKEN)
+
+    def test_zero_output_verdict_waits_for_two_reports_and_zero_lessons(self):
+        now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        artifacts = self.root / "artifacts"
+        latest = twill_digest.default_week(now)
+        self.write_digest_summary(artifacts, latest, lesson_counts=(1, 0, 0, 0))
+        self.write_digest_summary(
+            artifacts,
+            twill_digest.previous_week(latest),
+            lesson_counts=(1, 0, 0, 0),
+        )
+
+        report = twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            artifacts_root=artifacts,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+        check = self.check(report, "zero_output_verdict")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertIsNone(check.details["verdict"])
+        self.assertIn("not been reported", check.message)
 
     def test_rescan_redaction_repairs_observation_and_source_excerpts(self):
         self.create_database()
