@@ -1,3 +1,6 @@
+import json
+import os
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -261,6 +264,146 @@ class WeeklyClusterTests(unittest.TestCase):
         self.assertEqual(rows, 1)
         self.assertTrue(self.connection.in_transaction)
         self.connection.commit()
+
+
+class EwmaTrendTests(unittest.TestCase):
+    def setUp(self):
+        temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(temporary.cleanup)
+        self.connection = twill_schema.connect(Path(temporary.name) / "state")
+        self.addCleanup(self.connection.close)
+
+    def add_week(self, detector, key, week, sessions, events):
+        self.connection.execute(
+            "INSERT INTO cluster_week(detector_id, key, week, sessions, events) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (detector, key, week, sessions, events),
+        )
+
+    def test_acceleration_uses_the_signature_own_ewma_band(self):
+        # The second key is large but flat.  It must not lend its volume to the
+        # first key's baseline or appear as a change point itself.
+        for index in range(6):
+            week = f"2026-W{30 + index:02d}"
+            self.add_week("D-02", "rising", week, 1, 1)
+            self.add_week("D-02", "flat", week, 10, 10)
+        self.add_week("D-02", "rising", "2026-W36", 4, 4)
+        self.add_week("D-02", "flat", "2026-W36", 10, 10)
+        self.connection.commit()
+
+        report = twill_trend.build_trend_report(
+            self.connection,
+            detector="D-02",
+            weeks=7,
+        )
+
+        self.assertEqual([finding.key for finding in report.findings], ["rising"])
+        finding = report.findings[0]
+        self.assertEqual(finding.status, twill_trend.TREND_ACCELERATING)
+        self.assertEqual(finding.signal_metric, "events")
+        self.assertEqual(finding.current_events, 4)
+        self.assertEqual(finding.events_ewma, 1.0)
+        self.assertEqual(finding.events_band, 1.0)
+        self.assertTrue(report.history_sufficient)
+
+    def test_new_key_is_reported_after_six_calendar_weeks(self):
+        for index in range(6):
+            week = f"2026-W{30 + index:02d}"
+            self.add_week("D-02", "existing", week, 1, 1)
+        self.add_week("D-02", "new-key", "2026-W35", 2, 2)
+        self.connection.commit()
+
+        report = twill_trend.build_trend_report(
+            self.connection,
+            detector="D-02",
+            weeks=6,
+        )
+
+        self.assertEqual(
+            [(finding.key, finding.status) for finding in report.findings],
+            [("new-key", twill_trend.TREND_NEW)],
+        )
+
+    def test_insufficient_history_is_explicit_and_new_only_filters_it(self):
+        self.add_week("D-02", "thin", "2026-W38", 2, 2)
+        self.connection.commit()
+
+        report = twill_trend.build_trend_report(
+            self.connection,
+            detector="D-02",
+            weeks=12,
+        )
+        self.assertEqual(report.findings[0].status, twill_trend.TREND_INSUFFICIENT_HISTORY)
+        self.assertFalse(report.history_sufficient)
+        self.assertIn("at least 6 weeks", report.warnings[0])
+
+        filtered = twill_trend.build_trend_report(
+            self.connection,
+            detector="D-02",
+            weeks=12,
+            new_only=True,
+        )
+        self.assertEqual(filtered.findings, ())
+        self.assertEqual(filtered.warnings, report.warnings)
+
+    def test_report_is_json_serializable(self):
+        self.add_week("D-02", "thin", "2026-W38", 2, 2)
+        self.connection.commit()
+
+        report = twill_trend.build_trend_report(self.connection)
+        import json
+
+        self.assertEqual(json.loads(json.dumps(report.as_dict())), report.as_dict())
+
+
+class TrendCommandTests(unittest.TestCase):
+    def test_cli_exposes_detector_weeks_new_only_and_json(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            connection = twill_schema.connect(state)
+            for index in range(6):
+                week = f"2026-W{30 + index:02d}"
+                connection.execute(
+                    "INSERT INTO cluster_week(detector_id, key, week, sessions, events) "
+                    "VALUES ('D-02', 'existing', ?, 1, 1)",
+                    (week,),
+                )
+            connection.execute(
+                "INSERT INTO cluster_week(detector_id, key, week, sessions, events) "
+                "VALUES ('D-02', 'new-key', '2026-W35', 2, 2)"
+            )
+            connection.commit()
+            connection.close()
+
+            result = subprocess.run(
+                [
+                    sys.executable,
+                    str(ROOT / "twill"),
+                    "trend",
+                    "--detector",
+                    "D-02",
+                    "--weeks",
+                    "6",
+                    "--new-only",
+                    "--json",
+                    "--state-dir",
+                    str(state),
+                ],
+                cwd=ROOT,
+                env={**os.environ, "HOME": str(root / "home")},
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stderr, "")
+        payload = json.loads(result.stdout)
+        self.assertEqual(
+            [(row["key"], row["status"]) for row in payload["data"]["findings"]],
+            [("new-key", twill_trend.TREND_NEW)],
+        )
 
 
 if __name__ == "__main__":

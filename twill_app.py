@@ -37,6 +37,7 @@ import twill_perf
 import twill_ranker
 import twill_review
 import twill_rules
+import twill_trend
 import twill_router
 import twill_schema
 import twill_cursor
@@ -1995,6 +1996,45 @@ def rules_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def trend_command(args: argparse.Namespace) -> int:
+    """Render the read-only EWMA change-point view."""
+
+    weeks = args.weeks
+    if isinstance(weeks, bool) or not isinstance(weeks, int) or weeks < 1:
+        raise UsageError("--weeks must be a positive integer")
+    if args.detector:
+        try:
+            twill_detectors.select_detectors(twill_detectors.REGISTRY, args.detector)
+        except ValueError as exc:
+            raise UsageError(str(exc)) from exc
+
+    state_dir = _state_dir(args.state_dir)
+    db_path = twill_schema.state_db_path(state_dir)
+    if not db_path.is_file():
+        report = twill_trend.empty_trend_report(weeks=weeks)
+    else:
+        connection = twill_schema.connect_read_only(state_dir)
+        try:
+            report = twill_trend.build_trend_report(
+                connection,
+                weeks=weeks,
+                detector=args.detector,
+                new_only=args.new_only,
+            )
+        finally:
+            connection.close()
+
+    emit_success(
+        report.as_dict(),
+        json_mode=args.json,
+        warnings=report.warnings,
+    )
+    if args.json:
+        return EXIT_SUCCESS
+    print(twill_trend.render_trend_text(report))
+    return EXIT_SUCCESS
+
+
 def measure_command(args: argparse.Namespace) -> int:
     config = load_config()
     artifacts_root = config.require_artifacts_root()
@@ -2530,6 +2570,32 @@ def build_parser() -> argparse.ArgumentParser:
     rules.add_argument("--state-dir")
     rules.add_argument("--json", action="store_true")
     rules.set_defaults(handler=rules_command)
+
+    trend = subparsers.add_parser(
+        "trend", help="show EWMA change points in weekly detector activity"
+    )
+    trend.add_argument(
+        "--detector",
+        action="append",
+        help="detector id to inspect, e.g. D-02; may be repeated (default: all)",
+    )
+    trend.add_argument(
+        "--weeks",
+        type=int,
+        default=twill_trend.DEFAULT_TREND_WEEKS,
+        help=(
+            "number of trailing weekly buckets to inspect "
+            f"(default: {twill_trend.DEFAULT_TREND_WEEKS})"
+        ),
+    )
+    trend.add_argument(
+        "--new-only",
+        action="store_true",
+        help="show only signatures whose first observed activity is this week",
+    )
+    trend.add_argument("--state-dir")
+    trend.add_argument("--json", action="store_true")
+    trend.set_defaults(handler=trend_command)
 
     measure = subparsers.add_parser(
         "measure", help="replay accepted lesson detectors and append measurements"
