@@ -20,6 +20,9 @@ persistence boundary, from three angles:
    result to converge on exactly one full parse of the same final bytes,
    with monotone cursor transitions recorded after every pass.  For codex
    this exercises the stateful prefix replay on the resumed span.
+4. **Crash recovery.**  SIGKILL a child after it has started persisting a
+   large session, then require SQLite recovery and the next ingest to produce
+   the same rows as a clean ingest with no partial observations left behind.
 
 The comparison units are the full ``transcript_event`` and ``observation``
 tables ordered by rowid, plus the ``session`` and ``cursor`` bookkeeping
@@ -28,6 +31,8 @@ rows — ``SELECT *``, so a schema column cannot silently escape the property.
 
 import json
 import os
+import signal
+import subprocess
 import sys
 import tempfile
 import unittest
@@ -63,6 +68,42 @@ CURSOR_COMPARED_FIELDS = tuple(
     for field in fields(CursorRow)
     if field.name not in ("path", "first_seen", "last_indexed_at")
 )
+
+# The child is killed after the 128th transcript-event INSERT is traced, so
+# the transaction has definitely started writing but cannot commit its rows.
+# Keeping the fault injection in the child makes this a real process-crash
+# test: SQLite must recover the interrupted transaction when the parent opens
+# the database again.
+KILL_MID_INGEST_CHILD = r'''
+import os
+import signal
+import sys
+from pathlib import Path
+
+root, state_dir, transcript, marker = map(Path, sys.argv[1:5])
+sys.path.insert(0, str(root))
+
+from twill_app import Store
+
+
+store = Store(state_dir)
+insert_count = 0
+
+
+def kill_after_partial_insert(statement):
+    global insert_count
+    if not statement.lstrip().upper().startswith("INSERT INTO TRANSCRIPT_EVENT"):
+        return
+    insert_count += 1
+    if insert_count == 128:
+        marker.write_text(str(insert_count), encoding="ascii")
+        os.kill(os.getpid(), signal.SIGKILL)
+
+
+store.connection.set_trace_callback(kill_after_partial_insert)
+store.ingest_path(transcript)
+store.close()
+'''
 
 
 @dataclass(frozen=True)
@@ -305,6 +346,86 @@ class IdempotencyPropertyTests(unittest.TestCase):
                 self.assert_cross_store_identical(
                     work, str(work_path), control, str(control_path), case.label
                 )
+
+    # -- 4: a killed transaction leaves no partial observations (§5, §10.1) --
+
+    def test_kill_mid_ingest_rolls_back_before_the_rerun(self):
+        """SIGKILL during persistence must roll back rows and the cursor."""
+
+        record = {
+            "type": "user",
+            "sessionId": "kill-mid-ingest",
+            "timestamp": "2026-09-27T00:00:00Z",
+            "message": {
+                "role": "user",
+                "content": "kill-mid-ingest payload " + ("x" * 900),
+            },
+        }
+        line = (json.dumps(record, separators=(",", ":")) + "\n").encode()
+        payload = line * ((10 * 1024 * 1024 + len(line) - 1) // len(line))
+        self.assertGreaterEqual(len(payload), 10 * 1024 * 1024)
+
+        work_path = self.materialize("kill-mid-ingest", "transcript.jsonl", payload)
+        control_path = self.materialize(
+            "kill-mid-ingest-control", "transcript.jsonl", payload
+        )
+        state_dir = self.root / "kill-mid-ingest" / "state"
+        control_state_dir = self.root / "kill-mid-ingest-control" / "state"
+        marker = self.root / "kill-mid-ingest" / "killed-after-inserts"
+
+        crashed = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                KILL_MID_INGEST_CHILD,
+                str(ROOT),
+                str(state_dir),
+                str(work_path),
+                str(marker),
+            ],
+            cwd=ROOT,
+            check=False,
+            text=True,
+            capture_output=True,
+            timeout=60,
+        )
+        self.assertEqual(crashed.returncode, -signal.SIGKILL, crashed.stderr)
+        self.assertEqual(marker.read_text(encoding="ascii"), "128")
+
+        interrupted = Store(state_dir)
+        self.addCleanup(interrupted.close)
+        for table in (
+            "cursor",
+            "session",
+            "session_usage",
+            "transcript_event",
+            "observation",
+            "parse_shape",
+        ):
+            count = interrupted.connection.execute(
+                f"SELECT count(*) FROM {table}"
+            ).fetchone()[0]
+            self.assertEqual(count, 0, f"{table} retained killed-run rows")
+        self.assertIsNone(
+            twill_cursor.load_cursor(interrupted.connection, str(work_path))
+        )
+
+        recovered = Store(state_dir)
+        self.addCleanup(recovered.close)
+        rerun = recovered.ingest_path(work_path)
+        self.assertEqual(rerun["action"], twill_cursor.ACTION_PARSE)
+        self.assertGreater(rerun["events"], 128)
+
+        control = Store(control_state_dir)
+        self.addCleanup(control.close)
+        control.ingest_path(control_path)
+        self.assert_cross_store_identical(
+            recovered,
+            str(work_path),
+            control,
+            str(control_path),
+            "kill-mid-ingest",
+        )
 
 
 if __name__ == "__main__":
