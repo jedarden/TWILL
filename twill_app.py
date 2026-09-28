@@ -1981,6 +1981,18 @@ def explain_command(args: argparse.Namespace) -> int:
                 sys.stdout.write(prompt)
             return EXIT_SUCCESS
 
+        if not twill_explainer.reserve_explain_invocation(connection):
+            emit_success(
+                {
+                    "clusters": len(candidates),
+                    "drafts": 0,
+                    "lessons": [],
+                },
+                json_mode=args.json,
+                warnings=(twill_explainer.EXPLAIN_QUOTA_WARNING,),
+            )
+            return EXIT_SUCCESS
+
         model = args.model or config.model
         output = twill_explainer.invoke_claude(prompt, model=model)
         expected_cluster_ids = tuple(

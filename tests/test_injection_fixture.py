@@ -14,6 +14,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -224,9 +225,14 @@ class PromptInjectionFixturePipelineTests(unittest.TestCase):
         self.assertTrue(framed_injection)
 
     def test_schema_deviation_is_rejected_and_valid_lessons_stay_draft(self):
-        invalid_code, invalid_envelope, invoke = self.explain_with_model(
-            self.model_output(accepted=True)
-        )
+        with mock.patch.object(
+            twill_explainer,
+            "_utc_now",
+            return_value=datetime(2026, 9, 20, 12, tzinfo=timezone.utc),
+        ):
+            invalid_code, invalid_envelope, invoke = self.explain_with_model(
+                self.model_output(accepted=True)
+            )
         self.assertEqual(invalid_code, 4)
         self.assertEqual(set(invalid_envelope), {"error"})
         self.assertEqual(invalid_envelope["error"]["code"], 4)
@@ -246,9 +252,14 @@ class PromptInjectionFixturePipelineTests(unittest.TestCase):
             connection.close()
         self.assertEqual(states, {"open"})
 
-        valid_code, valid_envelope, invoke = self.explain_with_model(
-            self.model_output()
-        )
+        with mock.patch.object(
+            twill_explainer,
+            "_utc_now",
+            return_value=datetime(2026, 9, 21, 12, tzinfo=timezone.utc),
+        ):
+            valid_code, valid_envelope, invoke = self.explain_with_model(
+                self.model_output()
+            )
         self.assertEqual(valid_code, 0)
         self.assertEqual(
             set(valid_envelope), {"data", "generated_at", "schema_version", "warnings"}

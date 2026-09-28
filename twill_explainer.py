@@ -48,6 +48,10 @@ MAX_LESSON_SUMMARY_LENGTH = MAX_EXCERPT_LENGTH
 LESSON_DIRNAME = "lessons"
 LESSON_FILE_MODE = 0o600
 LESSON_BACKTEST_DAYS = 180
+EXPLAIN_QUOTA_META_KEY = "explain.last_invoked_iso_week"
+EXPLAIN_QUOTA_WARNING = (
+    "Explain weekly quota already used; skipping Claude invocation"
+)
 _OPAQUE_ID_RE = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._:@-]{0,239}$")
 _SENTENCE_END_RE = re.compile(r"[.!?](?=\s|$)")
 _CLAUDE_SESSION_ENV_VARS = ("CLAUDE_CODE_CHILD_SESSION", "CLAUDE_CODE_SESSION_ID")
@@ -152,6 +156,64 @@ class LessonBacktest:
     sessions: int
     first_seen: str | None
     weeks_present: int
+
+
+def _utc_now() -> datetime:
+    """Return the clock used by the persistent Explain quota."""
+
+    return datetime.now(timezone.utc)
+
+
+def iso_week(value: datetime) -> str:
+    """Render an instant as the canonical UTC ISO week identifier."""
+
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    utc_date = value.astimezone(timezone.utc).date()
+    year, week, _ = utc_date.isocalendar()
+    return f"{year:04d}-W{week:02d}"
+
+
+def reserve_explain_invocation(
+    connection: sqlite3.Connection,
+    *,
+    now: datetime | None = None,
+) -> bool:
+    """Atomically reserve this week's single non-dry-run Explain invocation.
+
+    The reservation is committed before the child process starts.  That makes
+    the limit an invocation quota rather than a successful-response quota:
+    retrying a failed or interrupted child cannot create a second network call
+    in the same week.
+    """
+
+    instant = _utc_now() if now is None else now
+    week = iso_week(instant)
+    updated_at = instant
+    if updated_at.tzinfo is None:
+        updated_at = updated_at.replace(tzinfo=timezone.utc)
+    updated_at = updated_at.astimezone(timezone.utc).isoformat()
+
+    connection.execute("BEGIN IMMEDIATE")
+    try:
+        row = connection.execute(
+            "SELECT value FROM meta WHERE key = ?",
+            (EXPLAIN_QUOTA_META_KEY,),
+        ).fetchone()
+        if row is not None and row[0] == week:
+            connection.rollback()
+            return False
+        connection.execute(
+            "INSERT INTO meta(key, value, updated_at) VALUES (?, ?, ?) "
+            "ON CONFLICT(key) DO UPDATE SET value = excluded.value, "
+            "updated_at = excluded.updated_at",
+            (EXPLAIN_QUOTA_META_KEY, week, updated_at),
+        )
+        connection.commit()
+    except BaseException:
+        connection.rollback()
+        raise
+    return True
 
 
 def _get(value: object, name: str, default: object = None) -> object:
@@ -1454,6 +1516,8 @@ __all__ = [
     "ClusterEvidence",
     "EXCERPT_BEGIN",
     "EXCERPT_END",
+    "EXPLAIN_QUOTA_META_KEY",
+    "EXPLAIN_QUOTA_WARNING",
     "ExplainCluster",
     "ExplainExcerpt",
     "LESSON_BACKTEST_DAYS",
@@ -1475,9 +1539,11 @@ __all__ = [
     "compute_lesson_backtest",
     "build_prompt_from_db",
     "invoke_claude",
+    "iso_week",
     "load_candidate_clusters",
     "load_candidate_prompt_clusters",
     "persist_lesson_drafts",
+    "reserve_explain_invocation",
     "validate_explain_output",
     "write_lesson_files",
 ]

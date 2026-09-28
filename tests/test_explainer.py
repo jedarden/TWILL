@@ -224,6 +224,99 @@ class ExplainerTestCase(unittest.TestCase):
             stdout.getvalue(),
         )
 
+    def test_dry_run_does_not_consume_quota_and_child_runs_once_per_week(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        self.seed_cluster_row(connection)
+        self.seed_observation(
+            connection,
+            "session-11",
+            datetime(2026, 9, 10, tzinfo=timezone.utc),
+        )
+        connection.commit()
+        connection.close()
+
+        def explain_args(*, dry_run):
+            return type(
+                "ExplainArgs",
+                (),
+                {
+                    "dry_run": dry_run,
+                    "json": False,
+                    "model": None,
+                    "state_dir": str(state_dir),
+                    "top": None,
+                },
+            )()
+
+        output = json.dumps(
+            {
+                "lessons": [
+                    {
+                        "cluster_id": "D-01:command-not-found:sqlite3",
+                        "summary": self.draft().summary,
+                    }
+                ]
+            }
+        )
+        with mock.patch.object(twill_app, "load_config", return_value=self.config()), mock.patch.object(
+            twill_explainer, "invoke_claude", return_value=output
+        ) as invoke, mock.patch("sys.stdout", new_callable=io.StringIO):
+            self.assertEqual(
+                twill_app.explain_command(explain_args(dry_run=True)),
+                0,
+            )
+            read_only = twill_schema.connect_read_only(state_dir)
+            try:
+                self.assertIsNone(
+                    read_only.execute(
+                        "SELECT value FROM meta WHERE key = ?",
+                        (twill_explainer.EXPLAIN_QUOTA_META_KEY,),
+                    ).fetchone()
+                )
+            finally:
+                read_only.close()
+            self.assertEqual(
+                twill_app.explain_command(explain_args(dry_run=False)),
+                0,
+            )
+            self.assertEqual(
+                twill_app.explain_command(explain_args(dry_run=False)),
+                0,
+            )
+
+        invoke.assert_called_once()
+
+    def test_explain_quota_persists_and_resets_on_the_iso_week_boundary(self):
+        state_dir = self.root / "state"
+        connection = twill_schema.connect(state_dir)
+        week_38 = datetime(2026, 9, 20, 23, 30, tzinfo=timezone.utc)
+        week_39 = datetime(2026, 9, 21, 0, 0, tzinfo=timezone.utc)
+
+        self.assertTrue(
+            twill_explainer.reserve_explain_invocation(connection, now=week_38)
+        )
+        self.assertFalse(
+            twill_explainer.reserve_explain_invocation(
+                connection,
+                now=week_38 + timedelta(minutes=1),
+            )
+        )
+        connection.close()
+
+        reopened = twill_schema.connect(state_dir)
+        self.addCleanup(reopened.close)
+        self.assertTrue(
+            twill_explainer.reserve_explain_invocation(reopened, now=week_39)
+        )
+        self.assertEqual(
+            reopened.execute(
+                "SELECT value FROM meta WHERE key = ?",
+                (twill_explainer.EXPLAIN_QUOTA_META_KEY,),
+            ).fetchone(),
+            ("2026-W39",),
+        )
+
     def test_validates_complete_lesson_output_against_expected_clusters(self):
         cluster_id = "D-01:command-not-found:sqlite3"
         summary = (
