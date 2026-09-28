@@ -540,6 +540,62 @@ class CliWiringTests(unittest.TestCase):
             self.assertIn("artifacts_root", error["message"])
             self.assertIn("no default", error["message"])
 
+    def test_digest_rejects_unset_or_unloadable_config_before_writing_artifacts(self):
+        cases = (
+            ("missing", None),
+            ("unset", "# artifacts_root deliberately omitted\n"),
+            ("malformed", 'artifacts_root = "'),
+            ("in-tree", f'artifacts_root = "{ROOT / "digests"}"\n'),
+        )
+        for label, config_body in cases:
+            with self.subTest(config=label), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                home = root / "home"
+                artifacts = root / "artifacts"
+                artifacts.mkdir()
+                sentinel = artifacts / "sentinel.txt"
+                sentinel.write_text("must survive startup failure\n")
+                before = {
+                    path.relative_to(artifacts): (
+                        path.read_bytes() if path.is_file() else None
+                    )
+                    for path in artifacts.rglob("*")
+                }
+                if config_body is not None:
+                    write_config(home, config_body)
+
+                result = self.run_cli(
+                    "digest", "--week", "2026-W38", "--state-dir", str(root / "state"),
+                    home=home,
+                )
+
+                self.assertEqual(result.returncode, 1, result.stderr)
+                self.assertEqual(result.stdout, "")
+                self.assertTrue(result.stderr.startswith("twill: error:"), result.stderr)
+                after = {
+                    path.relative_to(artifacts): (
+                        path.read_bytes() if path.is_file() else None
+                    )
+                    for path in artifacts.rglob("*")
+                }
+                self.assertEqual(after, before)
+
+    def test_digest_accepts_a_valid_external_artifacts_root(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            artifacts = root / "external-artifacts"
+            write_config(home, f'artifacts_root = "{artifacts}"\n')
+
+            result = self.run_cli(
+                "digest", "--week", "2026-W38", "--state-dir", str(root / "state"),
+                home=home,
+            )
+
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertTrue((artifacts / "digests" / "2026-W38.txt").is_file())
+            self.assertTrue((artifacts / "manifest.json").is_file())
+
     def test_bad_settle_flag_is_still_a_usage_error(self):
         with tempfile.TemporaryDirectory() as directory:
             result = self.run_cli(
