@@ -376,6 +376,18 @@ def _read_window(
                 f"INSERT INTO rule_doc ({rule_quoted_columns}) VALUES ({rule_placeholders})",
                 source.execute(f"SELECT {rule_quoted_columns} FROM rule_doc"),
             )
+            if source.execute(
+                "SELECT 1 FROM sqlite_master "
+                "WHERE type = 'table' AND name = 'rule_fts'"
+            ).fetchone():
+                memory.execute(
+                    "CREATE VIRTUAL TABLE rule_fts USING fts5("
+                    "text, path UNINDEXED, tokenize='porter unicode61')"
+                )
+                memory.executemany(
+                    "INSERT INTO rule_fts(text, path) VALUES (?, ?)",
+                    source.execute("SELECT text, path FROM rule_fts"),
+                )
         usage_columns = tuple(
             (str(row[1]), str(row[2] or "TEXT"))
             for row in source.execute("PRAGMA table_info(session_usage)")

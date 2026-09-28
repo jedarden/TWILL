@@ -526,6 +526,39 @@ class DigestDiffTests(DigestStateCase):
         self.assertEqual(d09.previous_clusters, 1)
         self.assertEqual(report.findings, ())
 
+    def test_digest_replays_rule_fts_for_d08(self):
+        seed_failure(
+            self.connection,
+            "sqlite3",
+            2,
+            IN_WEEK,
+            signature="sqlite3: command not found",
+        )
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, last_read_by_agent, stale) "
+            "VALUES ('/rules/tools.md', 'memory', 'sha-tools', ?, NULL, 0)",
+            (IN_WEEK.isoformat(),),
+        )
+        self.connection.execute(
+            "INSERT INTO rule_fts(text, path) VALUES (?, '/rules/tools.md')",
+            ("keep sqlite3 handy for database dumps",),
+        )
+        self.connection.commit()
+
+        report = self.build(registry=(twill_detectors.STALE_RULE,))
+
+        d08 = next(
+            detector for detector in report.detectors if detector.detector_id == "D-08"
+        )
+        self.assertEqual(d08.current_status, "ok")
+        self.assertIsNone(d08.current_error)
+        self.assertEqual(d08.current_clusters, 1)
+        self.assertEqual(d08.previous_status, "ok")
+        self.assertEqual(
+            [finding.key for finding in report.findings],
+            ["stale-rule:binary:sqlite3:/rules/tools.md"],
+        )
+
     def test_digest_contains_a_read_only_escalation_proposal(self):
         artifacts = self.root / "artifacts"
         lessons = artifacts / "lessons"
