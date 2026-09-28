@@ -201,7 +201,7 @@ def _build_config(values: dict[str, object], config_path: Path, repo: Path) -> T
         top_k=_positive_int("top_k", values, config_path),
         source_globs=_string_list("source_globs", values, config_path),
         rule_globs=_rule_glob_list("rule_globs", values, config_path),
-        content_fences=_string_list("content_fences", values, config_path),
+        content_fences=_content_fence_list("content_fences", values, config_path),
         model=_non_empty_string("model", values, config_path),
         artifacts_root=_artifacts_root("artifacts_root", values, config_path, repo),
     )
@@ -236,6 +236,17 @@ def _string_list(key: str, values: dict[str, object], config_path: Path) -> tupl
         if not isinstance(item, str) or not item.strip():
             raise ConfigError(f"{config_path}: {key} entries must be non-empty strings")
     return tuple(value)
+
+
+def _content_fence_list(key: str, values: dict[str, object], config_path: Path) -> tuple[str, ...]:
+    """Validate literal content-fence entries while loading configuration.
+
+    Content fences are consumed by the redactor at the persistence boundary,
+    so malformed values must fail at startup just like malformed rule globs,
+    rather than waiting for the first ingest or lesson write.
+    """
+
+    return _string_list(key, values, config_path)
 
 
 def _rule_glob_list(key: str, values: dict[str, object], config_path: Path) -> tuple[str, ...]:

@@ -90,25 +90,31 @@ class RedactorTests(unittest.TestCase):
             with self.subTest(name=name):
                 self.assertEqual(redactor.redact_text(f"prefix {value} suffix"), f"prefix {expected} suffix")
 
-    def test_content_fences_are_case_insensitive_and_longest_first(self):
-        cases = (
-            (
-                "case-insensitive fence",
-                ("Restricted Vendor",),
-                "before rEsTrIcTeD vEnDoR after",
-                "before <redacted:content-fence> after",
-            ),
-            (
-                "longest fence wins",
-                ("Restricted", "Restricted Vendor"),
-                "before Restricted Vendor after",
-                "before <redacted:content-fence> after",
-            ),
+    def test_content_fences_match_case_insensitively(self):
+        redactor = Redactor(("Restricted Vendor",))
+
+        self.assertEqual(
+            redactor.redact_text("before rEsTrIcTeD vEnDoR after"),
+            "before <redacted:content-fence> after",
         )
 
-        for name, fences, value, expected in cases:
-            with self.subTest(name=name):
-                self.assertEqual(Redactor(fences).redact_text(value), expected)
+    def test_content_fences_are_ordered_longest_first(self):
+        redactor = Redactor(("Restricted", "Restricted Vendor"))
+
+        self.assertEqual(
+            redactor.redact_text("before Restricted Vendor after"),
+            "before <redacted:content-fence> after",
+        )
+
+    def test_short_fence_cannot_expose_suffix_of_a_longer_fence(self):
+        # Without longest-first alternatives, the short match would leave
+        # `` Vendor`` in the output and expose part of the fenced name.
+        redactor = Redactor(("Vendor", "Restricted Vendor"))
+
+        self.assertEqual(
+            redactor.redact_text("before Restricted Vendor after"),
+            "before <redacted:content-fence> after",
+        )
 
     def test_redacts_before_truncating_excerpts(self):
         long_token = "gh" + "p_" + "0123456789abcdef" * 2

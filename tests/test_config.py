@@ -296,10 +296,13 @@ class RejectionTests(unittest.TestCase):
         for body in (
             'content_fences = "a name"\n',
             "content_fences = [7]\n",
+            'content_fences = [""]\n',
+            'content_fences = ["   "]\n',
         ):
             with self.subTest(body=body), tempfile.TemporaryDirectory() as directory:
-                with self.assertRaises(ConfigError):
+                with self.assertRaises(ConfigError) as caught:
                     load_config(write_config(Path(directory), body), repo_root=Path(directory))
+                self.assertIn("content_fences", caught.exception.message)
 
     def test_rule_globs_must_carry_a_known_layer(self):
         # Rejected at load, not at the weekly rank pass that first consumes
