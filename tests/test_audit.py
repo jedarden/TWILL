@@ -95,8 +95,39 @@ class NetworkAuditTests(unittest.TestCase):
         self.assertNotEqual(child.returncode, 0)
         self.assertIn("NetworkViolation", child.stderr)
 
-    def test_non_network_events_and_the_sanctioned_claude_child_are_ignored(self):
-        self.assertIsNone(openpath.audit_hook("subprocess.Popen", ("claude", None, None)))
+    def test_explain_claude_print_invocation_is_the_allowlisted_child(self):
+        self.assertIsNone(
+            openpath.audit_hook(
+                "subprocess.Popen",
+                ("claude", ["claude", "-p", "--model", "claude-haiku-4-5"], None, None),
+            )
+        )
+
+    def test_other_child_processes_are_rejected(self):
+        with self.assertRaises(openpath.SubprocessViolation):
+            openpath.check_subprocess("git", ["git", "status"])
+        with self.assertRaises(openpath.SubprocessViolation):
+            openpath.check_subprocess("claude", ["claude", "--version"])
+
+    def test_production_child_cannot_spawn_another_process(self):
+        child = subprocess.run(
+            [
+                sys.executable,
+                "-c",
+                "from pathlib import Path; "
+                "from twill_artifacts import _git; "
+                "_git(Path.cwd(), ('status',))",
+            ],
+            cwd=ROOT,
+            env=dict(os.environ),
+            text=True,
+            capture_output=True,
+            check=False,
+        )
+        self.assertNotEqual(child.returncode, 0)
+        self.assertIn("SubprocessViolation", child.stderr)
+
+    def test_non_network_events_are_ignored(self):
         self.assertIsNone(openpath.audit_hook("os.stat", (str(ROOT),)))
 
 

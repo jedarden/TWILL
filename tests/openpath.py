@@ -11,6 +11,10 @@ at the write boundary §3 and §10.2 state in full:
 - Python code makes no network call.  The one sanctioned egress is the local
   ``claude -p`` child used by Explain, which is not Python code and therefore
   does not run this hook.
+- Production code may spawn only that exact local ``claude -p`` child.  The
+  test suite's own fixture subprocesses are exempt so the harness can test
+  child behavior; production children are still checked in their own
+  interpreter.
 
 :func:`install` puts PEP 578 audit hooks on imports, network events, and the
 ``open`` event -- the single event both :func:`open` and ``os.open`` raise
@@ -157,6 +161,11 @@ _NETWORK_EVENT_PREFIXES = (
     "telnetlib.",
 )
 
+# ``subprocess.Popen`` is the audit event raised by ``subprocess.run`` and
+# every other subprocess convenience wrapper. Explain is the only production
+# child allowed to cross the network-capable process boundary.
+_SUBPROCESS_EVENT = "subprocess.Popen"
+
 # A few tests import pytest while running under the stdlib unittest lane so
 # they can assert that redaction tests are non-skippable.  These are test
 # runner packages, not production dependencies; the source-level audit keeps
@@ -223,6 +232,14 @@ def audit_hook(event: str, args: tuple) -> None:
     if event != "open":
         if event == "import":
             check_import(*args[:2])
+        elif event == _SUBPROCESS_EVENT:
+            executable = args[0] if args else None
+            command = args[1] if len(args) > 1 else None
+            _check_subprocess(
+                executable,
+                command,
+                allow_test_harness=_audit_event_came_from_subprocess(),
+            )
         elif _is_network_event(event):
             check_network(event)
         return
@@ -236,6 +253,10 @@ class ImportViolation(AssertionError):
 
 class NetworkViolation(AssertionError):
     """Python code attempted a network operation under the suite gate."""
+
+
+class SubprocessViolation(AssertionError):
+    """Production code attempted to spawn a non-sanctioned child process."""
 
 
 def check_import(module: object, filename: object = None, *unused: object) -> None:
@@ -278,6 +299,100 @@ def check_network(event: str) -> None:
         f"forbidden network operation: {event!r}; Python code may not make "
         "network calls (only the local claude CLI invocation is sanctioned)"
     )
+
+
+def check_subprocess(
+    executable: object,
+    command: object,
+    cwd: object = None,
+    env: object = None,
+) -> None:
+    """Enforce the production child-process boundary.
+
+    ``cwd`` and ``env`` are accepted to mirror the four arguments carried by
+    the ``subprocess.Popen`` audit event, but neither is part of the allowlist:
+    the boundary is about the executable and argv. This public form is
+    intentionally strict; unlike the runtime hook, it never treats a test
+    caller's own subprocess as an exception.
+    """
+
+    del cwd, env
+    _check_subprocess(executable, command, allow_test_harness=False)
+
+
+def _check_subprocess(
+    executable: object,
+    command: object,
+    *,
+    allow_test_harness: bool,
+) -> None:
+    if _is_allowed_explain_child(executable, command):
+        return
+    if allow_test_harness and _called_from_test_harness():
+        return
+    raise SubprocessViolation(
+        "forbidden production child process; only the local claude -p "
+        "Explain invocation is permitted"
+    )
+
+
+def _is_allowed_explain_child(executable: object, command: object) -> bool:
+    """Whether an audit event describes ``claude -p`` without a shell."""
+
+    executable_text = _subprocess_text(executable)
+    if executable_text != "claude" or not isinstance(command, (list, tuple)):
+        return False
+    tokens = tuple(_subprocess_text(token) for token in command)
+    return len(tokens) >= 2 and tokens[0] == "claude" and tokens[1] == "-p"
+
+
+def _subprocess_text(value: object) -> str | None:
+    if isinstance(value, bytes):
+        return os.fsdecode(value)
+    if isinstance(value, str):
+        return value
+    try:
+        return os.fsdecode(os.fspath(value))
+    except TypeError:
+        return None
+
+
+def _audit_event_came_from_subprocess() -> bool:
+    """Whether ``audit_hook`` was called by Python's subprocess machinery.
+
+    Direct calls to :func:`audit_hook` are policy probes and remain strict,
+    while real subprocess events emitted by tests need the harness exemption
+    below. The audit event itself has no caller marker, so the stdlib frame is
+    the stable distinction available without importing inspection machinery in
+    the hook.
+    """
+
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_globals.get("__name__") == "subprocess":
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _called_from_test_harness() -> bool:
+    """Whether a real child event originated in this suite's scaffolding."""
+
+    frame = sys._getframe(1)
+    while frame is not None:
+        filename = frame.f_code.co_filename
+        try:
+            path = Path(filename).resolve()
+        except (OSError, RuntimeError, TypeError):
+            path = None
+        if (
+            path is not None
+            and path != Path(__file__).resolve()
+            and _under(path, REPO_TREE / "tests")
+        ):
+            return True
+        frame = frame.f_back
+    return False
 
 
 def _is_network_event(event: str) -> bool:

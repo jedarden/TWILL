@@ -160,7 +160,14 @@ class ReadPolicyTests(unittest.TestCase):
 
     def test_non_open_events_are_ignored(self):
         self.assertIsNone(openpath.audit_hook("os.stat", ("/etc/passwd",)))
-        self.assertIsNone(openpath.audit_hook("subprocess.Popen", ("sh", "sh", None)))
+        self.assertIsNone(
+            openpath.audit_hook(
+                "subprocess.Popen",
+                ("claude", ["claude", "-p", "--model", "model"], None, None),
+            )
+        )
+        with self.assertRaises(openpath.SubprocessViolation):
+            openpath.audit_hook("subprocess.Popen", ("sh", ["sh"], None, None))
         self.assertIsNone(openpath.audit_hook("open", (3, "w", 0)))
 
 
