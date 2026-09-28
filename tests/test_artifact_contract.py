@@ -262,7 +262,6 @@ class ArtifactContractTests(unittest.TestCase):
 
     def test_consumer_rejects_manifest_for_missing_or_partial_artifact(self):
         write_manifest(self.artifacts, repo_root=ROOT)
-        manifest_path = self.artifacts / "manifest.json"
         digest = self.artifacts / "digests/2026-W38.txt"
         digest.unlink()
 
