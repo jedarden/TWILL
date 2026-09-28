@@ -15,10 +15,13 @@ import os
 import re
 import shlex
 import stat
+import subprocess
+import tarfile
 import tempfile
 from contextlib import contextmanager
 from datetime import date, datetime, timezone
 from pathlib import Path
+from dataclasses import dataclass
 from typing import Iterator, Mapping, Sequence
 
 from twill_lessons import LESSON_ID_RE, lessons_dir
@@ -76,6 +79,30 @@ PATH_CONTRACT: Mapping[str, Mapping[str, str]] = {
 
 class ArtifactContractError(ValueError):
     """An artifact snapshot is missing required contract metadata or content."""
+
+
+class ArtifactPublicationError(RuntimeError):
+    """The private artifact checkout could not be published safely."""
+
+
+@dataclass(frozen=True)
+class PublicationResult:
+    """The immutable commit produced (or retried) by :func:`publish_snapshot`."""
+
+    commit: str
+    branch: str
+    changed_paths: tuple[str, ...]
+    created_commit: bool
+    pushed: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "commit": self.commit,
+            "branch": self.branch,
+            "changed_paths": list(self.changed_paths),
+            "created_commit": self.created_commit,
+            "pushed": self.pushed,
+        }
 
 
 class _ArtifactSnapshot:
@@ -590,6 +617,299 @@ def read_manifest(
     return payload
 
 
+def _git(
+    root: Path,
+    arguments: Sequence[str],
+    *,
+    check: bool = True,
+) -> subprocess.CompletedProcess[str]:
+    """Run one local git operation without exposing its command or URL."""
+
+    try:
+        result = subprocess.run(
+            ["git", *arguments],
+            cwd=root,
+            check=False,
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+    except OSError as exc:
+        raise ArtifactPublicationError("git is required to publish artifacts") from exc
+    if check and result.returncode != 0:
+        detail = (result.stderr or result.stdout or "git command failed").strip()
+        raise ArtifactPublicationError(redact_text(detail))
+    return result
+
+
+def _git_output(root: Path, arguments: Sequence[str]) -> str:
+    return _git(root, arguments).stdout.strip()
+
+
+def _git_repo(root: Path, *, require_origin: bool = False) -> Path:
+    if not root.is_dir() or root.is_symlink():
+        raise ArtifactPublicationError("artifacts_root must be a git checkout directory")
+    top = _git_output(root, ("rev-parse", "--show-toplevel"))
+    resolved_top = Path(top).resolve()
+    if resolved_top != root.resolve():
+        raise ArtifactPublicationError(
+            "artifacts_root must be the root of the private artifact checkout"
+        )
+    if require_origin:
+        remote = _git(root, ("remote", "get-url", "origin"), check=False)
+        if remote.returncode != 0 or not remote.stdout.strip():
+            raise ArtifactPublicationError(
+                "private artifact checkout has no configured origin remote"
+            )
+    return resolved_top
+
+
+def _status_paths(output: str) -> tuple[str, ...]:
+    """Decode porcelain-v1 ``-z`` paths, including rename pairs."""
+
+    records = output.split("\0")
+    paths: list[str] = []
+    index = 0
+    while index < len(records):
+        record = records[index]
+        index += 1
+        if not record:
+            continue
+        if len(record) < 3 or record[2] != " ":
+            raise ArtifactPublicationError("git returned an invalid worktree status")
+        status = record[:2]
+        paths.append(record[3:])
+        if "R" in status or "C" in status:
+            if index >= len(records) or not records[index]:
+                raise ArtifactPublicationError("git returned an incomplete rename status")
+            paths.append(records[index])
+            index += 1
+    return tuple(paths)
+
+
+def _name_only_paths(output: str) -> tuple[str, ...]:
+    return tuple(item for item in output.split("\0") if item)
+
+
+def _expand_namespace_paths(root: Path, paths: Sequence[str]) -> tuple[str, ...]:
+    """Expand git's ``?? namespace/`` record into its actual files."""
+
+    expanded: list[str] = []
+    for path in paths:
+        namespace = path.rstrip("/")
+        if namespace not in ARTIFACT_DIRS or not (root / namespace).is_dir():
+            expanded.append(path)
+            continue
+        for candidate in sorted((root / namespace).rglob("*")):
+            if candidate.is_file() or candidate.is_symlink():
+                expanded.append(candidate.relative_to(root).as_posix())
+    return tuple(expanded)
+
+
+def _contract_path(path: str) -> bool:
+    if path == MANIFEST_FILENAME:
+        return True
+    candidate = Path(path)
+    if (
+        candidate.is_absolute()
+        or candidate.as_posix() != path
+        or any(part in {"", ".", ".."} for part in candidate.parts)
+    ):
+        return False
+    try:
+        _schema_for(candidate)
+    except ArtifactContractError:
+        return False
+    return True
+
+
+def _assert_publishable_paths(paths: Sequence[str]) -> None:
+    unrelated = sorted({path for path in paths if not _contract_path(path)})
+    if unrelated:
+        names = ", ".join(unrelated)
+        raise ArtifactPublicationError(
+            f"refusing to publish unrelated checkout path(s): {redact_text(names)}"
+        )
+
+
+def _extract_archive(archive_path: Path, destination: Path) -> None:
+    """Extract a git archive while refusing links and traversal entries."""
+
+    destination.mkdir()
+    with tarfile.open(archive_path, mode="r:") as archive:
+        for member in archive.getmembers():
+            relative = Path(member.name)
+            target = (destination / relative).resolve()
+            if (
+                relative.is_absolute()
+                or any(part in {"", ".", ".."} for part in relative.parts)
+                or target != destination.resolve()
+                and destination.resolve() not in target.parents
+            ):
+                raise ArtifactPublicationError("git archive contains an unsafe path")
+            if member.issym() or member.islnk() or member.isdev():
+                raise ArtifactPublicationError("git archive contains a link or device")
+            archive.extract(member, path=destination, filter="data")
+
+
+def _validate_git_tree(
+    root: Path,
+    treeish: str,
+    *,
+    expected_manifest: bytes | None,
+    repo_root: Path | None,
+) -> dict[str, object]:
+    """Validate an exact index/commit tree through the public v1 reader."""
+
+    with tempfile.TemporaryDirectory(prefix="twill-publish-") as directory:
+        temporary = Path(directory)
+        archive_path = temporary / "snapshot.tar"
+        _git(
+            root,
+            ("archive", "--format=tar", "--output", str(archive_path), treeish),
+        )
+        checkout = temporary / "checkout"
+        _extract_archive(archive_path, checkout)
+        manifest_path = checkout / MANIFEST_FILENAME
+        if expected_manifest is not None and manifest_path.read_bytes() != expected_manifest:
+            raise ArtifactPublicationError(
+                "staged artifact tree does not contain the producer manifest"
+            )
+        return read_manifest(checkout, repo_root=repo_root)
+
+
+def read_committed_manifest(
+    artifacts_root: Path,
+    *,
+    commit: str = "HEAD",
+    repo_root: Path | None = None,
+) -> dict[str, object]:
+    """Validate one committed checkout tree before a consumer indexes it."""
+
+    root = _root(Path(artifacts_root), repo_root=repo_root)
+    _git_repo(root)
+    return _validate_git_tree(
+        root,
+        commit,
+        expected_manifest=None,
+        repo_root=repo_root,
+    )
+
+
+def publish_snapshot(
+    artifacts_root: Path,
+    *,
+    message: str = "twill: publish artifact snapshot",
+    push: bool = True,
+    repo_root: Path | None = None,
+) -> PublicationResult:
+    """Commit and push one validated artifact snapshot.
+
+    The producer worktree is validated before staging.  Only the manifest and
+    recognized artifact paths may be changed by the commit, and the staged
+    index is materialized through ``git archive`` and validated again before a
+    normal commit.  When a previous push failed, a clean worktree reuses that
+    same local commit, so retries never create another snapshot.
+    """
+
+    if not isinstance(message, str) or not message.strip() or "\n" in message or "\r" in message:
+        raise ArtifactPublicationError("publication commit message must be one non-empty line")
+    root = _root(Path(artifacts_root), repo_root=repo_root)
+    _git_repo(root, require_origin=push)
+    read_manifest(root, repo_root=repo_root)
+    manifest_bytes = (root / MANIFEST_FILENAME).read_bytes()
+
+    branch_result = _git(root, ("symbolic-ref", "--quiet", "--short", "HEAD"), check=False)
+    branch = branch_result.stdout.strip()
+    if branch_result.returncode != 0 or not branch:
+        raise ArtifactPublicationError("private artifact checkout must be on a named branch")
+
+    status = _git(root, ("status", "--porcelain=v1", "-z")).stdout
+    changed_paths = tuple(
+        sorted(set(_expand_namespace_paths(root, _status_paths(status))))
+    )
+    _assert_publishable_paths(changed_paths)
+    head_result = _git(root, ("rev-parse", "--verify", "HEAD"), check=False)
+    head = head_result.stdout.strip() if head_result.returncode == 0 else ""
+    created_commit = False
+
+    if changed_paths:
+        index_tree = _git_output(root, ("write-tree",))
+        try:
+            _git(root, ("add", "--", *changed_paths))
+            staged_paths = _name_only_paths(
+                _git(root, ("diff", "--cached", "--name-only", "-z")).stdout
+            )
+            _assert_publishable_paths(staged_paths)
+            _validate_git_tree(
+                root,
+                _git_output(root, ("write-tree",)),
+                expected_manifest=manifest_bytes,
+                repo_root=repo_root,
+            )
+            _git(
+                root,
+                (
+                    "-c",
+                    "user.name=jedarden",
+                    "-c",
+                    "user.email=github@jedarden.com",
+                    "commit",
+                    "-m",
+                    message,
+                ),
+            )
+        except BaseException:
+            # A failed staged validation must not leave a candidate index that
+            # a later operator command could accidentally publish.  A commit
+            # failure is also safe to retry from the restored index; a commit
+            # that succeeded is detected below through HEAD.
+            after_commit = _git(root, ("rev-parse", "--verify", "HEAD"), check=False)
+            current_head = after_commit.stdout.strip() if after_commit.returncode == 0 else ""
+            if current_head == head:
+                _git(root, ("read-tree", index_tree), check=False)
+            raise
+        head = _git_output(root, ("rev-parse", "--verify", "HEAD"))
+        created_commit = True
+
+        committed_paths = _name_only_paths(
+            _git(
+                root,
+                ("diff-tree", "--root", "--no-commit-id", "--name-only", "-r", "-z", head),
+            ).stdout
+        )
+        _assert_publishable_paths(committed_paths)
+        _validate_git_tree(
+            root,
+            head,
+            expected_manifest=manifest_bytes,
+            repo_root=repo_root,
+        )
+    elif not head:
+        raise ArtifactPublicationError("artifact checkout has no commit to publish")
+    else:
+        _validate_git_tree(
+            root,
+            head,
+            expected_manifest=None,
+            repo_root=repo_root,
+        )
+
+    if push:
+        _git(root, ("push", "origin", f"HEAD:{branch}"))
+    return PublicationResult(
+        commit=head,
+        branch=branch,
+        changed_paths=changed_paths,
+        created_commit=created_commit,
+        pushed=push,
+    )
+
+
+publish_artifacts = publish_snapshot
+
+
 __all__ = [
     "ARTIFACT_DIRS",
     "CONTRACT_SCHEMA",
@@ -600,7 +920,12 @@ __all__ = [
     "MEASUREMENT_SCHEMA",
     "PATH_CONTRACT",
     "ArtifactContractError",
+    "ArtifactPublicationError",
     "manifest_after_write",
+    "PublicationResult",
+    "publish_artifacts",
+    "publish_snapshot",
+    "read_committed_manifest",
     "read_manifest",
     "write_manifest",
 ]

@@ -35,6 +35,7 @@ import twill_lessons
 import twill_measure
 import twill_prune
 import twill_perf
+import twill_publisher
 import twill_ranker
 import twill_review
 import twill_rulecorpus
@@ -85,6 +86,7 @@ MUTATING_VERBS = frozenset(
         "dismiss",
         "measure",
         "prune",
+        "publish",
     }
 )
 
@@ -2171,6 +2173,18 @@ def measure_command(args: argparse.Namespace) -> int:
     return EXIT_SUCCESS
 
 
+def publish_command(args: argparse.Namespace) -> int:
+    """Validate, commit, and push the external artifact checkout."""
+
+    config = load_config()
+    result = twill_publisher.publish_snapshot(config.require_artifacts_root())
+    emit_success(result.as_dict(), json_mode=args.json)
+    if not args.json:
+        action = "created and pushed" if result.created_commit else "reused and pushed"
+        print(f"artifact snapshot {action}: {result.commit}")
+    return EXIT_SUCCESS
+
+
 def prune_command(args: argparse.Namespace) -> int:
     config = load_config()
     retention = config.retention if args.older_than is None else args.older_than
@@ -2760,6 +2774,13 @@ def build_parser() -> argparse.ArgumentParser:
     measure.add_argument("--state-dir")
     measure.add_argument("--json", action="store_true")
     measure.set_defaults(handler=measure_command)
+
+    publish = subparsers.add_parser(
+        "publish", help="validate and push the external artifact snapshot"
+    )
+    publish.add_argument("--state-dir")
+    publish.add_argument("--json", action="store_true")
+    publish.set_defaults(handler=publish_command)
 
     prune = subparsers.add_parser(
         "prune", help="remove observations outside the retention window"

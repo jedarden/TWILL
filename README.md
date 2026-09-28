@@ -127,6 +127,11 @@ twill ingest --limit 1
 twill digest --stdout
 ```
 
+After a successful artifact-producing run, `twill publish` validates the
+external v1 snapshot, commits the manifest and changed artifact files together,
+and pushes that commit to the configured private origin. Retrying after a
+transient push failure reuses the same local commit.
+
 Use `--settle 0` for a deliberately controlled fixture, `--file PATH` to select one session, or
 `--state-dir PATH` and `--source PATH` for an isolated run. The initial walking skeleton did not
 implement ranking, coverage, LLM explanation, measurement, or timers; cursor and schema support now
