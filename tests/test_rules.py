@@ -269,6 +269,23 @@ class RetirementTests(unittest.TestCase):
             "human edit in the owning layer",
         )
 
+    def test_retirement_requires_the_full_90_day_zero_occurrence_window(self):
+        self.add_rule(
+            "/rules/old-enough.md",
+            indexed_at="2026-06-30T00:00:00+00:00",
+        )
+        self.add_rule(
+            "/rules/too-young.md",
+            indexed_at="2026-07-01T00:00:00+00:00",
+        )
+
+        report = self.report()
+
+        self.assertEqual(
+            [item.path for item in report.retirement_proposals],
+            ["/rules/old-enough.md"],
+        )
+
     def test_old_last_occurrence_is_proposed_but_recent_one_is_not(self):
         self.add_rule("/rules/old.md")
         self.add_cluster(
@@ -302,6 +319,26 @@ class RetirementTests(unittest.TestCase):
         )
 
         self.assertEqual(self.report().retirement_proposals, ())
+
+    def test_recorded_file_read_prevents_retirement_proposal(self):
+        self.add_rule(
+            "/rules/read.md",
+            indexed_at="2026-06-01T00:00:00+00:00",
+        )
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
+            "VALUES ('session-read', ?, ?, 'file_read', ?)",
+            (
+                "2026-09-27T00:00:00+00:00",
+                "2026-09-27T00:00:00+00:00",
+                "/rules/read.md",
+            ),
+        )
+
+        report = self.report()
+
+        self.assertEqual(report.retirement_proposals, ())
+        self.assertEqual(report.rules[0].last_read, "2026-09-27T00:00:00+00:00")
 
     def test_malformed_occurrence_evidence_does_not_prove_zero(self):
         self.add_rule("/rules/mystery.md")
