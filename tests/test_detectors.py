@@ -158,6 +158,19 @@ def run_row(connection: sqlite3.Connection, detector_id: str, version: int):
     ).fetchone()
 
 
+def detector_state(connection: sqlite3.Connection) -> tuple[list[tuple], list[tuple]]:
+    """Snapshot the derived rows a detector refresh is allowed to change."""
+
+    return (
+        connection.execute(
+            "SELECT * FROM cluster ORDER BY detector_id, key"
+        ).fetchall(),
+        connection.execute(
+            "SELECT * FROM detector_run ORDER BY detector_id, version"
+        ).fetchall(),
+    )
+
+
 class RegistryContractTests(unittest.TestCase):
     """§4 and EC-12: the registry's naming, versioning and SQL discipline."""
 
@@ -553,6 +566,96 @@ class DetectorRunTests(unittest.TestCase):
         self.assertIn("empty key", report.outcomes[2].error)
         for detector_id in ("D-04", "D-05", "D-06"):
             self.assertEqual(cluster_rows(self.connection, detector_id), [])
+
+    def test_cluster_sql_contract_failures_leave_existing_state_unchanged(self):
+        seed_observation(self.connection, program="sqlite3", session_id="s1")
+        seed_observation(self.connection, program="sqlite3", session_id="s2")
+        baseline = make_detector("D-01", 1)
+        self.assertEqual(
+            twill_detectors.run_detectors(
+                self.connection, window_days=30, registry=(baseline,)
+            ).exit_code,
+            EXIT_SUCCESS,
+        )
+        before = detector_state(self.connection)
+
+        invalid_sql = (
+            (
+                "missing required parameter",
+                program_failure_sql().replace(
+                    ":window_start_utc", ":required_window_start"
+                ),
+                "binding parameter",
+            ),
+            (
+                "missing required output column",
+                program_failure_sql().replace(
+                    "count(DISTINCT session_id) AS sessions,", ""
+                ),
+                "missing sessions",
+            ),
+            (
+                "invalid key",
+                program_failure_sql().replace("program AS key", "NULL AS key"),
+                "empty key",
+            ),
+            (
+                "negative count",
+                program_failure_sql().replace(
+                    "count(DISTINCT session_id) AS sessions", "-1 AS sessions"
+                ),
+                "negative sessions",
+            ),
+            (
+                "non-integer count",
+                program_failure_sql().replace(
+                    "count(*) AS events", "1.5 AS events"
+                ),
+                "non-integer events",
+            ),
+        )
+        for version, (label, sql, expected_error) in enumerate(invalid_sql, 2):
+            with self.subTest(contract=label):
+                report = twill_detectors.run_detectors(
+                    self.connection,
+                    window_days=30,
+                    registry=(make_detector("D-01", version, sql=sql),),
+                )
+                self.assertEqual(report.exit_code, EXIT_RUNTIME_ERROR)
+                self.assertEqual(report.outcomes[0].status, "error")
+                self.assertIn(expected_error, report.outcomes[0].error)
+                self.assertEqual(detector_state(self.connection), before)
+
+    def test_non_select_cluster_sql_is_rejected_without_state_changes(self):
+        seed_observation(self.connection, program="sqlite3", session_id="s1")
+        seed_observation(self.connection, program="sqlite3", session_id="s2")
+        baseline = make_detector("D-01", 1)
+        self.assertEqual(
+            twill_detectors.run_detectors(
+                self.connection, window_days=30, registry=(baseline,)
+            ).exit_code,
+            EXIT_SUCCESS,
+        )
+        before = detector_state(self.connection)
+
+        for version, sql in enumerate(
+            (
+                "INSERT INTO cluster SELECT 1",
+                "UPDATE cluster SET state = 'open'",
+                "DELETE FROM observation",
+                "PRAGMA journal_mode = WAL",
+                "CREATE TABLE x(id INTEGER)",
+            ),
+            2,
+        ):
+            with self.subTest(sql=sql):
+                with self.assertRaises(ValueError):
+                    twill_detectors.run_detectors(
+                        self.connection,
+                        window_days=30,
+                        registry=(make_detector("D-01", version, sql=sql),),
+                    )
+                self.assertEqual(detector_state(self.connection), before)
 
     def test_a_later_failure_records_error_on_the_successful_stamp(self):
         seed_observation(self.connection, program="sqlite3", session_id="s1")
