@@ -20,6 +20,7 @@ SYSTEMD_SOURCE = ROOT / "systemd"
 sys.path.insert(0, str(ROOT))
 
 from twill_config import ConfigError, load_config  # noqa: E402
+from twill_lock import StateLock  # noqa: E402
 
 
 def run_install(home: Path) -> subprocess.CompletedProcess:
@@ -129,6 +130,29 @@ class InstallTests(unittest.TestCase):
             service.index("ExecStart=/usr/bin/env %h/.local/bin/twill measure"),
             service.index("ExecStart=/usr/bin/env %h/.local/bin/twill prune"),
         )
+
+    def test_installed_timer_commands_honor_the_shared_state_lock(self):
+        self.assertEqual(run_install(self.home).returncode, 0)
+        service_commands = {
+            "twill-ingest.service": ("ingest", "detect"),
+            "twill-measure.service": ("measure", "prune"),
+            "twill-digest.service": ("rank", "explain", "digest"),
+        }
+        state = self.home / ".local" / "state" / "twill"
+
+        with StateLock(state):
+            for service_name, expected_commands in service_commands.items():
+                service = (self.user_units() / service_name).read_text()
+                installed_commands = tuple(
+                    line.rsplit(" ", 1)[1]
+                    for line in service.splitlines()
+                    if line.startswith("ExecStart=")
+                )
+                self.assertEqual(installed_commands, expected_commands)
+                for command in installed_commands:
+                    result = run_installed(self.home, command)
+                    self.assertEqual(result.returncode, 3, result.stderr)
+                    self.assertIn("lock held by pid", result.stdout + result.stderr)
 
     def test_installed_entry_point_runs_from_a_foreign_cwd(self):
         self.assertEqual(run_install(self.home).returncode, 0)
