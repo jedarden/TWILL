@@ -1,17 +1,54 @@
 # The test-suite audit harness
 
 The mechanical enforcement of the §3 and §8.3 invariants that the test suite
-can observe —
-"No file outside `~/TWILL` and `~/.local/state/twill` is ever opened for
-writing" and "No path under `~/agent-transcript-archive` is ever opened at
-all", no third-party Python import in the core path, and no Python network
-call except the local `claude -p` child — plus §10.2's stop-ship gate. The
-harness is `tests/openpath.py`; it is exercised by `tests/test_openpath.py` and
-`tests/test_audit.py`. Ideas
+can observe — no open for writing outside the allowed write roots ("The
+write boundary" below), "no path under `~/agent-transcript-archive` is ever
+opened at all", no third-party Python import in the core path, and no Python
+network call except the local `claude -p` child — plus §10.2's stop-ship
+gate. The harness is `tests/openpath.py`; it is exercised by
+`tests/test_openpath.py` and `tests/test_audit.py`. Ideas
 ledger #77 rejected auditing in the engine's hot path; this is the selected
 alternative: the whole *test suite* runs under the hook, so every change to
 the engine is audited at development time, and the running timers pay
 nothing.
+
+## The write boundary
+
+§8.3 words the write invariant tersely — "no file outside `~/TWILL` and
+`~/.local/state/twill` is ever opened for writing" — naming the engine's own
+two trees and leaving `artifacts_root` implicit; §3 and §10.2 state the same
+contract in full ("read-only with respect to everything outside its own
+repository, its state directory … and `artifacts_root`"; "any write outside
+this repository + the state dir + `artifacts_root` … fails the run"). The
+harness enforces the full form, and `artifacts_root` is not a relaxation of
+it: §3, §7.2 and the README require every distilled artifact to live under
+`artifacts_root` — the separate private repository; "nothing TWILL produces
+lives here" — so it is the product's destination, not an exception granted
+to the tests. The exact allowed write roots, in the order
+`is_allowed_write` decides them:
+
+1. **This repository** — except its top-level `lessons/`, `digests/`,
+   `measurements/` and `guards/` names, which are denied outright ("no
+   lesson, digest, measurement or guard artifact is ever written inside this
+   repository's tree", §8.3 again — guard two of §10.2's three
+   artifact-containment guards). Top-level names only, mirroring the
+   `.gitignore` block: an artifact writer names `artifacts_root`, so a
+   directory of the same name nested elsewhere in the tree is ordinary
+   content, not a leak.
+2. **The state directory** — `TWILL_STATE_DIR` when set, else
+   `~/.local/state/twill`, the same resolution as the CLI's `--state-dir`
+   default, so the gate and the engine cannot disagree about where the
+   state tree is.
+3. **`artifacts_root`** — from the operator config when one is loadable; a
+   missing or unloadable config yields no allowance, which only narrows the
+   gate, never widens it.
+4. **The temp scratch root** — `tempfile.gettempdir()`, the one root the
+   harness adds on its own beyond §10.2's three ("The temp root is the one
+   broadening" below).
+
+`os.devnull` is allowed alongside those (a write to it persists nothing),
+and an fd-anchored open (`open(3, "w")`) addresses no path and is not
+policed.
 
 ## Import and network gates
 
@@ -41,15 +78,11 @@ the mode, or any of `O_WRONLY|O_RDWR|O_CREAT|O_TRUNC|O_APPEND` in the flags
 
 ## The gate is a hook, a startup, and an inheritance
 
-- `tests/openpath.py` — the policy. A write must land inside the
-  repository (never inside its `lessons/`, `digests/`, `measurements/` or
-  `guards/` names: §10.2's second artifact guard), the state directory
-  (`TWILL_STATE_DIR` or `~/.local/state/twill`, the same resolution as the
-  CLI), `artifacts_root`, or the temp scratch root. The repository is
-  decided before the temp root, so the artifact names are denied even in a
-  checkout that itself lives under the temp root — a clean extraction or a
-  CI checkout in TMPDIR; the first extraction run caught the original
-  ordering letting those through. A read must simply be
+- `tests/openpath.py` — the policy ("The write boundary" above). The
+  repository is decided before the temp root, so the artifact names are
+  denied even in a checkout that itself lives under the temp root — a clean
+  extraction or a CI checkout in TMPDIR; the first extraction run caught the
+  original ordering letting those through. A read must simply be
   outside `~/agent-transcript-archive` — any open under it fails, read or
   write, which is the stricter §8.3 wording. Violations raise
   `OpenPathViolation` (an `AssertionError`) at the open itself; the refused
@@ -75,9 +108,7 @@ the suite writes its fixtures and state directories under
 `tempfile.gettempdir()` in 78 places, and pytest builds its tmp roots there.
 So the harness also allows the temp root — scaffolding, not engine surface:
 nothing the invariants protect (operator context, other repositories, the
-public tree) lives there. It also allows `os.devnull` (a write to it
-persists nothing) and ignores fd-anchored opens (`open(3, "w")`), which
-address no path.
+public tree) lives there.
 
 ## No open happens inside the hook
 

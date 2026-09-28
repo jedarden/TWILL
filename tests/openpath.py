@@ -1,10 +1,11 @@
 """The test-suite audit harness (plan §3, §8.3, §10.2).
 
-Mechanical enforcement of the two pre-flight invariants the plan lists as
-"must always hold":
+Mechanical enforcement of the plan's "must always hold" invariants (§8.3),
+at the write boundary §3 and §10.2 state in full:
 
-- No file outside this repository and the state directory is ever opened for
-  writing.
+- No file outside this repository (never its artifact-directory names), the
+  state directory, ``artifacts_root`` or the test scratch root is ever
+  opened for writing.
 - No path under ``~/agent-transcript-archive`` is ever opened at all.
 - Core code imports only the standard library or this repository.
 - Python code makes no network call.  The one sanctioned egress is the local
@@ -46,8 +47,10 @@ startup hook.  A static import audit in ``tests/test_audit.py`` covers the
 whole production tree, while the runtime hook covers imports made through
 dynamic code paths and every Python child the suite spawns.
 
-Allowed write trees, and why the harness is allowed to be broader than the
-invariant it enforces:
+Allowed write trees.  §8.3's first bullet names only the engine's own two
+trees; §3 and §10.2 include ``artifacts_root`` in the invariant itself, and
+the temp root below is the harness's one deliberate broadening beyond even
+that:
 
 - **this repository**, except ``lessons/``, ``digests/``, ``measurements/``
   and ``guards/`` inside it.  The in-tree artifact names are denied outright
