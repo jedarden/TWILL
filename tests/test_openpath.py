@@ -30,6 +30,7 @@ sys.path.insert(0, str(TESTS))
 sys.path.insert(0, str(ROOT))
 
 import openpath  # noqa: E402
+import twill_app  # noqa: E402
 
 
 def deny(read_or_write, *args):
@@ -254,11 +255,18 @@ class ChildVerbOpenPathTests(unittest.TestCase):
     def tearDownClass(cls):
         cls._config_home.cleanup()
 
-    def run_cli(self, *args):
+    def child_environment(self, **overrides):
+        return {
+            **os.environ,
+            "HOME": str(Path(self._config_home.name)),
+            **overrides,
+        }
+
+    def run_cli(self, *args, **overrides):
         return subprocess.run(
             [sys.executable, str(CLI), *args],
             cwd=ROOT,
-            env={**os.environ, "HOME": str(Path(self._config_home.name))},
+            env=self.child_environment(**overrides),
             check=False,
             text=True,
             capture_output=True,
@@ -329,6 +337,70 @@ class ChildVerbOpenPathTests(unittest.TestCase):
             digest = self.run_cli("digest", "--stdout", "--state-dir", str(state))
             self.assertEqual(digest.returncode, 0, digest.stderr)
             self.assertIn("TWILL digest", digest.stdout)
+
+    def test_custom_state_dir_is_shared_with_cli_and_inherited_audit_hook(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "resolved" / "state"
+            state.mkdir(parents=True)
+            configured = root / "state-link"
+            configured.symlink_to(state, target_is_directory=True)
+
+            previous = os.environ.get("TWILL_STATE_DIR")
+            os.environ["TWILL_STATE_DIR"] = str(configured)
+            try:
+                self.assertEqual(openpath.state_dir(), state.resolve())
+                self.assertEqual(twill_app._state_dir(None).resolve(), openpath.state_dir())
+            finally:
+                if previous is None:
+                    os.environ.pop("TWILL_STATE_DIR", None)
+                else:
+                    os.environ["TWILL_STATE_DIR"] = previous
+
+            source = root / "session.jsonl"
+            source.write_text(
+                json.dumps(
+                    {
+                        "type": "user",
+                        "sessionId": "custom-state-dir",
+                        "timestamp": "2026-09-20T12:00:00Z",
+                        "message": {"role": "user", "content": "state-dir fixture"},
+                    }
+                )
+                + "\n"
+            )
+
+            ingest = self.run_cli(
+                "ingest",
+                "--file",
+                str(source),
+                "--settle",
+                "0",
+                "--limit",
+                "1",
+                TWILL_STATE_DIR=str(configured),
+            )
+            self.assertEqual(ingest.returncode, 0, ingest.stderr)
+            self.assertTrue((state / "twill.db").is_file())
+            self.assertFalse((Path(self._config_home.name) / ".local" / "state" / "twill").exists())
+            self.assertEqual(state.stat().st_mode & 0o777, 0o700)
+            for path in sorted(state.rglob("*")):
+                self.assertFalse(path.is_symlink(), path)
+                expected = 0o700 if path.is_dir() else 0o600
+                self.assertEqual(path.stat().st_mode & 0o777, expected, path)
+
+            outside = Path.home() / f".twill-custom-state-outside-{os.getpid()}"
+            child = subprocess.run(
+                [sys.executable, "-c", f"open({str(outside)!r}, 'w')"],
+                cwd=ROOT,
+                env=self.child_environment(TWILL_STATE_DIR=str(configured)),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(child.returncode, 0)
+            self.assertIn("OpenPathViolation", child.stderr)
+            self.assertFalse(outside.exists())
 
 
 if __name__ == "__main__":
