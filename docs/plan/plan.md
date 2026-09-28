@@ -437,7 +437,7 @@ installs it.
   transcript text is *designed* to be surfaced into future prompts, which makes a leaked secret in
   it worse than one sitting inert in a transcript.
 - **The distilled artifacts are the durable product, and they live outside this repository.**
-  `artifacts_root` (default `~/TWILL-lessons`) is a **separate private git repository** — Forgejo
+  `artifacts_root` (with no working default) is a **separate private git repository** — Forgejo
   only, no GitHub mirror, never public — holding `lessons/`, `digests/`, `measurements/` and
   `guards/`. It is git rather than a directory for three reasons the plan depends on: a lesson
   survives a state-DB rebuild, a change to one is diffable and reviewable in a normal commit, and
@@ -445,6 +445,18 @@ installs it.
   is public; that one is not, and nothing in the engine's tree is permitted to become an artifact.
 - **Retention:** observations older than 180 days are pruned by `twill prune` (daily); clusters are
   recomputed from surviving observations; measurements and lessons are kept forever.
+
+### 7.3 `artifacts_root` interchange contract
+
+The private repository is a versioned pull transport, not an ad-hoc directory. Its v1 contract is
+defined in `docs/notes/artifact-contract.md`: `manifest.json` inventories the four reserved
+namespaces (`lessons/`, `digests/`, `measurements/`, `guards/`) with a schema name, byte count and
+SHA-256 for every recognized file. Producers write files atomically and regenerate the manifest;
+the publisher commits the changed files and manifest together, and the recall consumer validates
+the committed manifest before replacing its disposable index. A v1 reader accepts additive
+manifest metadata and ignores unrelated root files, but rejects unknown contract versions,
+malformed paths, symlinks, stale inventories and hash mismatches. This is the compatibility
+boundary for Phase 8 and does not weaken the public-tree or secret-containment guards.
 
 ## 8. Pre-Flight Safety
 

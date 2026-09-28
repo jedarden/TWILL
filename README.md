@@ -56,6 +56,11 @@ the `.gitignore` here, an open-path test that fails on an artifact write into th
 assertion that the published tree contains no artifact. A convention alone lasts exactly as long as
 the first default-config run.
 
+The downstream interchange contract is documented in
+[`docs/notes/artifact-contract.md`](docs/notes/artifact-contract.md). Each successful artifact
+write maintains a versioned `manifest.json` with the paths, schemas, sizes and hashes a recall
+consumer needs to validate one committed snapshot before indexing it.
+
 Working state lives outside the repo in `~/.local/state/twill/` (mode 600). The database is derived
 and disposable — never committed, never off the host: an index of transcript text is *designed* to
 be surfaced into future prompts, which makes a leaked secret in it worse than one sitting inert in

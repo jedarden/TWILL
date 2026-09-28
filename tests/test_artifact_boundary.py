@@ -177,6 +177,7 @@ class ArtifactBoundaryTests(unittest.TestCase):
                 Path("guards") / f"{LESSON_ID}.gate.txt",
                 Path("guards") / f"{LESSON_ID}.agents.md",
                 Path("guards") / f"{LESSON_ID}.memory.md",
+                Path("manifest.json"),
             },
         )
         for path in (self.artifacts, *self.artifacts.rglob("*")):

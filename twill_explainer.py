@@ -1370,6 +1370,9 @@ def write_lesson_files(
         if connection is not None:
             _finish_cluster_state_writes(connection, prepared)
             transaction_started = False
+        from twill_artifacts import write_manifest
+
+        write_manifest(artifacts_root, repo_root=repo_root)
         return paths
     except BaseException:
         if transaction_started:

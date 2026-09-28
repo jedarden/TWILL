@@ -1498,4 +1498,7 @@ def write_digest_file(
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
+    from twill_artifacts import write_manifest
+
+    write_manifest(root, repo_root=repo_root)
     return path

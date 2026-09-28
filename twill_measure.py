@@ -1102,6 +1102,9 @@ def measure_lessons(
             repo_root=repo_root,
         )
         resolved.append(candidate.lesson_id)
+    from twill_artifacts import write_manifest
+
+    write_manifest(artifacts_root, repo_root=repo_root)
     return MeasurementReport(
         window_days=window_days,
         window_start_utc=window_start,

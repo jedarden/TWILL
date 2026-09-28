@@ -484,7 +484,7 @@ def write_guard(
     """Render and atomically write one selected guard template."""
 
     text = render_guard(record, target_layer=target_layer)
-    return _write_atomic(
+    path = _write_atomic(
         guard_path(
             artifacts_root,
             record.id,
@@ -493,6 +493,10 @@ def write_guard(
         ),
         text,
     )
+    from twill_artifacts import write_manifest
+
+    write_manifest(artifacts_root, repo_root=repo_root)
+    return path
 
 
 def write_wrapper_guard(
