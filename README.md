@@ -9,7 +9,7 @@ reaching for, a rule they keep breaking, a fact rediscovered every week.
 A twill is the weave whose diagonal comes from a *repeating* pattern, which is the whole signal
 here: a one-off error is noise, the same one across six hundred sessions is a lesson.
 
-## The five phases
+## The six phases
 
 | Phase | What it does |
 |---|---|
