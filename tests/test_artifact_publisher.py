@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -21,6 +22,7 @@ from twill_artifacts import (  # noqa: E402
     read_manifest,
     write_manifest,
 )
+from twill_digest import write_digest_file  # noqa: E402
 
 
 LESSON = (
@@ -128,6 +130,69 @@ class ArtifactPublisherTests(unittest.TestCase):
         self.assertEqual(
             read_manifest(consumer, repo_root=ROOT)["artifacts"],
             read_committed_manifest(self.artifacts, repo_root=ROOT)["artifacts"],
+        )
+
+    def test_successful_artifact_write_refreshes_manifest_before_publication(self):
+        initial = read_manifest(self.artifacts, repo_root=ROOT)
+        digest = "digest | $ twill digest --week 2026-W38 --stdout --state-dir /tmp/twill-state\n"
+
+        path = write_digest_file(digest, self.artifacts, (2026, 38), repo_root=ROOT)
+
+        manifest = read_manifest(self.artifacts, repo_root=ROOT)
+        self.assertEqual(manifest["schema"], "twill-artifacts/v1")
+        self.assertNotEqual(manifest, initial)
+        self.assertEqual(
+            manifest["artifacts"],
+            [
+                {
+                    "bytes": len(digest.encode("utf-8")),
+                    "path": "digests/2026-W38.txt",
+                    "schema": "twill-digest/v1",
+                    "sha256": hashlib.sha256(digest.encode("utf-8")).hexdigest(),
+                }
+            ],
+        )
+        self.assertEqual(path, self.artifacts / "digests/2026-W38.txt")
+
+        result = publish_snapshot(self.artifacts, repo_root=ROOT)
+
+        committed = read_committed_manifest(
+            self.artifacts, commit=result.commit, repo_root=ROOT
+        )
+        self.assertEqual(committed["schema"], "twill-artifacts/v1")
+        self.assertEqual(committed["artifacts"], manifest["artifacts"])
+
+    def test_failed_publication_keeps_partial_write_invisible_to_consumers(self):
+        self.add_complete_snapshot()
+        published = publish_snapshot(self.artifacts, repo_root=ROOT)
+        previous_manifest = read_committed_manifest(
+            self.artifacts, commit=published.commit, repo_root=ROOT
+        )
+        digest = self.artifacts / "digests/2026-W38.txt"
+        previous_digest = digest.read_bytes()
+        digest.write_bytes(previous_digest + b"partial\n")
+
+        with self.assertRaises(ArtifactContractError):
+            publish_snapshot(self.artifacts, repo_root=ROOT)
+
+        self.assertEqual(
+            self._run_git(self.remote, "rev-parse", "refs/heads/main"), published.commit
+        )
+        consumer = Path(self.temporary.name) / "consumer-after-failure"
+        self._run_git(
+            Path(self.temporary.name),
+            "clone",
+            "-q",
+            "-b",
+            "main",
+            str(self.remote),
+            str(consumer),
+        )
+        self.assertEqual(
+            read_committed_manifest(consumer, repo_root=ROOT), previous_manifest
+        )
+        self.assertEqual(
+            (consumer / "digests/2026-W38.txt").read_bytes(), previous_digest
         )
 
     def test_second_attempt_is_a_noop_and_reuses_the_committed_snapshot(self):
