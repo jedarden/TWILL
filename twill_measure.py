@@ -72,6 +72,41 @@ class Measurement:
 
 
 @dataclass(frozen=True)
+class CoveredClusterMeasurement:
+    """A daily snapshot for a recurring cluster already covered by a rule.
+
+    Covered clusters do not have a TWILL lesson id, so they must not be
+    forced into the lesson measurement mirror.  Their durable history remains
+    the detector-owned ``cluster_week`` series; this value is the current
+    seven-day measurement exposed by ``twill measure``.
+    """
+
+    detector_id: str
+    key: str
+    covered_by: str
+    measured_at: str
+    window_days: int
+    sessions: int
+    events: int
+
+    @property
+    def cluster_id(self) -> str:
+        return f"{self.detector_id.split('@', 1)[0]}:{self.key}"
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "cluster_id": self.cluster_id,
+            "detector_id": self.detector_id,
+            "key": self.key,
+            "covered_by": self.covered_by,
+            "measured_at": self.measured_at,
+            "window_days": self.window_days,
+            "sessions": self.sessions,
+            "events": self.events,
+        }
+
+
+@dataclass(frozen=True)
 class EscalationProposal:
     """A measurement-backed routing proposal for the weekly digest.
 
@@ -163,6 +198,7 @@ class MeasurementReport:
     measurements: tuple[Measurement, ...]
     skipped: tuple[str, ...] = ()
     resolved: tuple[str, ...] = ()
+    covered_clusters: tuple[CoveredClusterMeasurement, ...] = ()
 
     @property
     def points(self) -> tuple[Measurement, ...]:
@@ -180,6 +216,7 @@ class MeasurementReport:
             "measurements": [item.as_dict() for item in self.measurements],
             "skipped": list(self.skipped),
             "resolved": list(self.resolved),
+            "covered_clusters": [item.as_dict() for item in self.covered_clusters],
         }
 
 
@@ -763,6 +800,68 @@ def _replay_lesson(
     )
 
 
+def measure_covered_clusters(
+    connection: sqlite3.Connection,
+    *,
+    registry: Sequence[twill_detectors.Detector],
+    measured_at: str,
+    window_start_utc: str,
+    window_days: int,
+) -> tuple[CoveredClusterMeasurement, ...]:
+    """Replay active covered clusters without creating lesson artifacts.
+
+    ``rank`` is the owner of ``cluster.covered_by``.  A covered cluster is
+    therefore measured only while its indexed rule document is live and the
+    cluster is still in a review lane.  Dismissed and terminal rows cannot
+    re-enter this escalation surface.
+    """
+
+    rows = connection.execute(
+        "SELECT c.detector_id, c.key, c.covered_by "
+        "FROM cluster AS c "
+        "JOIN rule_doc AS d ON d.path = c.covered_by "
+        "WHERE c.covered_by IS NOT NULL AND d.stale = 0 "
+        "AND c.state IN ('open', 'escalation') "
+        "ORDER BY c.detector_id, c.key"
+    ).fetchall()
+    result: list[CoveredClusterMeasurement] = []
+    for raw_detector_id, raw_key, raw_covered_by in rows:
+        detector = _detector_for(str(raw_detector_id), registry)
+        try:
+            canonical_key, emitted = _replay_read_only(
+                connection,
+                detector,
+                str(raw_key),
+                window_start_utc=window_start_utc,
+                window_days=window_days,
+            )
+        except twill_detectors.DetectorContractError as exc:
+            raise _validation(
+                f"{detector.full_id} replay failed validation: {exc}",
+                "bump the detector version when its semantics change",
+            ) from exc
+        except sqlite3.Error as exc:
+            raise _error(
+                EXIT_RUNTIME_ERROR,
+                f"{detector.full_id} replay failed",
+                "run twill doctor to inspect the derived state database",
+            ) from exc
+        row = emitted.get(canonical_key)
+        sessions, events = (0, 0) if row is None else (row[0], row[1])
+        result.append(
+            CoveredClusterMeasurement(
+                detector_id=detector.full_id,
+                key=str(raw_key),
+                covered_by=str(raw_covered_by),
+                measured_at=measured_at,
+                window_days=window_days,
+                sessions=sessions,
+                events=events,
+            )
+        )
+    return tuple(result)
+
+
 def _write_temp(path: Path, content: bytes) -> Path:
     descriptor, temporary_name = tempfile.mkstemp(
         dir=path.parent, prefix=".measurement-", suffix=".tmp"
@@ -975,6 +1074,15 @@ def measure_lessons(
         )
     for point in points:
         history[(point.lesson_id, point.day)] = point
+    covered_clusters = ()
+    if lesson_id is None:
+        covered_clusters = measure_covered_clusters(
+            connection,
+            registry=active_registry,
+            measured_at=measured_at,
+            window_start_utc=window_start,
+            window_days=window_days,
+        )
     _, staged = _stage_mirrors(artifacts_root, history, repo_root=repo_root)
     try:
         _persist(connection, history, staged)
@@ -996,6 +1104,7 @@ def measure_lessons(
         measurements=tuple(points),
         skipped=tuple(skipped),
         resolved=tuple(resolved),
+        covered_clusters=covered_clusters,
     )
 
 
@@ -1062,12 +1171,14 @@ __all__ = [
     "MEASUREMENT_DIR_MODE",
     "MEASUREMENT_FILE_MODE",
     "Measurement",
+    "CoveredClusterMeasurement",
     "EscalationProposal",
     "ResolutionCandidate",
     "MeasurementError",
     "MeasurementReport",
     "MeasurementValidationError",
     "measure_lessons",
+    "measure_covered_clusters",
     "evaluate_escalations",
     "evaluate_resolutions",
     "escalation_proposals",

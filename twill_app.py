@@ -2141,6 +2141,7 @@ def measure_command(args: argparse.Namespace) -> int:
         {
             "lessons": len(report.measurements),
             "measurements": len(report.measurements),
+            "covered_clusters": len(report.covered_clusters),
             "resolved": len(report.resolved),
         },
     )
@@ -2158,7 +2159,15 @@ def measure_command(args: argparse.Namespace) -> int:
             f"- {item.lesson_id} {item.detector_id}: "
             f"{item.sessions} session(s), {item.events} event(s)"
         )
-    print(f"{len(report.measurements)} measurement(s) recorded")
+    for item in report.covered_clusters:
+        print(
+            f"- covered {item.detector_id} {item.key} ({item.covered_by}): "
+            f"{item.sessions} session(s), {item.events} event(s)"
+        )
+    print(
+        f"{len(report.measurements)} lesson measurement(s) recorded; "
+        f"{len(report.covered_clusters)} covered cluster measurement(s) recorded"
+    )
     return EXIT_SUCCESS
 
 
@@ -2598,7 +2607,9 @@ def digest_command(args: argparse.Namespace) -> int:
             selected_week,
         )
         print(
-            f"digest {report.week_id}: {len(report.findings)} finding(s) "
+            f"digest {report.week_id}: "
+            f"{len(report.findings) + len(report.covered_escalations)} "
+            f"finding(s) "
             f"written to {redact_text(artifact)}"
         )
     for warning in warnings:

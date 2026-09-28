@@ -136,8 +136,9 @@ class RankedCluster:
 
     @property
     def escalation_candidate(self) -> bool:
-        return self.state == "escalation" or (
-            self.state == "open" and self.covered and not self.rule_stale
+        return self.sessions > 0 and (
+            self.state == "escalation"
+            or (self.state == "open" and self.covered and not self.rule_stale)
         )
 
     def as_dict(self) -> dict[str, object]:

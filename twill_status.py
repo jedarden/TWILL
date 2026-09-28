@@ -26,6 +26,7 @@ COUNT_FIELDS = frozenset(
     {
         "bytes",
         "clusters",
+        "covered_clusters",
         "db_bytes",
         "detectors",
         "events",

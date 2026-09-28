@@ -190,6 +190,56 @@ class Finding:
 
 
 @dataclass(frozen=True)
+class CoveredEscalation:
+    """A recurring weekly cluster covered by a live rule document.
+
+    This is intentionally separate from :class:`EscalationProposal`, which
+    belongs to an already-applied TWILL lesson.  A covered cluster has no
+    lesson to draft; its rule path and week-over-week counts are the digest
+    representation of the escalation lane.
+    """
+
+    n: int
+    detector: str
+    key: str
+    covered_by: str
+    state: str
+    current: Counts
+    previous: Counts | None
+    week: str
+    reproduce: str
+
+    def as_dict(self) -> dict[str, object]:
+        previous = self.previous
+        return {
+            "n": self.n,
+            "verdict": "covered",
+            "escalation": True,
+            "detector": self.detector,
+            "key": self.key,
+            "covered_by": self.covered_by,
+            "state": self.state,
+            "sessions": self.current[0],
+            "events": self.current[1],
+            "first_seen": self.current[2],
+            "last_seen": self.current[3],
+            "previous": (
+                {
+                    "sessions": previous[0],
+                    "events": previous[1],
+                    "first_seen": previous[2],
+                    "last_seen": previous[3],
+                }
+                if previous is not None
+                else None
+            ),
+            "week": self.week,
+            "reproduce": self.reproduce,
+            "reason": "covered recurrence is routed to escalation, not Explain",
+        }
+
+
+@dataclass(frozen=True)
 class LessonFlowHealth:
     """The lesson lifecycle counts for one completed digest window."""
 
@@ -232,6 +282,7 @@ class DigestReport:
     warnings: tuple[str, ...]
     lesson_flow: LessonFlowHealth
     escalations: tuple[twill_measure.EscalationProposal, ...] = ()
+    covered_escalations: tuple[CoveredEscalation, ...] = ()
     retirements: tuple[twill_rules.RetirementProposal, ...] = ()
     trend: twill_trend.TrendReport | None = None
 
@@ -249,6 +300,7 @@ class DigestReport:
             self.database
             and not self.findings
             and not self.escalations
+            and not self.covered_escalations
             and not self.retirements
             and all(
                 detector.current_status == STATUS_OK
@@ -530,6 +582,71 @@ def _suppress_dismissed(
     return tuple(filtered)
 
 
+def _active_coverage(
+    connection: sqlite3.Connection,
+) -> dict[tuple[str, str], tuple[str, str]]:
+    """Return live rule coverage for clusters in an escalation lane."""
+
+    rows = connection.execute(
+        "SELECT c.detector_id, c.key, c.covered_by, c.state "
+        "FROM cluster AS c "
+        "JOIN rule_doc AS d ON d.path = c.covered_by "
+        "WHERE c.covered_by IS NOT NULL AND d.stale = 0 "
+        "AND c.state IN ('open', 'escalation') "
+        "ORDER BY c.detector_id, c.key"
+    ).fetchall()
+    return {
+        (str(detector_id), str(key)): (str(covered_by), str(state))
+        for detector_id, key, covered_by, state in rows
+    }
+
+
+def _covered_escalations(
+    current_results: Sequence[_DetectorWindow],
+    previous_results: Sequence[_DetectorWindow],
+    coverage: dict[tuple[str, str], tuple[str, str]],
+    *,
+    week: str,
+    reproduce: str,
+) -> tuple[CoveredEscalation, ...]:
+    """Build the digest's covered-recurring-cluster lane."""
+
+    previous_by_detector = {
+        result.detector.full_id: result for result in previous_results
+    }
+    result: list[CoveredEscalation] = []
+    for current_result in current_results:
+        if current_result.status != STATUS_OK:
+            continue
+        detector_id = current_result.detector.detector_id
+        previous_result = previous_by_detector.get(current_result.detector.full_id)
+        for key, current in current_result.clusters.items():
+            covered = coverage.get((detector_id, key))
+            if covered is None or current[0] < 1:
+                continue
+            previous = (
+                previous_result.clusters.get(key)
+                if previous_result is not None
+                and previous_result.status == STATUS_OK
+                else None
+            )
+            result.append(
+                CoveredEscalation(
+                    n=0,
+                    detector=current_result.detector.full_id,
+                    key=key,
+                    covered_by=covered[0],
+                    state=covered[1],
+                    current=current,
+                    previous=previous,
+                    week=week,
+                    reproduce=reproduce,
+                )
+            )
+    result.sort(key=lambda item: (item.detector, item.key))
+    return tuple(replace(item, n=index) for index, item in enumerate(result, start=1))
+
+
 def _known_token(value: object) -> int | None:
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         return None
@@ -773,6 +890,7 @@ def build_digest(
     source = connect_read_only(state)
     trend_report: twill_trend.TrendReport | None = None
     trend_error: str | None = None
+    coverage: dict[tuple[str, str], tuple[str, str]] = {}
     try:
         source.execute("BEGIN")
         observations = int(
@@ -799,6 +917,7 @@ def build_digest(
         previous_results = _suppress_dismissed(
             _read_window(source, detectors, prior_start, prior_end), dismissed
         )
+        coverage = _active_coverage(source)
         try:
             retirements = twill_rules.build_rules_report(
                 source,
@@ -827,6 +946,16 @@ def build_digest(
     warnings: list[str] = []
     if trend_error is not None:
         warnings.append(trend_error)
+    covered_escalations = _covered_escalations(
+        current_results,
+        previous_results,
+        coverage,
+        week=format_week(week),
+        reproduce=command,
+    )
+    covered_ids = {
+        (item.detector, item.key) for item in covered_escalations
+    }
     changes: list[tuple[str, str, str, Counts | None, Counts | None]] = []
     current_by_detector = {
         result.detector.full_id: result for result in current_results
@@ -866,6 +995,8 @@ def build_digest(
             continue
         keys = current_result.clusters.keys() | previous_result.clusters.keys()
         for key in keys:
+            if (full_id, key) in covered_ids:
+                continue
             verdict = _verdict(
                 current_result.clusters.get(key),
                 previous_result.clusters.get(key),
@@ -899,6 +1030,7 @@ def build_digest(
                 or current_result.status != STATUS_OK
                 or key not in current_result.clusters
                 or (detector, key) in seen
+                or (detector, key) in covered_ids
             ):
                 continue
             changes.append(
@@ -973,6 +1105,7 @@ def build_digest(
         warnings=tuple(warnings),
         lesson_flow=lesson_flow,
         escalations=escalations,
+        covered_escalations=covered_escalations,
         retirements=retirements,
         trend=trend_report,
     )
@@ -1043,6 +1176,9 @@ def render_data(report: DigestReport) -> dict[str, object]:
         "trend": _trend_data(report.trend),
         "lesson_flow": report.lesson_flow.as_dict(),
         "escalations": [proposal.as_dict() for proposal in report.escalations],
+        "covered_escalations": [
+            proposal.as_dict() for proposal in report.covered_escalations
+        ],
         "retirements": [proposal.as_dict() for proposal in report.retirements],
         "reproduction_command": report.command,
     }
@@ -1218,6 +1354,31 @@ def render_text(report: DigestReport) -> str:
                     report.command,
                 )
             )
+    if report.covered_escalations:
+        lines.append(
+            _line(
+                f"covered recurrence escalations: {len(report.covered_escalations)}",
+                report.command,
+            )
+        )
+        for escalation in report.covered_escalations:
+            current = escalation.current
+            previous = escalation.previous
+            comparison = (
+                f" vs {previous[0]} sessions/{previous[1]} events"
+                if previous is not None
+                else " with no prior-week comparison"
+            )
+            lines.append(
+                _line(
+                    f"- {escalation.n} {escalation.detector} "
+                    f"{_display_key(escalation.key)} covered by "
+                    f"{escalation.covered_by}: "
+                    f"{current[0]} sessions/{current[1]} events{comparison}; "
+                    "route to escalation, not Explain",
+                    report.command,
+                )
+            )
     if report.retirements:
         lines.append(
             _line(f"retirement proposals: {len(report.retirements)}", report.command)
@@ -1248,7 +1409,8 @@ def render_text(report: DigestReport) -> str:
         if failed:
             clean = f"clean week: no; detector failures: {', '.join(failed)}"
         else:
-            clean = f"clean week: no; {len(report.findings)} finding(s)"
+            total_signals = len(report.findings) + len(report.covered_escalations)
+            clean = f"clean week: no; {total_signals} finding(s)"
     lines.append(_line(clean, report.command))
     return "\n".join(lines) + "\n"
 

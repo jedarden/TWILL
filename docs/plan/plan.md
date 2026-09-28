@@ -738,6 +738,13 @@ and leaves an uncovered one open; `D-08` finds the known live contradiction (MEM
 agents `bf`, never `br`, while CLAUDE.md made `bead` canonical on 2026-08-14).
 **Does NOT include:** any writing of lessons.
 
+**Covered-recurrence decision (2026-09-28):** a live covered cluster with a
+non-zero session count is an escalation lane item. `twill rank --json` exposes
+it under `escalations`, while `twill explain` receives only the uncovered
+`clusters` lane. The weekly digest carries the same item under
+`covered_escalations` with `detector`, `key`, `covered_by`, `state`, and
+current/previous week counts; it is not also emitted as a normal finding.
+
 ### Phase 4: Explain
 **Delivers:** bounded prompt builder, `claude -p` invocation with `CLAUDE_CODE_*` unset, strict JSON
 schema, validation, draft lesson files, `twill explain --dry-run` (prompt to stdout, no spawn), and
@@ -799,6 +806,14 @@ replaces that day's point without losing earlier history. Draft and terminal les
 points, while their existing mirror history is retained. The versioned JSONL mirror is authoritative
 for recovery: `twill measure` reconciles it into the derived table before recording new points, and
 all paths resolve through the validated external `artifacts_root`.
+
+**Covered-cluster measurement decision (2026-09-28):** covered clusters do
+not receive synthetic lesson ids and never create lesson mirror files. The
+daily measure JSON instead reports `covered_clusters` snapshots shaped as
+`{cluster_id, detector_id, key, covered_by, measured_at, window_days, sessions,
+events}`. Their durable history is the detector-owned `cluster_week` series;
+the snapshot is replayed from observations over the same trailing window and
+only includes live-rule, open/escalation rows.
 **Completion criteria:** a simulated series drives escalate and retire deterministically in tests;
 the digest names its own zero-output state loudly if no lesson reached `applied` in 60 days.
 **Does NOT include:** other hosts, retrieval surface.

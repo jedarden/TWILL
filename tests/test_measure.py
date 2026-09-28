@@ -97,6 +97,68 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(payload["lesson_id"], "L-00000001")
         self.assertEqual(payload["detector_id"], "D-01@1")
 
+    def test_measure_exposes_covered_and_omits_uncovered_cluster_snapshots(self):
+        rule = self.root / "rules" / "AGENTS.md"
+        rule.parent.mkdir()
+        rule.write_text("command-not-found:sqlite3\n", encoding="utf-8")
+        connection = twill_schema.connect(self.state)
+        self.addCleanup(connection.close)
+        covered_by = str(rule.resolve())
+        connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, stale) "
+            "VALUES (?, 'agents_md', 'sha-sqlite3', ?, 0)",
+            (covered_by, "2026-09-23T00:00:00+00:00"),
+        )
+        connection.execute(
+            "INSERT INTO rule_fts(text, path) VALUES (?, ?)",
+            ("command-not-found:sqlite3", covered_by),
+        )
+        connection.executemany(
+            "INSERT INTO cluster(detector_id, key, window_days, sessions, events, "
+            "first_seen, last_seen, score, covered_by, state) "
+            "VALUES (?, ?, 30, 2, 2, ?, ?, 0.0, ?, 'open')",
+            [
+                (
+                    "D-01",
+                    "command-not-found:sqlite3",
+                    "2026-09-23T00:00:00+00:00",
+                    "2026-09-23T00:00:00+00:00",
+                    covered_by,
+                ),
+                (
+                    "D-01",
+                    "command-not-found:other",
+                    "2026-09-23T00:00:00+00:00",
+                    "2026-09-23T00:00:00+00:00",
+                    None,
+                ),
+            ],
+        )
+        connection.commit()
+        self.seed(connection)
+
+        report = twill_measure.measure_lessons(
+            connection,
+            self.artifacts,
+            now="2026-09-24T12:00:00Z",
+        )
+
+        self.assertEqual(report.measurements, ())
+        self.assertEqual(len(report.covered_clusters), 1)
+        snapshot = report.covered_clusters[0]
+        self.assertEqual(snapshot.cluster_id, "D-01:command-not-found:sqlite3")
+        self.assertEqual(snapshot.detector_id, "D-01@1")
+        self.assertEqual(snapshot.covered_by, covered_by)
+        self.assertEqual((snapshot.sessions, snapshot.events), (2, 2))
+        self.assertNotIn(
+            "command-not-found:other",
+            [item.key for item in report.covered_clusters],
+        )
+        self.assertEqual(
+            report.as_dict()["covered_clusters"][0]["cluster_id"],
+            "D-01:command-not-found:sqlite3",
+        )
+
     def test_same_day_rerun_replaces_the_point_and_new_day_appends(self):
         self.lesson("L-00000001", state="applied:environment")
         connection = twill_schema.connect(self.state)

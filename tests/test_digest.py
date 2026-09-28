@@ -620,6 +620,47 @@ class DigestDiffTests(DigestStateCase):
         self.assertEqual(lesson.read_bytes(), lesson_before)
         self.assertEqual(measurement_path.read_bytes(), measurement_before)
 
+    def test_digest_separates_covered_recurrence_from_uncovered_findings(self):
+        rule = self.root / "rules" / "AGENTS.md"
+        rule.parent.mkdir()
+        rule.write_text("command-not-found:sqlite3\n", encoding="utf-8")
+        rule_path = str(rule.resolve())
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, stale) "
+            "VALUES (?, 'agents_md', 'sha-sqlite3', ?, 0)",
+            (rule_path, IN_WEEK.isoformat()),
+        )
+        self.connection.execute(
+            "INSERT INTO rule_fts(text, path) VALUES (?, ?)",
+            ("command-not-found:sqlite3", rule_path),
+        )
+        self.connection.execute(
+            "INSERT INTO cluster(detector_id, key, window_days, sessions, events, "
+            "first_seen, last_seen, score, covered_by, state) "
+            "VALUES ('D-01', 'command-not-found:sqlite3', 30, 2, 2, ?, ?, 0.0, ?, 'open')",
+            (IN_WEEK.isoformat(), IN_WEEK.isoformat(), rule_path),
+        )
+        seed_failure(self.connection, "sqlite3", 2, IN_WEEK)
+        seed_failure(self.connection, "ghost", 2, IN_WEEK)
+
+        report = self.build(registry=(MISSING_BINARY,))
+
+        self.assertEqual(
+            [(item.detector, item.key) for item in report.covered_escalations],
+            [("D-01@1", "command-not-found:sqlite3")],
+        )
+        self.assertEqual(
+            [finding.key for finding in report.findings],
+            ["command-not-found:ghost"],
+        )
+        covered = report.covered_escalations[0]
+        self.assertEqual(covered.covered_by, rule_path)
+        self.assertEqual(covered.current[:2], (2, 2))
+        data = twill_digest.render_data(report)
+        self.assertTrue(data["covered_escalations"][0]["escalation"])
+        self.assertEqual(data["covered_escalations"][0]["covered_by"], rule_path)
+        self.assertIn("covered recurrence escalations: 1", twill_digest.render_text(report))
+
     def test_digest_contains_a_read_only_retirement_proposal(self):
         self.connection.execute(
             "INSERT INTO rule_doc(path, layer, sha, indexed_at, stale) "

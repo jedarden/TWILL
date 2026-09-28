@@ -15,6 +15,10 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import twill_app  # noqa: E402
+import twill_detectors  # noqa: E402
+import twill_digest  # noqa: E402
+import twill_explainer  # noqa: E402
+import twill_measure  # noqa: E402
 import twill_ranker  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_config import TwillConfig  # noqa: E402
@@ -253,6 +257,7 @@ class CoverageTestCase(unittest.TestCase):
                 self.assertIn("estimated_tokens", row)
                 self.assertIn("estimated_waste_usd", row)
 
+
     def test_rank_command_labels_every_human_waste_figure_as_estimated(self):
         self.add_cluster("command-not-found:sqlite3")
         self.connection.execute(
@@ -285,6 +290,100 @@ class CoverageTestCase(unittest.TestCase):
         self.assertIn("estimated tokens: 60.00", rendered)
         self.assertIn("estimated waste: 0.125000 USD", rendered)
 
+
+class CoveredRecurrenceEndToEndTests(unittest.TestCase):
+    """A covered recurrence takes the escalation lane across every surface."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.root = Path(self._temporary.name)
+        self.state_dir = self.root / "state"
+        self.artifacts = self.root / "artifacts"
+        self.artifacts.mkdir()
+        self.rules_dir = self.root / "rules"
+        self.rules_dir.mkdir()
+        self.rule_path = self.rules_dir / "AGENTS.md"
+        self.rule_path.write_text("command-not-found:sqlite3\n", encoding="utf-8")
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def seed_failure(self, program: str, count: int = 2) -> None:
+        self.connection.executemany(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, program, "
+            "signature, sig_hash) VALUES (?, ?, ?, 'run_failed', ?, ?, ?)",
+            [
+                (
+                    f"{program}-{index}",
+                    "2026-09-16T12:00:00+00:00",
+                    "2026-09-16T12:00:00+00:00",
+                    program,
+                    "command not found",
+                    f"{program}-{index}",
+                )
+                for index in range(count)
+            ],
+        )
+
+    def test_detect_rank_explain_digest_and_measure_keep_the_lanes_distinct(self):
+        self.seed_failure("sqlite3")
+        self.seed_failure("ghost")
+        self.connection.commit()
+
+        detected = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.MISSING_BINARY,),
+            now="2026-09-20T18:00:00+00:00",
+        )
+        self.assertEqual(detected.exit_code, 0)
+        ranked = twill_ranker.run_rank(
+            self.connection,
+            (f"memory:{self.rules_dir}/*.md",),
+            top_k=10,
+            as_of="2026-09-20T18:00:00+00:00",
+        )
+
+        self.assertEqual(
+            [row.key for row in ranked.ranking.clusters],
+            ["command-not-found:ghost"],
+        )
+        self.assertEqual(
+            [row.key for row in ranked.ranking.escalations],
+            ["command-not-found:sqlite3"],
+        )
+        prompt_clusters = twill_explainer.load_candidate_prompt_clusters(
+            self.connection, top_k=10
+        )
+        prompt = twill_explainer.build_prompt(prompt_clusters)
+        self.assertIn("D-01:command-not-found:ghost", prompt)
+        self.assertNotIn("D-01:command-not-found:sqlite3", prompt)
+
+        digest = twill_digest.build_digest(
+            self.state_dir,
+            (2026, 38),
+            registry=(twill_detectors.MISSING_BINARY,),
+        )
+        self.assertEqual(
+            [item.key for item in digest.covered_escalations],
+            ["command-not-found:sqlite3"],
+        )
+        self.assertEqual(
+            [item.key for item in digest.findings],
+            ["command-not-found:ghost"],
+        )
+
+        measured = twill_measure.measure_lessons(
+            self.connection,
+            self.artifacts,
+            now="2026-09-20T18:00:00Z",
+            registry=(twill_detectors.MISSING_BINARY,),
+        )
+        self.assertEqual(measured.measurements, ())
+        self.assertEqual(
+            [item.key for item in measured.covered_clusters],
+            ["command-not-found:sqlite3"],
+        )
 
 if __name__ == "__main__":
     unittest.main()
