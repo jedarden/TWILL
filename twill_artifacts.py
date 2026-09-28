@@ -226,6 +226,15 @@ def _validate_lines(text: str, *, label: str) -> None:
             )
 
 
+def _validate_redaction(text: str, *, label: str) -> None:
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        content = line.strip()
+        if redact_text(content) != content:
+            raise ArtifactContractError(
+                f"{label} line {line_number} contains unredacted content"
+            )
+
+
 def _validate_lesson(path: Path, *, repo_root: Path | None) -> object:
     from twill_lessons import load_lesson
 
@@ -297,7 +306,7 @@ def _validate_measurement_json(path: Path, *, label: str) -> None:
 
 def _validate_guard(path: Path, lesson_id: str, *, label: str) -> None:
     text = _read_text(path, label=label)
-    _validate_lines(text, label=f"guard {path.name}")
+    _validate_redaction(text, label=f"guard {path.name}")
     if path.name.endswith(".hook.json"):
         payload = _read_json(path, label=f"guard {path.name}")
         if not isinstance(payload, dict):
