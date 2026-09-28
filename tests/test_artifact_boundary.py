@@ -5,8 +5,11 @@ from __future__ import annotations
 import hashlib
 import sys
 import tempfile
+import time
 import unittest
+from datetime import datetime
 from pathlib import Path
+from unittest import mock
 
 ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
@@ -18,7 +21,7 @@ import twill_measure  # noqa: E402
 import twill_schema  # noqa: E402
 import twill_lessons  # noqa: E402
 from twill_config import ConfigError, TwillConfig  # noqa: E402
-from twill_artifacts import read_manifest  # noqa: E402
+from twill_artifacts import read_manifest, write_manifest  # noqa: E402
 from twill_ranker import RankedCluster  # noqa: E402
 
 
@@ -147,11 +150,14 @@ class ArtifactBoundaryTests(unittest.TestCase):
 
     def _write_guards(self, record):
         writers = (
+            twill_guards.write_environment_guard,
             twill_guards.write_hook_guard,
-            twill_guards.write_wrapper_guard,
             twill_guards.write_gate_guard,
+            twill_guards.write_wrapper_guard,
+            twill_guards.write_skill_guard,
             twill_guards.write_agents_md_guard,
             twill_guards.write_memory_guard,
+            twill_guards.write_retrieval_guard,
         )
         paths = []
         for writer in writers:
@@ -162,6 +168,69 @@ class ArtifactBoundaryTests(unittest.TestCase):
                 {entry["path"] for entry in read_manifest(self.artifacts, repo_root=ROOT)["artifacts"]},
             )
         return tuple(paths)
+
+    def _manifest_timestamp(self, manifest):
+        return datetime.fromisoformat(
+            manifest["generated_at"].replace("Z", "+00:00")
+        )
+
+    def _assert_complete_manifest(self):
+        manifest = read_manifest(self.artifacts, repo_root=ROOT)
+        schemas = {
+            "lessons": "twill-lesson/v1",
+            "digests": "twill-digest/v1",
+            "measurements": "twill-measurement/v1",
+            "guards": "twill-guard/v1",
+        }
+        expected = {}
+        for namespace, schema in schemas.items():
+            directory = self.artifacts / namespace
+            if not directory.exists():
+                continue
+            for path in directory.iterdir():
+                if not path.is_file():
+                    continue
+                content = path.read_bytes()
+                relative = path.relative_to(self.artifacts).as_posix()
+                expected[relative] = {
+                    "bytes": len(content),
+                    "path": relative,
+                    "schema": schema,
+                    "sha256": hashlib.sha256(content).hexdigest(),
+                }
+
+        self.assertEqual(
+            {entry["path"] for entry in manifest["artifacts"]},
+            set(expected),
+        )
+        for entry in manifest["artifacts"]:
+            self.assertEqual(entry, expected[entry["path"]])
+        timestamp = self._manifest_timestamp(manifest)
+        self.assertIsNotNone(timestamp.tzinfo)
+        return manifest
+
+    def _assert_failed_writer_restored(self, operation, target):
+        previous_manifest = (self.artifacts / "manifest.json").read_bytes()
+        with mock.patch(
+            "twill_artifacts.write_manifest",
+            side_effect=RuntimeError("injected manifest failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                operation()
+
+        self.assertFalse(target.exists(), target)
+        self.assertEqual(
+            (self.artifacts / "manifest.json").read_bytes(), previous_manifest
+        )
+        self._assert_complete_manifest()
+        self.assertEqual(
+            [
+                path
+                for path in self.artifacts.rglob("*")
+                if path.is_file() and path.name.startswith(".")
+            ],
+            [],
+        )
 
     def test_every_exported_writer_stays_external_and_private(self):
         record = self._write_lesson(self.artifacts)
@@ -193,17 +262,151 @@ class ArtifactBoundaryTests(unittest.TestCase):
                 Path("lessons") / f"{LESSON_ID}.md",
                 Path("measurements") / f"{LESSON_ID}.jsonl",
                 Path("digests") / f"{WEEK_LABEL}.txt",
+                Path("guards") / f"{LESSON_ID}.environment.md",
                 Path("guards") / f"{LESSON_ID}.hook.json",
-                Path("guards") / f"{LESSON_ID}.wrapper.sh",
                 Path("guards") / f"{LESSON_ID}.gate.txt",
+                Path("guards") / f"{LESSON_ID}.wrapper.sh",
+                Path("guards") / f"{LESSON_ID}.skill.md",
                 Path("guards") / f"{LESSON_ID}.agents.md",
                 Path("guards") / f"{LESSON_ID}.memory.md",
+                Path("guards") / f"{LESSON_ID}.retrieval.md",
                 Path("manifest.json"),
             },
         )
         for path in (self.artifacts, *self.artifacts.rglob("*")):
             self.assertFalse(path.is_symlink(), path)
             self.assertEqual(path.stat().st_mode & 0o777, 0o700 if path.is_dir() else 0o600)
+
+    def test_every_writer_refreshes_complete_manifest_metadata(self):
+        write_manifest(
+            self.artifacts,
+            generated_at="2026-09-27T00:00:00Z",
+            repo_root=ROOT,
+        )
+        previous = self._assert_complete_manifest()
+
+        time.sleep(0.001)
+        record = self._write_lesson(self.artifacts)
+        current = self._assert_complete_manifest()
+        self.assertGreater(
+            self._manifest_timestamp(current), self._manifest_timestamp(previous)
+        )
+
+        time.sleep(0.001)
+        measurement = self._write_measurement(record)
+        current = self._assert_complete_manifest()
+        self.assertGreater(
+            self._manifest_timestamp(current), self._manifest_timestamp(previous)
+        )
+        self.assertTrue(measurement.is_file())
+        previous = current
+
+        for writer in (
+            twill_guards.write_environment_guard,
+            twill_guards.write_hook_guard,
+            twill_guards.write_gate_guard,
+            twill_guards.write_wrapper_guard,
+            twill_guards.write_skill_guard,
+            twill_guards.write_agents_md_guard,
+            twill_guards.write_memory_guard,
+            twill_guards.write_retrieval_guard,
+        ):
+            with self.subTest(writer=writer.__name__):
+                time.sleep(0.001)
+                writer(self.artifacts, record, repo_root=ROOT)
+                current = self._assert_complete_manifest()
+                self.assertGreater(
+                    self._manifest_timestamp(current),
+                    self._manifest_timestamp(previous),
+                )
+                previous = current
+
+        time.sleep(0.001)
+        self._write_digest(self.artifacts)
+        current = self._assert_complete_manifest()
+        self.assertGreater(
+            self._manifest_timestamp(current), self._manifest_timestamp(previous)
+        )
+
+        self.assertEqual(
+            {entry["path"] for entry in current["artifacts"]},
+            {
+                f"lessons/{LESSON_ID}.md",
+                f"measurements/{LESSON_ID}.jsonl",
+                f"digests/{WEEK_LABEL}.txt",
+                *{
+                    f"guards/{LESSON_ID}{suffix}"
+                    for suffix in (
+                        ".environment.md",
+                        ".hook.json",
+                        ".gate.txt",
+                        ".wrapper.sh",
+                        ".skill.md",
+                        ".agents.md",
+                        ".memory.md",
+                        ".retrieval.md",
+                    )
+                },
+            },
+        )
+
+    def test_manifest_failure_rolls_back_each_writer_without_stale_publication(self):
+        write_manifest(self.artifacts, repo_root=ROOT)
+        self._assert_failed_writer_restored(
+            lambda: twill_explainer.persist_lesson_drafts(
+                (self._draft(),),
+                (self._candidate(),),
+                TwillConfig(artifacts_root=self.artifacts),
+                repo_root=ROOT,
+            ),
+            self.artifacts / "lessons" / f"{LESSON_ID}.md",
+        )
+        self._assert_failed_writer_restored(
+            lambda: twill_digest.write_digest_file(
+                "empty | $ twill digest --week 2026-W38 --stdout "
+                "--state-dir /tmp/twill-state\n",
+                self.artifacts,
+                WEEK,
+                repo_root=ROOT,
+            ),
+            self.artifacts / "digests" / f"{WEEK_LABEL}.txt",
+        )
+
+        record = self._write_lesson(self.artifacts)
+        self._assert_failed_writer_restored(
+            lambda: twill_guards.write_hook_guard(
+                self.artifacts,
+                record,
+                repo_root=ROOT,
+            ),
+            self.artifacts / "guards" / f"{LESSON_ID}.hook.json",
+        )
+
+        twill_lessons.accept_lesson(self.artifacts, record.id, repo_root=ROOT)
+        connection = twill_schema.connect(self.state)
+        self.addCleanup(connection.close)
+        connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, program, "
+            "signature, sig_hash) VALUES (?, ?, ?, 'run_failed', ?, ?, ?)",
+            (
+                "session-1",
+                "2026-09-23T00:00:00+00:00",
+                "2026-09-23T00:00:00+00:00",
+                "sqlite3",
+                "sqlite3: command not found",
+                "boundary-hash",
+            ),
+        )
+        connection.commit()
+        self._assert_failed_writer_restored(
+            lambda: twill_measure.measure_lessons(
+                connection,
+                self.artifacts,
+                now="2026-09-24T12:00:00Z",
+                repo_root=ROOT,
+            ),
+            self.artifacts / "measurements" / f"{LESSON_ID}.jsonl",
+        )
 
     def test_each_writer_rejects_unset_and_in_tree_roots_before_writing(self):
         record = self._write_lesson(self.artifacts)
