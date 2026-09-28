@@ -1459,11 +1459,11 @@ def ingest_command(
         retention_seconds=config.retention,
     )
     try:
-        # EC-05: on every enumerated run, flag upstream files that vanished.
-        # The sweep runs before the no-settled-files error so a fully cleaned
-        # transcript tree still records its missing paths (evidence survives).
-        if args.file is None:
-            store.mark_missing_paths()
+        # EC-05: on every ingest run, flag upstream files that vanished.  The
+        # sweep is deliberately independent of the selected candidate list,
+        # including for --file, and runs before the no-settled-files error so a
+        # fully cleaned transcript tree still records its missing paths.
+        store.mark_missing_paths()
         if not files and (
             args.file is not None
             or (args.source is not None and _has_missing_source_root(source_patterns))

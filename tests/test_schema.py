@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import twill_app  # noqa: E402
+import twill_cursor  # noqa: E402
 import twill_rulecorpus  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_contract import EXIT_RUNTIME_ERROR, CliError  # noqa: E402
@@ -198,10 +199,13 @@ class SchemaContractTests(unittest.TestCase):
         # data and gains the column on the next writer open (plan §8.4:
         # additive only; a fresh database gets it from the DDL directly) —
         # and the same convergence adds cursor.parse_error_runs (EC-04).
+        legacy_path = self.state_dir.parent / "legacy.jsonl"
+        legacy_path.write_text("legacy transcript\n")
         self.connection.execute(
             "INSERT INTO cursor(path, session_id, source, identity_sha, size, mtime_ns, "
             "last_offset, first_seen, last_indexed_at) "
-            "VALUES ('/t/old.jsonl', 's1', 'claude', 'sha', 10, 1, 4, 'x', 'y')"
+            "VALUES (?, 's1', 'claude', 'sha', 10, 1, 4, 'x', 'y')",
+            (str(legacy_path),),
         )
         self.connection.commit()
         self.connection.close()
@@ -222,6 +226,7 @@ class SchemaContractTests(unittest.TestCase):
         )
         legacy.commit()
         legacy.close()
+        legacy_path.unlink()
 
         migrated = twill_schema.connect(self.state_dir)
         self.addCleanup(migrated.close)
@@ -235,7 +240,33 @@ class SchemaContractTests(unittest.TestCase):
             "SELECT path, last_offset, parse_errors, parse_error_runs, path_missing "
             "FROM cursor"
         ).fetchone()
-        self.assertEqual(row, ("/t/old.jsonl", 4, 0, 0, 0))
+        self.assertEqual(row, (str(legacy_path), 4, 0, 0, 0))
+
+        # Migration must leave the row usable by the EC-05 sweep.  A missing
+        # path changes only path_missing; a returned path clears only that
+        # flag, preserving the committed offset and all other bookkeeping.
+        before_sweep = migrated.execute(
+            "SELECT path, session_id, source, identity_sha, size, mtime_ns, "
+            "last_offset, parse_errors, parse_error_runs, first_seen, "
+            "last_indexed_at, path_missing FROM cursor"
+        ).fetchone()
+        self.assertEqual(twill_cursor.mark_missing(migrated), 1)
+        after_missing = migrated.execute(
+            "SELECT path, session_id, source, identity_sha, size, mtime_ns, "
+            "last_offset, parse_errors, parse_error_runs, first_seen, "
+            "last_indexed_at, path_missing FROM cursor"
+        ).fetchone()
+        self.assertEqual(after_missing[:-1], before_sweep[:-1])
+        self.assertEqual(after_missing[-1], 1)
+        legacy_path.write_text("legacy transcript\n")
+        self.assertEqual(twill_cursor.mark_missing(migrated), 1)
+        after_return = migrated.execute(
+            "SELECT path, session_id, source, identity_sha, size, mtime_ns, "
+            "last_offset, parse_errors, parse_error_runs, first_seen, "
+            "last_indexed_at, path_missing FROM cursor"
+        ).fetchone()
+        self.assertEqual(after_return, before_sweep)
+        migrated.commit()
         # The migrated shape matches a fresh one exactly.
         fresh = twill_schema.connect(self.state_dir.parent / "fresh")
         self.addCleanup(fresh.close)

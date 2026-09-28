@@ -814,6 +814,130 @@ class CursorCliTests(unittest.TestCase):
             self.assertEqual(flagged, (1,))
             self.assertEqual(survivors, 1)
 
+    def test_cli_sweep_preserves_cursor_fields_and_clears_on_young_return(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            transcript = root / "returning.jsonl"
+            payload = (claude_line("cli-returning", "stable evidence", 0) + "\n").encode()
+            transcript.write_bytes(payload)
+
+            first = self.run_cli(
+                "ingest", "--source", str(root), "--settle", "0",
+                "--limit", "5", "--state-dir", str(state),
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            columns = (
+                "path, session_id, source, identity_sha, size, mtime_ns, "
+                "last_offset, parse_errors, first_seen, last_indexed_at, path_missing"
+            )
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                before = connection.execute(
+                    f"SELECT {columns} FROM cursor WHERE path = ?", (str(transcript),)
+                ).fetchone()
+                events_before = connection.execute(
+                    "SELECT source_line, event_index, text FROM transcript_event"
+                ).fetchall()
+                observations_before = connection.execute(
+                    "SELECT session_id, kind, excerpt FROM observation"
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertIsNotNone(before)
+            self.assertEqual(before[-1], 0)
+
+            transcript.unlink()
+            vanished = self.run_cli(
+                "ingest", "--source", str(root), "--settle", "2h",
+                "--state-dir", str(state),
+            )
+            self.assertNotEqual(vanished.returncode, 0)
+            self.assertIn("no settled", vanished.stderr)
+
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                missing = connection.execute(
+                    f"SELECT {columns} FROM cursor WHERE path = ?", (str(transcript),)
+                ).fetchone()
+                self.assertEqual(missing[:-1], before[:-1])
+                self.assertEqual(missing[-1], 1)
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT source_line, event_index, text FROM transcript_event"
+                    ).fetchall(),
+                    events_before,
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT session_id, kind, excerpt FROM observation"
+                    ).fetchall(),
+                    observations_before,
+                )
+            finally:
+                connection.close()
+
+            # The returned file is intentionally young, so this run still
+            # finds no settled file.  Sweeping must nevertheless clear only
+            # path_missing and leave the committed offset intact.
+            transcript.write_bytes(payload)
+            returned = self.run_cli(
+                "ingest", "--source", str(root), "--settle", "2h",
+                "--state-dir", str(state),
+            )
+            self.assertNotEqual(returned.returncode, 0)
+            self.assertIn("no settled", returned.stderr)
+
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                present_again = connection.execute(
+                    f"SELECT {columns} FROM cursor WHERE path = ?", (str(transcript),)
+                ).fetchone()
+                self.assertEqual(present_again[:-1], before[:-1])
+                self.assertEqual(present_again[-1], 0)
+            finally:
+                connection.close()
+
+    def test_cli_explicit_file_still_sweeps_other_stored_paths(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            selected = root / "selected.jsonl"
+            other = root / "other.jsonl"
+            selected.write_text(claude_line("cli-selected", "selected", 0) + "\n")
+            other.write_text(claude_line("cli-other", "other", 0) + "\n")
+
+            first = self.run_cli(
+                "ingest", "--source", str(root), "--settle", "0",
+                "--limit", "5", "--state-dir", str(state),
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+            other.unlink()
+
+            selected_run = self.run_cli(
+                "ingest", "--file", str(selected), "--settle", "0",
+                "--state-dir", str(state),
+            )
+            self.assertEqual(selected_run.returncode, 0, selected_run.stderr)
+
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT path_missing FROM cursor WHERE path = ?", (str(other),)
+                    ).fetchone(),
+                    (1,),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM observation WHERE session_id = 'cli-other'"
+                    ).fetchone(),
+                    (1,),
+                )
+            finally:
+                connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()

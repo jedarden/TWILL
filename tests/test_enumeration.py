@@ -149,6 +149,120 @@ class ConfiguredGlobIngestTests(unittest.TestCase):
                 ],
             )
 
+    def test_narrowed_glob_does_not_hide_a_missing_stored_path(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            home = root / "home"
+            projects = root / ".claude" / "projects"
+            kept = projects / "kept" / "session.jsonl"
+            vanished = projects / "retired" / "session.jsonl"
+            for path, session_id, text in (
+                (kept, "glob-kept", "kept evidence"),
+                (vanished, "glob-retired", "retired evidence"),
+            ):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(
+                    json.dumps(
+                        {
+                            "type": "user",
+                            "sessionId": session_id,
+                            "message": {"role": "user", "content": text},
+                        }
+                    )
+                    + "\n"
+                )
+
+            config_dir = home / ".config" / "twill"
+            config_dir.mkdir(parents=True)
+            config_path = config_dir / "config.toml"
+
+            def configure(pattern: Path) -> None:
+                config_path.write_text(
+                    "\n".join(
+                        [
+                            'settle_window = "0"',
+                            f'source_globs = ["{pattern}"]',
+                            f'artifacts_root = "{root / "artifacts"}"',
+                        ]
+                    )
+                    + "\n"
+                )
+
+            configure(projects / "*" / "*.jsonl")
+            state = root / "state"
+            first = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI),
+                    "ingest",
+                    "--limit",
+                    "10",
+                    "--state-dir",
+                    str(state),
+                ],
+                cwd=ROOT,
+                env={**os.environ, "HOME": str(home)},
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(first.returncode, 0, first.stderr)
+
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                offsets = dict(
+                    connection.execute(
+                        "SELECT path, last_offset FROM cursor ORDER BY path"
+                    ).fetchall()
+                )
+            finally:
+                connection.close()
+            vanished.unlink()
+
+            configure(projects / "kept" / "*.jsonl")
+            second = subprocess.run(
+                [
+                    sys.executable,
+                    str(CLI),
+                    "ingest",
+                    "--limit",
+                    "10",
+                    "--state-dir",
+                    str(state),
+                ],
+                cwd=ROOT,
+                env={**os.environ, "HOME": str(home)},
+                check=False,
+                text=True,
+                capture_output=True,
+            )
+            self.assertEqual(second.returncode, 0, second.stderr)
+
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT path_missing, last_offset FROM cursor WHERE path = ?",
+                        (str(vanished.resolve()),),
+                    ).fetchone(),
+                    (1, offsets[str(vanished.resolve())]),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT path_missing, last_offset FROM cursor WHERE path = ?",
+                        (str(kept.resolve()),),
+                    ).fetchone(),
+                    (0, offsets[str(kept.resolve())]),
+                )
+                self.assertEqual(
+                    connection.execute(
+                        "SELECT count(*) FROM observation WHERE session_id = 'glob-retired'"
+                    ).fetchone(),
+                    (1,),
+                )
+            finally:
+                connection.close()
+
 
 if __name__ == "__main__":
     unittest.main()
