@@ -190,12 +190,17 @@ def diff_manifests(
 def permitted_artifact_path(relative: str) -> bool:
     """Whether one artifacts_root path is a sanctioned workflow output.
 
-    Only the lesson drafts, the guard templates, and the directories that
-    hold them qualify -- any other artifact-side change is a surprise the
+    Lesson drafts, guard templates, their directories, and the v1 interchange
+    manifest qualify -- any other artifact-side change is a surprise the
     accounting assertion names.
     """
 
-    if relative in {"artifacts", "artifacts/lessons", "artifacts/guards"}:
+    if relative in {
+        "artifacts",
+        "artifacts/manifest.json",
+        "artifacts/lessons",
+        "artifacts/guards",
+    }:
         return True
     parts = relative.split("/")
     return len(parts) == 3 and parts[0] == "artifacts" and (
@@ -614,6 +619,7 @@ class ExplainApplyNeverMutateRuleSourcesTests(unittest.TestCase):
                 f"artifacts/lessons/{lesson_id}.md"
                 for lesson_id in self.lesson_ids.values()
             ]
+            + ["artifacts/manifest.json"]
         )
         self.assertEqual(artifact_added, expected)
         artifact_changed = [
