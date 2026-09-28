@@ -27,23 +27,38 @@ if TYPE_CHECKING:
 
 
 GUARD_DIRNAME = "guards"
+ENVIRONMENT_SUFFIX = ".environment.md"
 HOOK_SUFFIX = ".hook.json"
 WRAPPER_SUFFIX = ".wrapper.sh"
 GATE_SUFFIX = ".gate.txt"
+SKILL_SUFFIX = ".skill.md"
 AGENTS_MD_SUFFIX = ".agents.md"
 MEMORY_SUFFIX = ".memory.md"
+RETRIEVAL_SUFFIX = ".retrieval.md"
 HOOK_TOOL_MATCHER = "Write|Edit|MultiEdit|Bash"
 HOOK_COMMAND = "python3 ~/.claude/hooks/org-rule-guard.py"
 HOOK_TIMEOUT_SECONDS = 10
 GUARD_SCHEMA = "twill-guard/v1"
 MAX_GUARD_BYTES = 64 * 1024
-TEMPLATE_LAYERS = ("hook", "wrapper", "gate", "agents_md", "memory")
+TEMPLATE_LAYERS = (
+    "environment",
+    "hook",
+    "gate",
+    "wrapper",
+    "skill",
+    "agents_md",
+    "memory",
+    "retrieval_only",
+)
 _TEMPLATE_SUFFIXES = {
+    "environment": ENVIRONMENT_SUFFIX,
     "hook": HOOK_SUFFIX,
     "wrapper": WRAPPER_SUFFIX,
     "gate": GATE_SUFFIX,
+    "skill": SKILL_SUFFIX,
     "agents_md": AGENTS_MD_SUFFIX,
     "memory": MEMORY_SUFFIX,
+    "retrieval_only": RETRIEVAL_SUFFIX,
 }
 
 
@@ -194,6 +209,38 @@ def render_hook_guard(record: LessonRecord, *, target_layer: str = "hook") -> st
     return text
 
 
+def render_environment_guard(
+    record: LessonRecord, *, target_layer: str = "environment"
+) -> str:
+    """Render a human-only proposal for repairing the execution environment."""
+
+    if target_layer != "environment":
+        raise _guard_error(
+            f"environment guard generation does not support template {target_layer!r}",
+            "select the environment template explicitly",
+        )
+    _require_template_layer(record, target_layer)
+    lesson_id, detector, summary = _safe_template_fields(record)
+    key = record.key
+    command = key.partition("command-not-found:")[2]
+    if not command:
+        command = key
+    verification = f"command -v {shlex.quote(command)}"
+    text = (
+        f"# TWILL environment-fix proposal {lesson_id}\n\n"
+        "<!-- Human-only proposal; TWILL never changes the host environment. -->\n"
+        f"detector: {detector}\n"
+        f"recurring_key: {json.dumps(key, ensure_ascii=False)}\n"
+        f"summary: {json.dumps(summary, ensure_ascii=False)}\n"
+        "direct_change: true\n"
+        "action: install or repair the dependency represented by recurring_key\n"
+        f"verification: {json.dumps(verification, ensure_ascii=False)}\n\n"
+        "Review the dependency, apply the environment fix manually, and run the\n"
+        "verification command before treating this proposal as installed.\n"
+    )
+    return _bounded_template(text)
+
+
 def render_wrapper_guard(record: LessonRecord, *, target_layer: str = "wrapper") -> str:
     """Render a shell wrapper skeleton that a human can adapt and install."""
 
@@ -237,6 +284,32 @@ def render_gate_guard(record: LessonRecord, *, target_layer: str = "gate") -> st
     lesson_id, detector, summary = _safe_template_fields(record)
     key = record.key
     text = f"- [ ] TWILL guard {lesson_id} ({detector}): {summary} [key: {key}]\n"
+    return _bounded_template(text)
+
+
+def render_skill_guard(record: LessonRecord, *, target_layer: str = "skill") -> str:
+    """Render a reviewed skill fragment for a recurring agent workflow."""
+
+    if target_layer != "skill":
+        raise _guard_error(
+            f"skill guard generation does not support template {target_layer!r}",
+            "select the skill template explicitly",
+        )
+    _require_template_layer(record, target_layer)
+    lesson_id, detector, summary = _safe_template_fields(record)
+    key = record.key
+    text = (
+        "---\n"
+        f"id: {lesson_id}\n"
+        f"detector: {detector}\n"
+        f"trigger: {json.dumps(key, ensure_ascii=False)}\n"
+        "direct_change: true\n"
+        "---\n"
+        f"# TWILL skill proposal {lesson_id}\n\n"
+        f"When the recurring condition {json.dumps(key, ensure_ascii=False)} appears, "
+        f"{summary} Review and install this guidance in the owning skill.\n"
+        "\nThis is a human-installable proposal; TWILL does not edit skill files.\n"
+    )
     return _bounded_template(text)
 
 
@@ -284,6 +357,37 @@ def render_memory_guard(record: LessonRecord, *, target_layer: str = "memory") -
     return _bounded_template(text)
 
 
+def render_retrieval_guard(
+    record: LessonRecord, *, target_layer: str = "retrieval_only"
+) -> str:
+    """Render a pull-only record when no direct change is justified."""
+
+    if target_layer != "retrieval_only":
+        raise _guard_error(
+            f"retrieval guard generation does not support template {target_layer!r}",
+            "select the retrieval_only template explicitly",
+        )
+    _require_template_layer(record, target_layer)
+    lesson_id, detector, summary = _safe_template_fields(record)
+    key = record.key
+    text = (
+        "---\n"
+        f"id: {lesson_id}\n"
+        f"detector: {detector}\n"
+        f"trigger: {json.dumps(key, ensure_ascii=False)}\n"
+        "layer: retrieval_only\n"
+        "direct_change: false\n"
+        "---\n"
+        f"# TWILL retrieval-only record {lesson_id}\n\n"
+        f"{summary}\n\n"
+        "No direct code, environment, hook, wrapper, skill, AGENTS.md, or memory "
+        "change is appropriate from the current evidence. Keep this lesson available "
+        "as pull-only retrieval context and revisit it if a deterministic prevention "
+        "point is established.\n"
+    )
+    return _bounded_template(text)
+
+
 def _bounded_template(text: str) -> str:
     if len(text.encode("utf-8")) > MAX_GUARD_BYTES:
         raise _guard_error("generated guard template exceeds the artifact size limit")
@@ -294,11 +398,14 @@ def render_guard(record: LessonRecord, *, target_layer: str) -> str:
     """Render the selected human-installable template for a lesson."""
 
     renderers = {
+        "environment": render_environment_guard,
         "hook": render_hook_guard,
         "wrapper": render_wrapper_guard,
         "gate": render_gate_guard,
+        "skill": render_skill_guard,
         "agents_md": render_agents_md_guard,
         "memory": render_memory_guard,
+        "retrieval_only": render_retrieval_guard,
     }
     try:
         renderer = renderers[target_layer]
@@ -397,6 +504,17 @@ def write_wrapper_guard(
     return write_guard(artifacts_root, record, target_layer="wrapper", repo_root=repo_root)
 
 
+def write_environment_guard(
+    artifacts_root: Path,
+    record: LessonRecord,
+    *,
+    repo_root: Path | None = None,
+) -> Path:
+    return write_guard(
+        artifacts_root, record, target_layer="environment", repo_root=repo_root
+    )
+
+
 def write_gate_guard(
     artifacts_root: Path,
     record: LessonRecord,
@@ -404,6 +522,15 @@ def write_gate_guard(
     repo_root: Path | None = None,
 ) -> Path:
     return write_guard(artifacts_root, record, target_layer="gate", repo_root=repo_root)
+
+
+def write_skill_guard(
+    artifacts_root: Path,
+    record: LessonRecord,
+    *,
+    repo_root: Path | None = None,
+) -> Path:
+    return write_guard(artifacts_root, record, target_layer="skill", repo_root=repo_root)
 
 
 def write_agents_md_guard(
@@ -424,30 +551,50 @@ def write_memory_guard(
     return write_guard(artifacts_root, record, target_layer="memory", repo_root=repo_root)
 
 
+def write_retrieval_guard(
+    artifacts_root: Path,
+    record: LessonRecord,
+    *,
+    repo_root: Path | None = None,
+) -> Path:
+    return write_guard(
+        artifacts_root, record, target_layer="retrieval_only", repo_root=repo_root
+    )
+
+
 __all__ = [
     "GUARD_DIRNAME",
     "GUARD_SCHEMA",
     "TEMPLATE_LAYERS",
     "AGENTS_MD_SUFFIX",
+    "ENVIRONMENT_SUFFIX",
     "GATE_SUFFIX",
     "HOOK_COMMAND",
     "HOOK_SUFFIX",
     "HOOK_TIMEOUT_SECONDS",
     "HOOK_TOOL_MATCHER",
     "MEMORY_SUFFIX",
+    "RETRIEVAL_SUFFIX",
+    "SKILL_SUFFIX",
     "WRAPPER_SUFFIX",
     "guard_path",
     "guards_dir",
     "render_agents_md_guard",
+    "render_environment_guard",
     "render_gate_guard",
     "render_guard",
     "render_hook_guard",
     "render_memory_guard",
+    "render_retrieval_guard",
+    "render_skill_guard",
     "render_wrapper_guard",
     "write_agents_md_guard",
+    "write_environment_guard",
     "write_gate_guard",
     "write_guard",
     "write_hook_guard",
     "write_memory_guard",
+    "write_retrieval_guard",
+    "write_skill_guard",
     "write_wrapper_guard",
 ]

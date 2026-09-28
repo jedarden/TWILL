@@ -10,8 +10,11 @@ sys.path.insert(0, str(ROOT))
 
 from twill_contract import ValidationError  # noqa: E402
 from twill_router import (  # noqa: E402
+    DIRECT_CHANGE_LAYERS,
+    NO_DIRECT_CHANGE_LAYERS,
     ROUTING_LAYER_ORDER,
     bead_create_command,
+    has_direct_change,
     rank_routing_layers,
     recommend_routing,
 )
@@ -31,6 +34,10 @@ class RoutingTests(unittest.TestCase):
 
         self.assertEqual(ROUTING_LAYER_ORDER, expected)
         self.assertEqual(rank_routing_layers(reversed(expected)), expected)
+        self.assertEqual(DIRECT_CHANGE_LAYERS, expected[:-1])
+        self.assertEqual(NO_DIRECT_CHANGE_LAYERS, ("retrieval_only",))
+        self.assertTrue(has_direct_change("environment"))
+        self.assertFalse(has_direct_change("retrieval_only"))
 
     def test_missing_binary_recommends_the_environment_fix(self):
         recommendation = recommend_routing(

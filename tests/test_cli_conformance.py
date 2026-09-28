@@ -350,11 +350,11 @@ class SuccessEnvelopeTests(ConformanceTestCase):
 class LessonVerbTests(ConformanceTestCase):
     """accept/apply/un-apply and dismiss on real operator actions."""
 
-    def write_draft(self, home):
+    def write_draft(self, home, key="command-not-found:cli"):
         artifacts = Path(home) / "artifacts"
         cluster = RankedCluster(
             "D-01",
-            "command-not-found:cli",
+            key,
             30,
             3,
             7,
@@ -371,7 +371,7 @@ class LessonVerbTests(ConformanceTestCase):
         path = write_lesson_files(
             (
                 LessonDraft(
-                    "D-01:command-not-found:cli",
+                    f"D-01:{key}",
                     "A command fails repeatedly. Install the command before retrying.",
                 ),
             ),
@@ -423,6 +423,45 @@ class LessonVerbTests(ConformanceTestCase):
         )
         envelope = self.assert_success_envelope(unapplied)
         self.assertEqual(envelope["data"]["lesson"]["state"], "accepted")
+
+    def test_apply_emits_environment_skill_and_retrieval_outcomes(self):
+        home = self.make_home()
+        state = Path(home) / "state-all-layers"
+        cases = (
+            ("command-not-found:environment", "environment", "twill-env"),
+            ("command-not-found:skill", "skill", "twill-skill"),
+            ("recurrence:retrieval", "retrieval_only", None),
+        )
+        for key, layer, bead in cases:
+            with self.subTest(layer=layer):
+                lesson_id = self.write_draft(home, key)
+                accepted = run_cli(
+                    home, "accept", lesson_id, "--json", "--state-dir", str(state)
+                )
+                self.assert_success_envelope(accepted)
+                args = [
+                    "apply",
+                    lesson_id,
+                    "--layer",
+                    layer,
+                    "--emit-guard",
+                    "--json",
+                    "--state-dir",
+                    str(state),
+                ]
+                if bead is not None:
+                    args[4:4] = ["--bead", bead]
+                applied = run_cli(home, *args)
+                envelope = self.assert_success_envelope(applied)
+                data = envelope["data"]
+                self.assertEqual(data["direct_change"], bead is not None)
+                self.assertIn(f"guards/{lesson_id}.", data["guard_artifact"])
+                artifact = home / "artifacts" / data["guard_artifact"]
+                if bead is None:
+                    self.assertNotIn("bead_create_command", data)
+                    self.assertIn("direct_change: false", artifact.read_text())
+                else:
+                    self.assertTrue(data["bead_create_command"].startswith("bead create"))
 
     def test_dismiss_known_cluster_envelope(self):
         home = self.make_home()

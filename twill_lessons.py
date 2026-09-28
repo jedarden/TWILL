@@ -30,10 +30,13 @@ VALID_STATES = frozenset(
 )
 MAX_FIELD_LENGTH = 240
 _GUARD_ARTIFACT_SUFFIXES = {
+    "environment": (".environment.md",),
     "hook": (".hook.json", ".gate.txt"),
     "wrapper": (".wrapper.sh",),
+    "skill": (".skill.md",),
     "agents_md": (".agents.md",),
     "memory": (".memory.md",),
+    "retrieval_only": (".retrieval.md",),
 }
 _REQUIRED_TOP_LEVEL = frozenset(
     {"id", "summary", "state", "detector", "key", "evidence", "routing", "backtest"}
@@ -342,9 +345,16 @@ def _validate_routing(value: object) -> dict[str, object]:
         )
     applied_at = _timestamp(routing["applied_at"], "routing.applied_at")
     bead = _redacted(routing["bead"], "routing.bead")
-    if applied is not None and (applied_at is None or bead is None):
+    missing_apply_timestamp = applied is not None and applied_at is None
+    missing_owner_bead = applied not in {None, "retrieval_only"} and bead is None
+    if missing_apply_timestamp or missing_owner_bead:
         raise _error(
             "an applied lesson must record routing.applied_at and routing.bead"
+        )
+    if applied == "retrieval_only" and bead is not None:
+        raise _error(
+            "a retrieval-only lesson must not record routing.bead",
+            "retrieval_only means no direct code or policy change is appropriate",
         )
     return {
         "recommended": recommended,
@@ -871,6 +881,11 @@ def _transition(
         if target.startswith("applied:"):
             if layer is not None and layer != record.layer:
                 raise _error("an applied lesson cannot change layers")
+            if record.layer == "retrieval_only" and bead is not None:
+                raise _error(
+                    "a retrieval-only lesson must not record routing.bead",
+                    "omit --bead when applying retrieval_only",
+                )
             if (
                 bead is not None
                 and _operator_token(bead, "bead") != record.routing["bead"]
@@ -898,7 +913,15 @@ def _transition(
     updates: dict[str, object] = {"state": target}
     if target.startswith("applied:"):
         applied_layer = target.split(":", 1)[1]
-        safe_bead = _operator_token(bead, "bead")
+        if applied_layer == "retrieval_only":
+            if bead is not None:
+                raise _error(
+                    "a retrieval-only lesson must not record routing.bead",
+                    "omit --bead when applying retrieval_only",
+                )
+            safe_bead = None
+        else:
+            safe_bead = _operator_token(bead, "bead")
         routing = dict(record.routing)
         routing.update(
             {
@@ -970,12 +993,16 @@ def apply_lesson(
     lesson_id: str | None = None,
     *,
     layer: str,
-    bead: object,
+    bead: object = None,
     applied_at: datetime | str | None = None,
     operator: bool = True,
     repo_root: Path | None = None,
 ) -> LessonRecord:
-    """Record an operator-applied routing layer and its owning bead."""
+    """Record an applied layer and its owner, if that layer changes anything.
+
+    ``retrieval_only`` is the intentional no-direct-change outcome. It records
+    when the operator selected retrieval, but it has no owning bead.
+    """
 
     return transition_lesson(
         artifacts_root_or_path,

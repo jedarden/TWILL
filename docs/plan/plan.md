@@ -778,10 +778,13 @@ same empty block.
 `accept`/`apply`/`unapply`/`dismiss`, `twill lessons` listing, and the **guard generator**: each lesson ships
 the mechanical artifact that would stop it at its recommended layer — an `org-rule-guard`/ICG
 matcher fragment, a wrapper-script skeleton, a gate line, an `AGENTS.md` paragraph, or a memory leaf
-with frontmatter — written to `guards/<lesson-id>.*` inside TWILL and installed by nobody but a
-human. Prose describes a rule; an artifact is one someone can actually adopt in a minute.
+with frontmatter — plus an environment-fix proposal, a skill fragment, or a retrieval-only record —
+written to `guards/<lesson-id>.*` inside TWILL and installed by nobody but a human. Prose describes
+a rule; an artifact is one someone can actually adopt in a minute. Retrieval-only records explicitly
+carry `direct_change: false` and do not create an owner-repo bead.
 **Completion criteria:** state machine tests including the refusal to auto-accept; an applied lesson
-records layer + timestamp + bead id; the open-path test proves no write outside TWILL's two trees.
+records layer + timestamp and an owner bead for direct changes; the open-path test proves no write
+outside TWILL's two trees.
 **Routing decision (2026-09-24):** the router owns the exact strongest-to-weakest tuple
 `environment`, `hook`, `wrapper`, `skill`, `agents_md`, `memory`, `retrieval_only` and records the
 strongest layer justified by structured cluster identity, never by the model-authored summary. A

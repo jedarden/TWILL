@@ -296,10 +296,13 @@ class LessonLifecycleTests(unittest.TestCase):
 
     def test_per_layer_guard_templates_are_human_installable(self):
         cases = (
+            ("environment", "environment", twill_guards.ENVIRONMENT_SUFFIX),
             ("wrapper", "wrapper", twill_guards.WRAPPER_SUFFIX),
             ("gate", "hook", twill_guards.GATE_SUFFIX),
+            ("skill", "skill", twill_guards.SKILL_SUFFIX),
             ("agents_md", "agents_md", twill_guards.AGENTS_MD_SUFFIX),
             ("memory", "memory", twill_guards.MEMORY_SUFFIX),
+            ("retrieval_only", "retrieval_only", twill_guards.RETRIEVAL_SUFFIX),
         )
         for template, layer, suffix in cases:
             with self.subTest(template=template):
@@ -310,7 +313,7 @@ class LessonLifecycleTests(unittest.TestCase):
                     self.artifacts,
                     lesson_id,
                     layer=layer,
-                    bead=f"twill-{template}",
+                    bead=None if layer == "retrieval_only" else f"twill-{template}",
                     applied_at="2026-09-27T00:00:00Z",
                 )
 
@@ -325,12 +328,21 @@ class LessonLifecycleTests(unittest.TestCase):
                 self.assertIn(lesson_id, rendered)
                 self.assertIn("D-01", rendered)
                 self.assertIn("template:", rendered)
-                if template == "wrapper":
+                if template == "environment":
+                    self.assertIn("environment-fix proposal", rendered)
+                    self.assertIn("direct_change: true", rendered)
+                elif template == "wrapper":
                     self.assertTrue(rendered.startswith("#!/bin/sh\n"))
                 elif template == "gate":
                     self.assertTrue(rendered.startswith("- [ ] TWILL guard"))
+                elif template == "skill":
+                    self.assertIn("skill proposal", rendered)
+                    self.assertIn("direct_change: true", rendered)
                 elif template == "agents_md":
                     self.assertIn("AGENTS.md", rendered)
+                elif template == "retrieval_only":
+                    self.assertIn("direct_change: false", rendered)
+                    self.assertIn("No direct code", rendered)
                 else:
                     self.assertTrue(rendered.startswith("---\n"))
                     self.assertIn('summary: "A command fails repeatedly.', rendered)
@@ -343,6 +355,32 @@ class LessonLifecycleTests(unittest.TestCase):
                 )
                 self.assertEqual(recorded.guard["artifact"], f"guards/{artifact.name}")
                 self.assertFalse(recorded.guard["installed"])
+                if layer == "retrieval_only":
+                    self.assertIsNone(recorded.routing["bead"])
+
+    def test_retrieval_only_apply_has_no_owner_bead(self):
+        path = self.write_draft("retrieval-only:no-direct-change")
+        lesson_id = path.stem
+        accept_lesson(self.artifacts, lesson_id)
+        applied = apply_lesson(
+            self.artifacts,
+            lesson_id,
+            layer="retrieval_only",
+            applied_at="2026-09-27T00:00:00Z",
+        )
+
+        self.assertEqual(applied.state, "applied:retrieval_only")
+        self.assertIsNone(applied.routing["bead"])
+        self.assertEqual(applied.routing["applied_at"], "2026-09-27T00:00:00Z")
+
+        with self.assertRaises(ValidationError) as raised:
+            apply_lesson(
+                self.artifacts,
+                lesson_id,
+                layer="retrieval_only",
+                bead="twill-should-not-exist",
+            )
+        self.assertIn("must not record routing.bead", str(raised.exception))
 
 
 class LessonCliTests(unittest.TestCase):

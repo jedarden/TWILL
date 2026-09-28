@@ -2283,6 +2283,8 @@ def _lesson_data(
     guard_artifact: Path | None = None,
 ) -> dict[str, object]:
     data: dict[str, object] = {"lesson": record.as_dict()}
+    if record.layer is not None:
+        data["direct_change"] = twill_router.has_direct_change(record.layer)
     if bead_command is not None:
         data["bead_create_command"] = bead_command
     if guard_artifact is not None:
@@ -2297,7 +2299,10 @@ def _print_lesson(record: twill_lessons.LessonRecord, action: str) -> None:
     )
     if record.layer is not None:
         print(f"layer: {record.layer}")
-        print(f"bead: {record.routing['bead']}")
+        if twill_router.has_direct_change(record.layer):
+            print(f"bead: {record.routing['bead']}")
+        else:
+            print("direct change: none (retrieval-only outcome)")
         print(f"applied_at: {record.routing['applied_at']}")
 
 
@@ -2316,10 +2321,15 @@ def accept_command(args: argparse.Namespace) -> int:
 
 def apply_command(args: argparse.Namespace) -> int:
     config = load_config()
-    if not args.bead:
+    if args.layer != "retrieval_only" and not args.bead:
         raise UsageError(
             "--bead is required when recording an applied lesson",
             "record the bead that owns the fix before applying the lesson",
+        )
+    if args.layer == "retrieval_only" and args.bead:
+        raise UsageError(
+            "--bead is not valid for a retrieval-only outcome",
+            "omit --bead because no direct code or policy change is appropriate",
         )
     template_layer = (
         (args.guard_template or args.layer) if args.emit_guard else None
@@ -2328,7 +2338,7 @@ def apply_command(args: argparse.Namespace) -> int:
         if template_layer not in twill_guards.TEMPLATE_LAYERS:
             raise UsageError(
                 f"--emit-guard has no template for the {args.layer} layer",
-                "use --emit-guard with hook, wrapper, agents_md, or memory",
+                "use --emit-guard with a documented routing layer or gate",
             )
         if template_layer == "gate":
             if args.layer != "hook":
@@ -2364,10 +2374,14 @@ def apply_command(args: argparse.Namespace) -> int:
             artifact=f"guards/{guard_artifact.name}",
             operator=True,
         )
-    bead_command = twill_router.bead_create_command(
-        title=record.summary,
-        body=record.body,
-        detector=record.detector,
+    bead_command = (
+        twill_router.bead_create_command(
+            title=record.summary,
+            body=record.body,
+            detector=record.detector,
+        )
+        if twill_router.has_direct_change(record.layer)
+        else None
     )
     emit_success(
         _lesson_data(
@@ -2381,7 +2395,8 @@ def apply_command(args: argparse.Namespace) -> int:
         _print_lesson(record, "applied")
         if guard_artifact is not None:
             print(f"guard artifact: {guard_artifact}")
-        print(bead_command)
+        if bead_command is not None:
+            print(bead_command)
     return EXIT_SUCCESS
 
 
@@ -2783,7 +2798,7 @@ def build_parser() -> argparse.ArgumentParser:
         choices=twill_guards.TEMPLATE_LAYERS,
         help=(
             "template to emit; defaults to the applied layer, with gate available "
-            "for the hook layer"
+            "as an alias for the hook-strength outcome"
         ),
     )
     apply.add_argument("--state-dir")

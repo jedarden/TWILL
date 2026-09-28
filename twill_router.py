@@ -19,6 +19,8 @@ ROUTING_LAYER_ORDER = (
     "memory",
     "retrieval_only",
 )
+DIRECT_CHANGE_LAYERS = ROUTING_LAYER_ORDER[:-1]
+NO_DIRECT_CHANGE_LAYERS = ("retrieval_only",)
 MAX_ROUTING_REASON_LENGTH = 240
 _DETECTOR_RE = re.compile(r"D-\d{2,}")
 
@@ -40,6 +42,13 @@ def rank_routing_layers(layers: Iterable[str]) -> tuple[str, ...]:
         choices = ", ".join(sorted(unknown))
         raise ValidationError(f"unknown routing layer(s): {choices}")
     return tuple(layer for layer in ROUTING_LAYER_ORDER if layer in selected)
+
+
+def has_direct_change(layer: str) -> bool:
+    """Return whether applying ``layer`` changes an owned system or rule."""
+
+    rank_routing_layers((layer,))
+    return layer in DIRECT_CHANGE_LAYERS
 
 
 def _validated_inputs(detector: str, key: str, sessions: int) -> str:
@@ -114,10 +123,13 @@ def bead_create_command(*, title: str, body: str, detector: str) -> str:
 
 
 __all__ = [
+    "DIRECT_CHANGE_LAYERS",
     "MAX_ROUTING_REASON_LENGTH",
+    "NO_DIRECT_CHANGE_LAYERS",
     "ROUTING_LAYER_ORDER",
     "RoutingRecommendation",
     "bead_create_command",
+    "has_direct_change",
     "rank_routing_layers",
     "recommend_routing",
 ]
