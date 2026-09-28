@@ -64,6 +64,12 @@ WEEK = "2026-W38"
 WEEK_START = datetime(2026, 9, 14, tzinfo=timezone.utc)
 WEEK_END = datetime(2026, 9, 21, tzinfo=timezone.utc)
 
+# This record exists only in the unavailable archive.  If the lifecycle ever
+# reads or copies the archive instead of the configured source globs, the
+# marker will show up in TWILL's own state or artifacts.
+ARCHIVE_BAIT_SESSION = "archive-only-001"
+ARCHIVE_BAIT_MARKER = "archive-only-marker"
+
 #: The mtime stamped on every staged transcript: hours after the last fixture
 #: event (17:00Z) so the default settle window admits the file, and fixed so
 #: the enumeration order — newest first, ties by path — is the same in every
@@ -140,6 +146,8 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
         cls.artifacts = cls.home / "artifacts"
         (config_dir / "config.toml").write_text(
             f'artifacts_root = "{cls.artifacts}"\n'
+            f'source_globs = ["{cls.home / ".claude" / "projects" / "**" / "*.jsonl"}", '
+            f'"{cls.home / ".codex" / "sessions" / "**" / "*.jsonl"}"]\n'
             # Long enough that the 2026-09-20 fixtures never age out of
             # observation derivation, which filters on now - retention.
             'retention = "3650d"\n'
@@ -152,12 +160,17 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
 
     @classmethod
     def _plant_archive(cls) -> None:
-        """Lay in the archive the scenario deletes: a graph.db and a bait copy."""
+        """Lay in the archive the scenario deletes: a graph.db and unique bait."""
 
         archive = cls.home / "agent-transcript-archive"
         (archive / "sessions").mkdir(parents=True)
         (archive / "graph.db").write_bytes(bytes(range(256)) * 8)
-        shutil.copyfile(fixture("claude", "clean"), archive / "sessions" / "archived.jsonl")
+        bait = fixture("claude", "clean").read_text(encoding="utf-8")
+        bait = bait.replace("claude-clean-001", ARCHIVE_BAIT_SESSION).replace(
+            "Check the project status and summarize the next safe step.",
+            ARCHIVE_BAIT_MARKER,
+        )
+        (archive / "sessions" / "archived.jsonl").write_text(bait, encoding="utf-8")
 
     @classmethod
     def _stage_corpus(cls) -> None:
@@ -211,10 +224,12 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
 
     @classmethod
     def run_cli(cls, *args):
+        environment = {**os.environ, "HOME": str(cls.home)}
+        environment.pop("TWILL_SOURCE_ROOTS", None)
         return subprocess.run(
             [sys.executable, str(CLI), *args],
             cwd=ROOT,
-            env={**os.environ, "HOME": str(cls.home)},
+            env=environment,
             check=False,
             text=True,
             capture_output=True,
@@ -222,7 +237,7 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
 
     @classmethod
     def _pipeline(cls) -> dict[str, object]:
-        """One full pass — ingest twice, detect, rank, digest — plus its facts."""
+        """One full pass — ingest twice, detect, rank, digest, measure."""
 
         shutil.rmtree(cls.home / ".local", ignore_errors=True)
         shutil.rmtree(cls.artifacts / "digests", ignore_errors=True)
@@ -233,6 +248,7 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
         detect = cls.run_cli("detect", "--window", "3650d", "--json")
         rank = cls.run_cli("rank", "--json")
         digest = cls.run_cli("digest", "--week", WEEK)
+        measure = cls.run_cli("measure", "--json")
         digest_path = cls.artifacts / "digests" / f"{WEEK}.txt"
         return {
             "ingest_first": ingest_first,
@@ -240,6 +256,7 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
             "detect": detect,
             "rank": rank,
             "digest": digest,
+            "measure": measure,
             "digest_path": digest_path,
             "digest_bytes": digest_path.read_bytes() if digest_path.is_file() else None,
             "database": cls._database_facts(),
@@ -254,6 +271,12 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
             sessions = connection.execute(
                 "SELECT session_id, source_kind FROM session ORDER BY session_id"
             ).fetchall()
+            source_paths = [
+                row[0]
+                for row in connection.execute(
+                    "SELECT source_path FROM session ORDER BY source_path"
+                )
+            ]
             events_per_session = dict(
                 connection.execute(
                     "SELECT s.session_id, count(*) FROM transcript_event te "
@@ -283,6 +306,7 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
             connection.close()
         return {
             "sessions": sessions,
+            "source_paths": source_paths,
             "events_per_session": events_per_session,
             "texts": texts,
             "observations": observations,
@@ -294,9 +318,21 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
     # -- The pipeline itself (§10.1 Integration) --------------------------
 
     def test_every_verb_exits_zero_with_the_archive_present(self):
-        for step in ("ingest_first", "ingest_second", "detect", "rank", "digest"):
+        for step in ("ingest_first", "ingest_second", "detect", "rank", "digest", "measure"):
             result = self.run_a[step]
             self.assertEqual(result.returncode, 0, f"{step}: {result.stderr}")
+
+    def test_only_configured_sources_reach_twill_state(self):
+        sessions = dict(self.run_a["database"]["sessions"])
+        self.assertNotIn(ARCHIVE_BAIT_SESSION, sessions)
+        for source_path in self.run_a["database"]["source_paths"]:
+            path = Path(source_path)
+            self.assertTrue(
+                path.is_relative_to(self.claude_dir)
+                or path.is_relative_to(self.codex_dir),
+                source_path,
+            )
+            self.assertNotIn("agent-transcript-archive", source_path)
 
     def test_both_sources_and_every_scenario_were_ingested(self):
         sessions = dict(self.run_a["database"]["sessions"])
@@ -388,6 +424,18 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
         self.assertIn(f"week: {WEEK} (", text)
         self.assertIn("observations: 15 total, 15 current, 0 previous", text)
 
+    def test_measure_runs_from_twill_state_without_archive_data(self):
+        self.assertEqual(self.run_a["measure"].returncode, 0, self.run_a["measure"].stderr)
+        measured = json.loads(self.run_a["measure"].stdout)
+        self.assertEqual(measured["data"]["measurements"], [])
+        self.assertNotIn(ARCHIVE_BAIT_MARKER.encode(), self._own_data_bytes())
+        self.assertFalse(
+            any(
+                path.name in {"archived.jsonl", "graph.db"}
+                for path in self._own_files()
+            )
+        )
+
     def test_corpus_timestamps_stay_inside_the_pinned_week(self):
         # A fixture added outside 2026-W38 would silently fall outside the
         # digest's bounds; fail here instead, naming the offending bounds.
@@ -398,8 +446,23 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
 
     # -- §5 Scenario 2: the archive-absent run ----------------------------
 
+    @classmethod
+    def _own_files(cls) -> tuple[Path, ...]:
+        roots = (cls.state_db.parent, cls.artifacts)
+        return tuple(
+            path
+            for root in roots
+            if root.exists()
+            for path in root.rglob("*")
+            if path.is_file()
+        )
+
+    @classmethod
+    def _own_data_bytes(cls) -> bytes:
+        return b"\n".join(path.read_bytes() for path in cls._own_files())
+
     def test_scenario2_archive_absent_digest_is_byte_identical(self):
-        """Delete graph.db, move the archive aside, re-run: same digest bytes."""
+        """Delete graph.db, move the archive aside, re-run the full lifecycle."""
 
         archive = self.home / "agent-transcript-archive"
         (archive / "graph.db").unlink()
@@ -407,7 +470,7 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
 
         run_b = self._pipeline()
 
-        for step in ("ingest_first", "ingest_second", "detect", "rank", "digest"):
+        for step in ("ingest_first", "ingest_second", "detect", "rank", "digest", "measure"):
             result = run_b[step]
             self.assertEqual(result.returncode, 0, f"{step}: {result.stderr}")
         # The digest artifact was genuinely re-rendered by the degraded run,
@@ -416,6 +479,25 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
         self.assertEqual(run_b["database"]["observations"], 15)
         self.assertIsNotNone(self.run_a["digest_bytes"])
         self.assertEqual(run_b["digest_bytes"], self.run_a["digest_bytes"])
+        self.assertNotIn(ARCHIVE_BAIT_SESSION, dict(run_b["database"]["sessions"]))
+        for source_path in run_b["database"]["source_paths"]:
+            path = Path(source_path)
+            self.assertTrue(
+                path.is_relative_to(self.claude_dir)
+                or path.is_relative_to(self.codex_dir),
+                source_path,
+            )
+            self.assertNotIn("agent-transcript-archive", source_path)
+        self.assertEqual(
+            json.loads(run_b["measure"].stdout)["data"]["measurements"], []
+        )
+        self.assertNotIn(ARCHIVE_BAIT_MARKER.encode(), self._own_data_bytes())
+        self.assertFalse(
+            any(
+                path.name in {"archived.jsonl", "graph.db"}
+                for path in self._own_files()
+            )
+        )
 
 
 if __name__ == "__main__":
