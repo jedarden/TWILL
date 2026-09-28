@@ -1089,8 +1089,16 @@ def measure_lessons(
             window_days=window_days,
         )
     _, staged = _stage_mirrors(artifacts_root, history, repo_root=repo_root)
+    staged_paths = tuple(item.path for item in staged)
+    from twill_artifacts import manifest_after_write
+
     try:
-        _persist(connection, history, staged)
+        with manifest_after_write(
+            artifacts_root,
+            staged_paths,
+            repo_root=repo_root,
+        ):
+            _persist(connection, history, staged)
     except BaseException:
         _cleanup_staged(staged)
         raise
@@ -1102,9 +1110,6 @@ def measure_lessons(
             repo_root=repo_root,
         )
         resolved.append(candidate.lesson_id)
-    from twill_artifacts import write_manifest
-
-    write_manifest(artifacts_root, repo_root=repo_root)
     return MeasurementReport(
         window_days=window_days,
         window_start_utc=window_start,

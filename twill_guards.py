@@ -462,15 +462,11 @@ def write_hook_guard(
 ) -> Path:
     """Write one hook guard atomically and return its external artifact path."""
 
-    text = render_hook_guard(record, target_layer=target_layer)
-    return _write_atomic(
-        guard_path(
-            artifacts_root,
-            record.id,
-            target_layer=target_layer,
-            repo_root=repo_root,
-        ),
-        text,
+    return write_guard(
+        artifacts_root,
+        record,
+        target_layer=target_layer,
+        repo_root=repo_root,
     )
 
 
@@ -484,18 +480,16 @@ def write_guard(
     """Render and atomically write one selected guard template."""
 
     text = render_guard(record, target_layer=target_layer)
-    path = _write_atomic(
-        guard_path(
-            artifacts_root,
-            record.id,
-            target_layer=target_layer,
-            repo_root=repo_root,
-        ),
-        text,
+    path = guard_path(
+        artifacts_root,
+        record.id,
+        target_layer=target_layer,
+        repo_root=repo_root,
     )
-    from twill_artifacts import write_manifest
+    from twill_artifacts import manifest_after_write
 
-    write_manifest(artifacts_root, repo_root=repo_root)
+    with manifest_after_write(artifacts_root, (path,), repo_root=repo_root):
+        _write_atomic(path, text)
     return path
 
 

@@ -1471,34 +1471,36 @@ def write_digest_file(
     path = directory / f"{format_week(week)}.txt"
     if path.is_symlink() or (path.exists() and not path.is_file()):
         raise ValueError("digest path is not a regular file")
-    descriptor, temporary_name = tempfile.mkstemp(
-        dir=directory,
-        prefix=f".{format_week(week)}.",
-        suffix=".tmp",
-    )
-    temporary = Path(temporary_name)
-    try:
-        os.fchmod(descriptor, DIGEST_FILE_MODE)
-        with os.fdopen(descriptor, "w", encoding="utf-8", newline="\n") as handle:
-            descriptor = -1
-            handle.write(text)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(temporary, path)
-        os.chmod(path, DIGEST_FILE_MODE)
-        directory_fd = os.open(
-            directory,
-            os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
-        )
-        try:
-            os.fsync(directory_fd)
-        finally:
-            os.close(directory_fd)
-    finally:
-        if descriptor >= 0:
-            os.close(descriptor)
-        temporary.unlink(missing_ok=True)
-    from twill_artifacts import write_manifest
+    from twill_artifacts import manifest_after_write
 
-    write_manifest(root, repo_root=repo_root)
+    with manifest_after_write(root, (path,), repo_root=repo_root):
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=directory,
+            prefix=f".{format_week(week)}.",
+            suffix=".tmp",
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, DIGEST_FILE_MODE)
+            with os.fdopen(
+                descriptor, "w", encoding="utf-8", newline="\n"
+            ) as handle:
+                descriptor = -1
+                handle.write(text)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, path)
+            os.chmod(path, DIGEST_FILE_MODE)
+            directory_fd = os.open(
+                directory,
+                os.O_RDONLY | getattr(os, "O_DIRECTORY", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
     return path

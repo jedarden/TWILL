@@ -756,7 +756,10 @@ def save_lesson(record: LessonRecord) -> Path:
             "saving a modified lesson is not an explicit lifecycle transition",
             "use the named operator transition command",
         )
-    _write_atomic(record.path, _replace_fields(record, {}))
+    from twill_artifacts import manifest_after_write
+
+    with manifest_after_write(record.path.parent.parent, (record.path,)):
+        _write_atomic(record.path, _replace_fields(record, {}))
     return record.path
 
 
@@ -811,7 +814,14 @@ def attach_guard(
             "installed": installed,
         }
     }
-    _write_atomic(record.path, _replace_fields(record, updates))
+    from twill_artifacts import manifest_after_write
+
+    with manifest_after_write(
+        record.path.parent.parent,
+        (record.path,),
+        repo_root=repo_root,
+    ):
+        _write_atomic(record.path, _replace_fields(record, updates))
     return load_lesson(record.path, repo_root=repo_root)
 
 
@@ -936,7 +946,14 @@ def _transition(
         routing["applied"] = None
         updates["routing"] = routing
     _validate_routing(updates.get("routing", record.routing))
-    _write_atomic(path, _replace_fields(record, updates))
+    from twill_artifacts import manifest_after_write
+
+    with manifest_after_write(
+        path.parent.parent,
+        (path,),
+        repo_root=repo_root,
+    ):
+        _write_atomic(path, _replace_fields(record, updates))
     return load_lesson(path, repo_root=repo_root)
 
 

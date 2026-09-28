@@ -6,6 +6,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -15,6 +16,7 @@ from twill_artifacts import (  # noqa: E402
     ARTIFACT_DIRS,
     CONTRACT_SCHEMA,
     ArtifactContractError,
+    manifest_after_write,
     read_manifest,
     write_manifest,
 )
@@ -97,6 +99,42 @@ class ArtifactContractTests(unittest.TestCase):
     def test_manifest_remains_external_to_public_tree(self):
         with self.assertRaises(Exception):
             write_manifest(ROOT / ".artifact-contract-root", repo_root=ROOT)
+
+    def test_empty_namespaces_still_publish_required_schema_metadata(self):
+        empty = self.root / "empty-artifacts"
+        (empty / "lessons").mkdir(parents=True)
+
+        write_manifest(empty, generated_at="2026-09-28T12:00:00Z", repo_root=ROOT)
+        manifest = read_manifest(empty, repo_root=ROOT)
+
+        self.assertEqual(manifest["artifacts"], [])
+        self.assertEqual(set(manifest["paths"]), set(ARTIFACT_DIRS))
+        for namespace in ARTIFACT_DIRS:
+            self.assertIn("pattern", manifest["paths"][namespace])
+            self.assertIn("schema", manifest["paths"][namespace])
+
+    def test_partial_artifact_write_restores_the_previous_snapshot(self):
+        write_manifest(self.artifacts, generated_at="2026-09-28T12:00:00Z", repo_root=ROOT)
+        path = self.artifacts / "digests/2026-W38.txt"
+        previous_artifact = path.read_bytes()
+        previous_manifest = (self.artifacts / "manifest.json").read_bytes()
+
+        with mock.patch(
+            "twill_artifacts.write_manifest",
+            side_effect=RuntimeError("injected manifest failure"),
+        ):
+            with self.assertRaises(RuntimeError):
+                with manifest_after_write(self.artifacts, (path,), repo_root=ROOT):
+                    path.write_bytes(b"partial artifact\n")
+
+        self.assertEqual(path.read_bytes(), previous_artifact)
+        self.assertEqual(
+            (self.artifacts / "manifest.json").read_bytes(), previous_manifest
+        )
+        self.assertEqual(
+            read_manifest(self.artifacts, repo_root=ROOT)["artifacts"],
+            json.loads(previous_manifest)["artifacts"],
+        )
 
 
 if __name__ == "__main__":

@@ -13,10 +13,12 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Mapping
+from typing import Iterator, Mapping, Sequence
 
 from twill_lessons import LESSON_ID_RE, lessons_dir
 
@@ -60,6 +62,53 @@ PATH_CONTRACT: Mapping[str, Mapping[str, str]] = {
 
 class ArtifactContractError(ValueError):
     """An artifact snapshot is missing required contract metadata or content."""
+
+
+class _ArtifactSnapshot:
+    def __init__(self, path: Path) -> None:
+        self.path = path
+        self.exists = os.path.lexists(path)
+        self.content = None
+        self.mode = None
+        if not self.exists:
+            return
+        if path.is_symlink() or not path.is_file():
+            raise ArtifactContractError(
+                f"artifact path is not a regular file: {path}"
+            )
+        self.content = path.read_bytes()
+        self.mode = stat.S_IMODE(path.stat().st_mode)
+
+    def restore(self) -> None:
+        if not self.exists:
+            self.path.unlink(missing_ok=True)
+            return
+        assert self.content is not None
+        assert self.mode is not None
+        descriptor, temporary_name = tempfile.mkstemp(
+            dir=self.path.parent, prefix=".artifact-restore-", suffix=".tmp"
+        )
+        temporary = Path(temporary_name)
+        try:
+            os.fchmod(descriptor, self.mode)
+            with os.fdopen(descriptor, "wb") as handle:
+                descriptor = -1
+                handle.write(self.content)
+                handle.flush()
+                os.fsync(handle.fileno())
+            os.replace(temporary, self.path)
+            os.chmod(self.path, self.mode)
+            directory_fd = os.open(
+                self.path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        finally:
+            if descriptor >= 0:
+                os.close(descriptor)
+            temporary.unlink(missing_ok=True)
 
 
 def _root(artifacts_root: Path, repo_root: Path | None = None) -> Path:
@@ -153,10 +202,13 @@ def write_manifest(
     content = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode(
         "utf-8"
     )
+    manifest_path = root / MANIFEST_FILENAME
+    previous_manifest = _ArtifactSnapshot(manifest_path)
     descriptor, temporary_name = tempfile.mkstemp(
         dir=root, prefix=".manifest-", suffix=".tmp"
     )
     temporary = Path(temporary_name)
+    replaced = False
     try:
         os.fchmod(descriptor, MANIFEST_FILE_MODE)
         with os.fdopen(descriptor, "wb") as handle:
@@ -164,18 +216,52 @@ def write_manifest(
             handle.write(content)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(temporary, root / MANIFEST_FILENAME)
-        os.chmod(root / MANIFEST_FILENAME, MANIFEST_FILE_MODE)
+        os.replace(temporary, manifest_path)
+        replaced = True
+        os.chmod(manifest_path, MANIFEST_FILE_MODE)
         directory_fd = os.open(root, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
         try:
             os.fsync(directory_fd)
         finally:
             os.close(directory_fd)
+    except BaseException:
+        if replaced:
+            previous_manifest.restore()
+        raise
     finally:
         if descriptor >= 0:
             os.close(descriptor)
         temporary.unlink(missing_ok=True)
     return root / MANIFEST_FILENAME
+
+
+@contextmanager
+def manifest_after_write(
+    artifacts_root: Path,
+    paths: Sequence[Path],
+    *,
+    repo_root: Path | None = None,
+) -> Iterator[None]:
+    """Regenerate the manifest and roll back artifact paths if it fails.
+
+    Artifact files are individually atomic, but an artifact and its manifest
+    cannot be renamed as one filesystem operation.  Keeping the prior bytes
+    for the paths touched by one operation prevents a failed inventory or
+    manifest publication from leaving a changed artifact paired with stale
+    metadata.  ``write_manifest`` itself uses a temporary file and replace, so
+    an interrupted manifest write also leaves its previous version intact.
+    """
+
+    root = _root(artifacts_root, repo_root=repo_root)
+    unique_paths = tuple(dict.fromkeys(Path(path) for path in paths))
+    snapshots = tuple(_ArtifactSnapshot(path) for path in unique_paths)
+    try:
+        yield
+        write_manifest(root, repo_root=repo_root)
+    except BaseException:
+        for snapshot in reversed(snapshots):
+            snapshot.restore()
+        raise
 
 
 def read_manifest(
@@ -223,7 +309,11 @@ def read_manifest(
         expected_schema = _schema_for(Path(relative))
         if item.get("schema") != expected_schema:
             raise ArtifactContractError(f"manifest schema mismatch for {relative}")
-        if not isinstance(item.get("bytes"), int) or item["bytes"] < 0:
+        if (
+            isinstance(item.get("bytes"), bool)
+            or not isinstance(item.get("bytes"), int)
+            or item["bytes"] < 0
+        ):
             raise ArtifactContractError(f"manifest byte count is invalid for {relative}")
         if not isinstance(item.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]):
             raise ArtifactContractError(f"manifest hash is invalid for {relative}")
@@ -249,6 +339,7 @@ __all__ = [
     "MEASUREMENT_SCHEMA",
     "PATH_CONTRACT",
     "ArtifactContractError",
+    "manifest_after_write",
     "read_manifest",
     "write_manifest",
 ]

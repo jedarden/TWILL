@@ -18,6 +18,7 @@ import twill_measure  # noqa: E402
 import twill_schema  # noqa: E402
 import twill_lessons  # noqa: E402
 from twill_config import ConfigError, TwillConfig  # noqa: E402
+from twill_artifacts import read_manifest  # noqa: E402
 from twill_ranker import RankedCluster  # noqa: E402
 
 
@@ -84,6 +85,10 @@ class ArtifactBoundaryTests(unittest.TestCase):
         )
         self.assertEqual(len(paths), 1)
         self.assertEqual(paths[0].name, f"{LESSON_ID}.md")
+        self.assertIn(
+            f"lessons/{LESSON_ID}.md",
+            {entry["path"] for entry in read_manifest(artifacts_root, repo_root=ROOT)["artifacts"]},
+        )
         return twill_lessons.load_lesson(paths[0], repo_root=ROOT)
 
     def _write_digest(self, artifacts_root):
@@ -93,12 +98,17 @@ class ArtifactBoundaryTests(unittest.TestCase):
             registry=(),
             artifacts_root=artifacts_root,
         )
-        return twill_digest.write_digest_file(
+        path = twill_digest.write_digest_file(
             twill_digest.render_text(report),
             artifacts_root,
             WEEK,
             repo_root=ROOT,
         )
+        self.assertIn(
+            f"digests/{WEEK_LABEL}.txt",
+            {entry["path"] for entry in read_manifest(artifacts_root, repo_root=ROOT)["artifacts"]},
+        )
+        return path
 
     def _write_measurement(self, record):
         twill_lessons.accept_lesson(self.artifacts, record.id)
@@ -124,11 +134,16 @@ class ArtifactBoundaryTests(unittest.TestCase):
             repo_root=ROOT,
         )
         self.assertEqual(len(report.measurements), 1)
-        return twill_measure.measurement_path(
+        path = twill_measure.measurement_path(
             self.artifacts,
             record.id,
             repo_root=ROOT,
         )
+        self.assertIn(
+            f"measurements/{record.id}.jsonl",
+            {entry["path"] for entry in read_manifest(self.artifacts, repo_root=ROOT)["artifacts"]},
+        )
+        return path
 
     def _write_guards(self, record):
         writers = (
@@ -138,9 +153,15 @@ class ArtifactBoundaryTests(unittest.TestCase):
             twill_guards.write_agents_md_guard,
             twill_guards.write_memory_guard,
         )
-        return tuple(
-            writer(self.artifacts, record, repo_root=ROOT) for writer in writers
-        )
+        paths = []
+        for writer in writers:
+            path = writer(self.artifacts, record, repo_root=ROOT)
+            paths.append(path)
+            self.assertIn(
+                f"guards/{path.name}",
+                {entry["path"] for entry in read_manifest(self.artifacts, repo_root=ROOT)["artifacts"]},
+            )
+        return tuple(paths)
 
     def test_every_exported_writer_stays_external_and_private(self):
         record = self._write_lesson(self.artifacts)

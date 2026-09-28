@@ -1304,7 +1304,6 @@ def _finish_cluster_state_writes(
                     f"Lesson write could not mark cluster {lesson.lesson_id} drafted",
                     "leave the cluster unchanged and retry after checking concurrent runs",
                 )
-    connection.commit()
 
 
 def write_lesson_files(
@@ -1366,13 +1365,19 @@ def write_lesson_files(
         if connection is not None:
             _begin_cluster_state_writes(connection, prepared)
             transaction_started = True
-        paths, created = _write_prepared_lessons(prepared)
-        if connection is not None:
-            _finish_cluster_state_writes(connection, prepared)
-            transaction_started = False
-        from twill_artifacts import write_manifest
+        from twill_artifacts import manifest_after_write
 
-        write_manifest(artifacts_root, repo_root=repo_root)
+        with manifest_after_write(
+            artifacts_root,
+            tuple(lesson.path for lesson in prepared),
+            repo_root=repo_root,
+        ):
+            paths, created = _write_prepared_lessons(prepared)
+            if connection is not None:
+                _finish_cluster_state_writes(connection, prepared)
+        if connection is not None:
+            connection.commit()
+            transaction_started = False
         return paths
     except BaseException:
         if transaction_started:
