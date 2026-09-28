@@ -271,9 +271,12 @@ each lives outside TWILL's two trees, which TWILL may not write to (§3):
 - **`org-rule-guard` denial log.** The hook appends `{ts, rule, tool, session_id}` on every deny.
   Without it, denials are unmeasurable: counting them from transcript text is polluted because
   CLAUDE.md's own statement of the rules is itself indexed. Ownership is Open Question 1.
-- **Friction receipt.** A `SessionEnd` hook writes one small structured record per session — rules
-  consulted, denials, unresolved error signatures, whether the session ended mid-task — so TWILL
-  reads facts instead of inferring them from prose. Ownership is Open Question 7.
+- **Friction receipt.** The `utilities/friction-receipt` `SessionEnd` hook writes one small
+  structured record per session under `${XDG_STATE_HOME:-$HOME/.local/state}/twill/friction-receipts/`.
+  Each `<session_id>.json` is `twill-friction-receipt/v1` and contains only bounded, redacted
+  summaries of `rules_consulted`, matching `denials`, `unresolved_errors`, and `ended_mid_task`.
+  The hook atomically replaces mode-0600 files in a mode-0700 directory and fails open. TWILL
+  reads valid receipts and skips malformed or unsafe records.
 - **The ICG always/never catalog.** `irreversible-command-gate` owns the authoritative list of
   events that must never happen and enforces it at the `PreToolUse` boundary. TWILL reads the
   exported catalog and runs one detector against it (`D-10`, gate gap): an event on that list that
@@ -1040,10 +1043,9 @@ triage-only summarization while routing stays manual.
 6. **Should TWILL detect fabricated work** (a bead closed with no artifact, the "fake-done" taxonomy)?
    It is the highest-value detector class and the most likely to be wrong about a human's intent.
    Owner: operator. Resolve by: Phase 6. Impact if wrong: false accusations in a digest a human reads.
-7. **Who owns and installs the friction receipt hook**, and where does it write? It is a `SessionEnd`
-   hook outside TWILL's trees, so it needs a home (`utilities`, alongside `agent-secrets`, is the
-   obvious candidate). Owner: operator. Resolve by: Phase 2. Impact if wrong: detection stays
-   inference-based and `D-04`/`D-06` keep a blind spot.
+7. **Resolved 2026-09-28:** `utilities/friction-receipt` owns and installs the `SessionEnd` hook;
+   it writes versioned receipts to `${XDG_STATE_HOME:-$HOME/.local/state}/twill/friction-receipts/`.
+   TWILL owns only the read path, and the producer's format is pinned above.
 8. **In what form does ICG export its always/never catalog** for `D-10` to read — a versioned JSON
    file in the ICG repo, a `icg catalog --json` command, or the rule packs parsed directly? Owner:
    operator, with ICG. Resolve by: Phase 2. Impact if wrong: TWILL ends up parsing rule packs it

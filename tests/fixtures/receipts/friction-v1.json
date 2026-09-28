@@ -1,0 +1,15 @@
+{
+  "schema": "twill-friction-receipt/v1",
+  "session_id": "fixture-session",
+  "ended_at": "2026-09-28T20:00:00Z",
+  "reason": "prompt_input_exit",
+  "cwd": "/repo",
+  "rules_consulted": ["AGENTS.md", "skills/testing"],
+  "denials": [
+    {"ts": "2026-09-28T19:59:00Z", "rule_id": "latest-image-tag", "tool": "Write"}
+  ],
+  "unresolved_errors": [
+    {"kind": "tool_error", "signature": "tests failed"}
+  ],
+  "ended_mid_task": false
+}
