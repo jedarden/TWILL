@@ -60,6 +60,21 @@ def program_failure_sql(group: str = "program", kind: str = "run_failed") -> str
     """
 
 
+# A weekly-hit query whose week comes from the observation's command JSON:
+# well-formed data yields the literal week, a malformed command makes
+# json_extract raise (a SQL failure), and a non-ISO week string breaks the
+# column contract (a validation failure) — data-dependent ways to fail a
+# rerun after its writes have already landed inside the run transaction.
+WEEKLY_FROM_COMMAND_SQL = (
+    "SELECT program AS key, "
+    "coalesce(json_extract(command, '$.week'), '2026-W01') AS week, "
+    "count(DISTINCT session_id) AS sessions, count(*) AS events "
+    "FROM observation "
+    "WHERE kind = 'run_failed' AND ts_utc >= :window_start_utc "
+    "GROUP BY program, coalesce(json_extract(command, '$.week'), '2026-W01')"
+)
+
+
 def make_detector(
     detector_id: str = "D-01",
     version: int = 1,
@@ -818,6 +833,194 @@ class DetectorRunTests(unittest.TestCase):
             self.connection, window_days=30, registry=(detector,)
         )
         self.assertEqual(cluster_rows(self.connection, "D-01"), first)
+
+    def test_refresh_preserves_review_state_and_coverage_of_reemitted_clusters(self):
+        seed_observation(self.connection, program="sqlite3", session_id="s1")
+        seed_observation(self.connection, program="sqlite3", session_id="s2")
+        seed_observation(self.connection, program="bf", session_id="s2")
+        detector = make_detector("D-01", 1)
+        twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+        # Review moves a cluster out of the open lane, and the ranker marks
+        # coverage on clusters that stay open — two shapes of state a refresh
+        # that re-emits the row must not clobber.
+        with self.connection:
+            self.connection.execute(
+                "UPDATE cluster SET state = 'drafted', covered_by = "
+                "'~/.claude/CLAUDE.md', score = 7.5 "
+                "WHERE detector_id = 'D-01' AND key = 'sqlite3'"
+            )
+            self.connection.execute(
+                "UPDATE cluster SET covered_by = 'AGENTS.md' "
+                "WHERE detector_id = 'D-01' AND key = 'bf'"
+            )
+        earlier_last_seen = {
+            row[1]: row[6] for row in cluster_rows(self.connection, "D-01")
+        }
+        # A fresh observation makes the rerun rewrite the sqlite3 row's
+        # mutable columns, so keeping the rest is not a no-op artifact.
+        seed_observation(
+            self.connection, program="sqlite3", session_id="s3", days_ago=0.5
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        rows = {row[1]: row for row in cluster_rows(self.connection, "D-01")}
+        self.assertEqual(rows["sqlite3"][3], 3)  # the refresh did land
+        self.assertGreater(rows["sqlite3"][6], earlier_last_seen["sqlite3"])
+        self.assertEqual(rows["sqlite3"][7], 7.5)  # score: the ranker owns it
+        self.assertEqual(rows["sqlite3"][8], "~/.claude/CLAUDE.md")
+        self.assertEqual(rows["sqlite3"][9], "drafted")
+        # Coverage on a still-open cluster survives the same way: the ranker
+        # re-derives it, a refresh must not clear it.
+        self.assertEqual(rows["bf"][8], "AGENTS.md")
+        self.assertEqual(rows["bf"][9], "open")
+
+    def test_refresh_removes_only_open_clusters_it_no_longer_emits(self):
+        seed_observation(self.connection, program="sqlite3", session_id="s1")
+        seed_observation(self.connection, program="bf", session_id="s2")
+        seed_observation(self.connection, program="hammer", session_id="s3")
+        detector = make_detector("D-01", 1)
+        twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+        self.assertEqual(
+            sorted(row[1] for row in cluster_rows(self.connection, "D-01")),
+            ["bf", "hammer", "sqlite3"],
+        )
+        with self.connection:
+            self.connection.execute(
+                "UPDATE cluster SET state = 'escalation', covered_by = "
+                "'~/.claude/CLAUDE.md' "
+                "WHERE detector_id = 'D-01' AND key = 'hammer'"
+            )
+            # Coverage is not a review state — the ranker re-derives it — so
+            # an open cluster goes when its observations do, covered or not.
+            self.connection.execute(
+                "UPDATE cluster SET covered_by = 'AGENTS.md' "
+                "WHERE detector_id = 'D-01' AND key = 'bf'"
+            )
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM observation WHERE program IN ('bf', 'hammer')"
+            )
+        seed_observation(self.connection, program="sqlite3", session_id="s4")
+
+        report = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        rows = {row[1]: row for row in cluster_rows(self.connection, "D-01")}
+        # gone-and-open is removed; gone-but-reviewed survives with its
+        # review state; still-emitted is refreshed in place.
+        self.assertEqual(set(rows), {"hammer", "sqlite3"})
+        self.assertEqual(rows["hammer"][9], "escalation")
+        self.assertEqual(rows["hammer"][8], "~/.claude/CLAUDE.md")
+        self.assertEqual(rows["sqlite3"][9], "open")
+        self.assertIsNone(rows["sqlite3"][8])
+        self.assertEqual(rows["sqlite3"][3], 2)  # s1 + s4
+
+    def _committed_state(self):
+        """Everything a detector run owns, for before/after comparison."""
+
+        clusters = self.connection.execute(
+            "SELECT detector_id, key, window_days, sessions, events, "
+            "first_seen, last_seen, score, covered_by, state FROM cluster "
+            "ORDER BY detector_id, key"
+        ).fetchall()
+        weeks = self.connection.execute(
+            "SELECT detector_id, key, week, sessions, events FROM cluster_week "
+            "ORDER BY detector_id, key, week"
+        ).fetchall()
+        record = self.connection.execute(
+            "SELECT semantics_sha, weekly_sha, clusters, window_days "
+            "FROM detector_run WHERE detector_id = 'D-01' AND version = 1"
+        ).fetchone()
+        return clusters, weeks, record
+
+    def _failing_rerun(self, broken_command):
+        """Commit one healthy run, then rerun over data that breaks it."""
+
+        seed_observation(
+            self.connection, program="sqlite3", session_id="s1", command="{}"
+        )
+        seed_observation(
+            self.connection, program="bf", session_id="s2", command="{}"
+        )
+        seed_observation(
+            self.connection, program="cargo", session_id="s3", command="{}"
+        )
+        detector = make_detector("D-01", 1, weekly_hits_sql=WEEKLY_FROM_COMMAND_SQL)
+        first = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+        self.assertEqual(first.exit_code, EXIT_SUCCESS)
+        before = self._committed_state()
+        # The rerun would delete the two now-unemitted open clusters, add a
+        # 'hammer' one, and rewrite the run record to two clusters — and the
+        # weekly query only breaks on the new row, after all of that.
+        with self.connection:
+            self.connection.execute(
+                "DELETE FROM observation WHERE program IN ('bf', 'cargo')"
+            )
+        seed_observation(
+            self.connection,
+            program="hammer",
+            session_id="s4",
+            command=broken_command,
+        )
+        second = twill_detectors.run_detectors(
+            self.connection, window_days=30, registry=(detector,)
+        )
+        return second, before
+
+    def test_sql_failure_on_rerun_rolls_back_clusters_and_run_record(self):
+        report, before = self._failing_rerun("not json")
+
+        self.assertEqual(report.exit_code, EXIT_RUNTIME_ERROR)
+        self.assertEqual(report.outcomes[0].status, "error")
+        self.assertIn("malformed JSON", report.outcomes[0].error)
+        # The rerun's refresh and its run-record rewrite vanished together:
+        # no 'hammer' row, the stale clusters still present, and the record
+        # still describing the committed run.
+        self.assertEqual(self._committed_state(), before)
+        self.assertEqual(
+            sorted(row[1] for row in cluster_rows(self.connection, "D-01")),
+            ["bf", "cargo", "sqlite3"],
+        )
+        # Only the deliberate failure bookkeeping survives on an
+        # already-successful version (§8.2); the semantics stamp is intact.
+        status, error = self.connection.execute(
+            "SELECT last_status, last_error FROM detector_run "
+            "WHERE detector_id = 'D-01' AND version = 1"
+        ).fetchone()
+        self.assertEqual(status, "error")
+        self.assertIn("malformed JSON", error)
+
+    def test_contract_failure_on_rerun_rolls_back_clusters_and_run_record(self):
+        report, before = self._failing_rerun('{"week": "2026-W1"}')
+
+        self.assertEqual(report.exit_code, EXIT_RUNTIME_ERROR)
+        self.assertEqual(report.outcomes[0].status, "error")
+        self.assertIn("non-ISO week", report.outcomes[0].error)
+        # A contract violation isolates exactly like a SQL error (§8.2): the
+        # whole rerun — clusters, weekly series, run record — rolls back.
+        self.assertEqual(self._committed_state(), before)
+        self.assertEqual(
+            sorted(row[1] for row in cluster_rows(self.connection, "D-01")),
+            ["bf", "cargo", "sqlite3"],
+        )
+        status, error = self.connection.execute(
+            "SELECT last_status, last_error FROM detector_run "
+            "WHERE detector_id = 'D-01' AND version = 1"
+        ).fetchone()
+        self.assertEqual(status, "error")
+        self.assertIn("non-ISO week", error)
 
     def test_keys_are_redacted_and_bounded(self):
         seed_observation(self.connection, program="sqlite3", session_id="s1")
