@@ -93,9 +93,31 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(rows, [("D-01@1", 7, 2, 2)])
         path = twill_measure.measurement_path(self.artifacts, "L-00000001")
         self.assertEqual(path.stat().st_mode & 0o777, 0o600)
-        payload = json.loads(path.read_text(encoding="utf-8"))
-        self.assertEqual(payload["lesson_id"], "L-00000001")
-        self.assertEqual(payload["detector_id"], "D-01@1")
+        lines = path.read_text(encoding="utf-8").splitlines()
+        self.assertEqual(len(lines), 1)
+        payload = json.loads(lines[0])
+        self.assertEqual(
+            set(payload),
+            {
+                "lesson_id",
+                "detector_id",
+                "measured_at",
+                "window_days",
+                "sessions",
+                "events",
+            },
+        )
+        self.assertEqual(
+            payload,
+            {
+                "lesson_id": "L-00000001",
+                "detector_id": "D-01@1",
+                "measured_at": "2026-09-24T12:00:00Z",
+                "window_days": 7,
+                "sessions": 2,
+                "events": 2,
+            },
+        )
 
     def test_measure_exposes_covered_and_omits_uncovered_cluster_snapshots(self):
         rule = self.root / "rules" / "AGENTS.md"
@@ -180,6 +202,35 @@ class MeasurementTests(unittest.TestCase):
         self.assertEqual(len(path.read_text(encoding="utf-8").splitlines()), 2)
         self.assertEqual(
             connection.execute("SELECT count(*) FROM measurement").fetchone()[0], 2
+        )
+        self.assertEqual(
+            len(twill_measure.read_measurements(self.artifacts, "L-00000001")),
+            2,
+        )
+
+    def test_measure_uses_utc_day_for_per_lesson_uniqueness(self):
+        self.lesson("L-00000001")
+        connection = twill_schema.connect(self.state)
+        self.addCleanup(connection.close)
+        self.seed(connection)
+
+        twill_measure.measure_lessons(
+            connection,
+            self.artifacts,
+            now="2026-09-24T23:30:00-04:00",
+        )
+        second_report = twill_measure.measure_lessons(
+            connection,
+            self.artifacts,
+            now="2026-09-25T01:30:00-04:00",
+        )
+
+        points = twill_measure.read_measurements(self.artifacts, "L-00000001")
+        self.assertEqual(len(points), 1)
+        self.assertEqual(points[0].day, "2026-09-25")
+        self.assertEqual(points[0].measured_at, second_report.measured_at)
+        self.assertEqual(
+            connection.execute("SELECT count(*) FROM measurement").fetchone()[0], 1
         )
 
     def test_mirror_restores_derived_rows_after_database_rebuild(self):
