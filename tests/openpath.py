@@ -381,14 +381,18 @@ def _called_from_test_harness() -> bool:
     frame = sys._getframe(1)
     while frame is not None:
         filename = frame.f_code.co_filename
+        module = frame.f_globals.get("__name__", "")
         try:
             path = Path(filename).resolve()
         except (OSError, RuntimeError, TypeError):
             path = None
         if (
-            path is not None
-            and path != Path(__file__).resolve()
-            and _under(path, REPO_TREE / "tests")
+            module.partition(".")[0] in _TEST_RUNNER_MODULES
+            or (
+                path is not None
+                and path != Path(__file__).resolve()
+                and _under(path, REPO_TREE / "tests")
+            )
         ):
             return True
         frame = frame.f_back
