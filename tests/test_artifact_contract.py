@@ -181,6 +181,14 @@ class ArtifactContractTests(unittest.TestCase):
         write_manifest(self.artifacts, repo_root=ROOT)
         path = self.artifacts / "manifest.json"
         payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["artifacts"][0]["path"] = "lessons/../lessons/L-0123abcd.md"
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+        write_manifest(self.artifacts, repo_root=ROOT)
+        path = self.artifacts / "manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
         payload["artifacts"].pop()
         path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
         with self.assertRaises(ArtifactContractError):
@@ -208,12 +216,13 @@ class ArtifactContractTests(unittest.TestCase):
 
     def test_each_artifact_payload_and_reference_is_validated(self):
         lesson = self.artifacts / "lessons/L-0123abcd.md"
-        lesson.write_text(lesson.read_text(encoding="utf-8") + ("x" * 241) + "\n", encoding="utf-8")
+        valid_lesson = lesson.read_text(encoding="utf-8")
+        lesson.write_text(valid_lesson + ("x" * 241) + "\n", encoding="utf-8")
         write_manifest(self.artifacts, repo_root=ROOT)
         with self.assertRaises(ArtifactContractError):
             read_manifest(self.artifacts, repo_root=ROOT)
 
-        lesson.write_text(lesson.read_text(encoding="utf-8")[:-243], encoding="utf-8")
+        lesson.write_text(valid_lesson, encoding="utf-8")
         digest = self.artifacts / "digests/2026-W38.txt"
         digest.write_text("leaked token=secret | $ twill digest --week 2026-W38 --stdout --state-dir /tmp/state\n", encoding="utf-8")
         write_manifest(self.artifacts, repo_root=ROOT)
