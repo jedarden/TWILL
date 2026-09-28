@@ -12,6 +12,134 @@ from twill_redactor import CONTENT_FENCE_MARKER, MAX_EXCERPT_LENGTH, Redactor  #
 
 
 class RedactorTests(unittest.TestCase):
+    def test_redacts_the_documented_credential_inventory(self):
+        cases = (
+            ("GitHub classic ghp token", "gh" + "p_0123456789ab", "<redacted:github-token>"),
+            ("GitHub classic gho token", "gh" + "o_0123456789ab", "<redacted:github-token>"),
+            ("GitHub classic ghu token", "gh" + "u_0123456789ab", "<redacted:github-token>"),
+            ("GitHub classic ghs token", "gh" + "s_0123456789ab", "<redacted:github-token>"),
+            ("GitHub classic ghr token", "gh" + "r_0123456789ab", "<redacted:github-token>"),
+            (
+                "GitHub fine-grained token",
+                "github" + "_pat_0123456789ab",
+                "<redacted:github-token>",
+            ),
+            ("AWS AKIA access key", "AKIA" + "1234567890ABCDEF", "<redacted:aws-access-key>"),
+            ("AWS ASIA access key", "ASIA" + "1234567890ABCDEF", "<redacted:aws-access-key>"),
+            ("Bearer token", "Bea" + "rer abcdefgh", "Bearer <redacted:bearer-token>"),
+            ("OpenAI-style token", "s" + "k-0123456789ab", "<redacted:api-key>"),
+            ("Slack xoxb token", "xox" + "b-0123456789", "<redacted:slack-token>"),
+            ("Slack xoxa token", "xox" + "a-0123456789", "<redacted:slack-token>"),
+            ("Slack xoxp token", "xox" + "p-0123456789", "<redacted:slack-token>"),
+            ("Slack xoxr token", "xox" + "r-0123456789", "<redacted:slack-token>"),
+            ("Slack xoxs token", "xox" + "s-0123456789", "<redacted:slack-token>"),
+            (
+                "api_key assignment",
+                "api" + "_key=assignment-value",
+                "api_key=<redacted:secret>",
+            ),
+            (
+                "access_token assignment",
+                "access" + "_token=assignment-value",
+                "access_token=<redacted:secret>",
+            ),
+            (
+                "auth_token assignment",
+                "auth" + "_token=assignment-value",
+                "auth_token=<redacted:secret>",
+            ),
+            (
+                "password assignment",
+                "pass" + "word=assignment-value",
+                "password=<redacted:secret>",
+            ),
+            ("secret assignment", "sec" + "ret=assignment-value", "secret=<redacted:secret>"),
+            ("token assignment", "tok" + "en=assignment-value", "token=<redacted:secret>"),
+            (
+                "PEM private-key block",
+                "before\n-----BEGIN RSA PRIVATE KEY-----\nbase64-secret\n"
+                "-----END RSA PRIVATE KEY-----\nafter",
+                "before\n<redacted:private-key>\nafter",
+            ),
+        )
+
+        redactor = Redactor()
+        for name, value, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(redactor.redact_text(f"prefix {value} suffix"), f"prefix {expected} suffix")
+
+    def test_documented_case_insensitive_patterns(self):
+        cases = (
+            ("GitHub classic token", "GH" + "P_0123456789AB", "<redacted:github-token>"),
+            (
+                "GitHub fine-grained token",
+                "GITHUB" + "_PAT_0123456789AB",
+                "<redacted:github-token>",
+            ),
+            ("Bearer token", "bEa" + "ReR AbCdEfGh", "Bearer <redacted:bearer-token>"),
+            ("OpenAI-style token", "S" + "K-0123456789AB", "<redacted:api-key>"),
+            (
+                "assignment name",
+                "PaSs" + "WoRd=assignment-value",
+                "PaSsWoRd=<redacted:secret>",
+            ),
+        )
+
+        redactor = Redactor()
+        for name, value, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(redactor.redact_text(f"prefix {value} suffix"), f"prefix {expected} suffix")
+
+    def test_content_fences_are_case_insensitive_and_longest_first(self):
+        cases = (
+            (
+                "case-insensitive fence",
+                ("Restricted Vendor",),
+                "before rEsTrIcTeD vEnDoR after",
+                "before <redacted:content-fence> after",
+            ),
+            (
+                "longest fence wins",
+                ("Restricted", "Restricted Vendor"),
+                "before Restricted Vendor after",
+                "before <redacted:content-fence> after",
+            ),
+        )
+
+        for name, fences, value, expected in cases:
+            with self.subTest(name=name):
+                self.assertEqual(Redactor(fences).redact_text(value), expected)
+
+    def test_redacts_before_truncating_excerpts(self):
+        long_token = "gh" + "p_" + "0123456789abcdef" * 2
+        long_fence = "Restricted Vendor Entity With More Words Than Usual"
+        cases = (
+            (
+                "credential",
+                Redactor(),
+                long_token,
+                "<redacted:github-token>",
+                202,
+                " TAIL-REMAINS",
+            ),
+            (
+                "content fence",
+                Redactor((long_fence,)),
+                long_fence,
+                CONTENT_FENCE_MARKER,
+                195,
+                " TAIL-REMAINS",
+            ),
+        )
+
+        for name, redactor, secret, replacement, prefix_length, suffix in cases:
+            with self.subTest(name=name):
+                value = "x" * prefix_length + " " + secret + suffix
+                expected = "x" * prefix_length + " " + replacement + suffix
+                self.assertGreater(len(value), MAX_EXCERPT_LENGTH)
+                self.assertLessEqual(len(expected), MAX_EXCERPT_LENGTH)
+                self.assertEqual(redactor.redact_excerpt(value), expected)
+
     def test_redacts_credentials_and_fences_before_the_excerpt_cut(self):
         token = "ghp_1234567890abcdefghijklmnop"
         suffix = " TAIL-REMAINS"
