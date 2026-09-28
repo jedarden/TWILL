@@ -697,6 +697,18 @@ a human actually reads:
   or dollar estimate is unavailable when any contributing session lacks that measure, rather than
   treating missing usage as zero. JSON fields carry an `estimated_` prefix and human output repeats
   `estimated`; neither surface presents an allocated figure as observed spend.
+- **Weekly waste decision (2026-09-27):** `cluster_week.est_waste_usd` applies the same equal-split
+  rule per (cluster, ISO week) cell. A session's dollar cost is divided equally across every distinct
+  persisted cluster-week cell it hit across all detectors — repeated observations within one week do
+  not increase that week's share, and weeks outside the re-derived trailing window keep their last
+  value. The distinct contributing sessions per cell come from each detector's session-hit SQL run
+  over one week at a time (the same query the current-window attribution persists), and a cell's
+  estimate is NULL when any session contributing that week lacks a known cost — as is a persisted
+  cell inside the window that the re-derivation finds no contributing session for. Only detectors that
+  define session-hit SQL attribute; a detector whose hit query fails is skipped for the pass and its
+  rows keep their previous estimate, the same isolation a failed detector run gets. The pass runs
+  with the weekly aggregation on every `twill detect`, over the full registered selection even when
+  `--only` narrows the cluster refresh, so a partial run never shrinks the denominators.
 - **Change-point detection** (`trend`) — weekly rates per signature in `cluster_week`, flagging new
   and accelerating friction against its own trailing band. **EWMA, not CUSUM** — the decision is
   made here so an implementer does not have to: CUSUM needs a tuned reference shift per signature,

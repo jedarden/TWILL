@@ -44,6 +44,17 @@ threshold once per week, because one chronic hit per week is still a standing
 problem. The backtest counts the distinct weeks for the requested key. A missing
 or invalid week query fails the draft; it never silently renders zero history.
 
+A detector that wants waste attribution also supplies `session_hits_sql`,
+emitting `key` and `session_id`. It has two consumers: the runner persists its
+distinct (key, session) pairs into `cluster_session` for the current-window
+attribution, and `twill_trend` re-runs it one ISO week at a time (with
+`observation` shadowed down to that week, since the query binds only a start)
+to fill `cluster_week.est_waste_usd`. Both uses assume the same thing: the
+rows are the distinct sessions whose observations qualify for the cluster in
+the window being attributed.
+Changing the query changes both surfaces; its normalized `attribution_sha` is
+stamped in `detector_run` and drift is refused like any other semantics.
+
 ## What the runner does with the output
 
 Per detector, in one `BEGIN IMMEDIATE` transaction:

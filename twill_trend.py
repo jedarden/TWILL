@@ -1,15 +1,35 @@
-"""Build the durable weekly cluster series used by trend analysis."""
+"""Build the durable weekly cluster series used by trend analysis.
+
+Alongside the sessions/events rates, this module fills ``cluster_week``'s
+``est_waste_usd``: the plan's 2026-09-24 equal-split attribution decision
+applied per (cluster, ISO week) cell.  A session's source-reported dollar
+cost is divided equally across every distinct persisted cluster-week cell it
+hit across all detectors — repeated observations within one week do not
+increase a cell's share — and a cell's estimate is unavailable (NULL) when
+any session contributing that week lacks a known cost, rather than treating
+missing usage as zero.  Only detectors that define session-hit SQL can
+attribute; a detector whose hit SQL fails over the weekly windows is skipped
+(its rows keep their last estimate) the same way a failed detector run is
+skipped, so one broken query cannot block the rest of the series.
+"""
 
 from __future__ import annotations
 
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
-from math import sqrt
-from typing import Sequence
+from math import isfinite, sqrt
+from typing import Iterable, Sequence
 
 import twill_detectors
-from twill_detectors import Detector, read_clusters, read_weekly_counts
+from twill_detectors import (
+    SESSION_HIT_COLUMNS,
+    Detector,
+    _emitted_key,
+    _emitted_session,
+    read_clusters,
+    read_weekly_counts,
+)
 
 
 WEEKLY_HISTORY_DAYS = 180
@@ -24,6 +44,10 @@ VALUES (?, ?, ?, ?, ?)
 ON CONFLICT(detector_id, key, week) DO UPDATE SET
   sessions=excluded.sessions, events=excluded.events
 """
+_WEEKLY_WASTE_UPDATE = (
+    "UPDATE cluster_week SET est_waste_usd = ? "
+    "WHERE detector_id = ? AND key = ? AND week = ?"
+)
 
 
 def _clock(value: str | datetime | None) -> datetime:
@@ -145,6 +169,28 @@ def _filtered_has_detector_data(
     return False
 
 
+def _iter_weeks(
+    start: datetime,
+    end: datetime,
+) -> Iterable[tuple[str, datetime, datetime]]:
+    """Yield ``(label, week_start, week_end)`` covering ``[start, end)``.
+
+    Weeks are whole ISO weeks aligned on Monday and clamped to the window's
+    edges, exactly as the replay path buckets them; the label is always the
+    ISO week of the underlying Monday, so partial edge weeks keep one label.
+    """
+
+    first = _monday(start)
+    last = _monday(end)
+    while first <= last:
+        yield (
+            _week_label(first),
+            max(first, start),
+            min(first + timedelta(days=7), end),
+        )
+        first += timedelta(days=7)
+
+
 def _replay_by_week(
     connection: sqlite3.Connection,
     detector: Detector,
@@ -154,11 +200,7 @@ def _replay_by_week(
     counts: dict[tuple[str, str], tuple[int, int]] = {}
     if not _has_reference_data(connection):
         return counts
-    first = _monday(start)
-    last = _monday(end)
-    while first <= last:
-        week_start = max(first, start)
-        week_end = min(first + timedelta(days=7), end)
+    for label, week_start, week_end in _iter_weeks(start, end):
         filtered = _filtered_connection(
             connection,
             week_start.isoformat(),
@@ -166,17 +208,15 @@ def _replay_by_week(
         )
         try:
             if not _filtered_has_detector_data(filtered, detector):
-                first += timedelta(days=7)
                 continue
             emitted = read_clusters(
                 filtered,
                 detector,
-                window_start_utc=first.isoformat(),
+                window_start_utc=_monday(week_start).isoformat(),
                 window_days=7,
             )
         finally:
             filtered.close()
-        label = _week_label(first)
         for key, values in emitted.items():
             # A detector may emit non-observation findings with zero counts
             # (D-09 is one example).  They are valid clusters, but they are
@@ -184,7 +224,6 @@ def _replay_by_week(
             if values[0] == 0 and values[1] == 0:
                 continue
             counts[(key, label)] = (values[0], values[1])
-        first += timedelta(days=7)
     return counts
 
 
@@ -207,14 +246,16 @@ def _weekly_counts(
     return _replay_by_week(connection, detector, start, end)
 
 
-def _persist_counts(
+def _persist_rows(
     connection: sqlite3.Connection,
-    detector: Detector,
-    counts: dict[tuple[str, str], tuple[int, int]],
+    statement: str,
+    rows: Sequence[tuple[object, ...]],
     *,
+    savepoint: str,
     manage_transaction: bool,
 ) -> int:
-    savepoint = "twill_cluster_week"
+    if not rows:
+        return 0
     owns_transaction = False
     started_transaction = False
     if connection.in_transaction:
@@ -224,13 +265,7 @@ def _persist_counts(
         started_transaction = True
         owns_transaction = manage_transaction
     try:
-        connection.executemany(
-            _WEEKLY_UPSERT,
-            (
-                (detector.detector_id, key, week, sessions, events)
-                for (key, week), (sessions, events) in sorted(counts.items())
-            ),
-        )
+        connection.executemany(statement, rows)
         if owns_transaction:
             connection.commit()
         elif not started_transaction:
@@ -242,7 +277,237 @@ def _persist_counts(
             connection.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
             connection.execute(f"RELEASE SAVEPOINT {savepoint}")
         raise
-    return len(counts)
+    return len(rows)
+
+
+def _persist_counts(
+    connection: sqlite3.Connection,
+    detector: Detector,
+    counts: dict[tuple[str, str], tuple[int, int]],
+    *,
+    manage_transaction: bool,
+) -> int:
+    return _persist_rows(
+        connection,
+        _WEEKLY_UPSERT,
+        [
+            (detector.detector_id, key, week, sessions, events)
+            for (key, week), (sessions, events) in sorted(counts.items())
+        ],
+        savepoint="twill_cluster_week",
+        manage_transaction=manage_transaction,
+    )
+
+
+def _known_cost(value: object) -> float | None:
+    """Return a usable dollar cost, or None when the value is not one.
+
+    Missing, non-numeric, negative, and non-finite costs all read as
+    unavailable — never as zero.
+    """
+
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    resolved = float(value)
+    if resolved < 0 or not isfinite(resolved):
+        return None
+    return resolved
+
+
+def _shadow_week(
+    connection: sqlite3.Connection,
+    week_start: datetime,
+    week_end: datetime,
+) -> None:
+    """Bound ``observation`` to one week for detectors that only bind a start.
+
+    Session-hit SQL filters ``ts_utc >= :window_start_utc`` with no upper
+    bound, so a week is imposed by shadowing ``observation`` with a temporary
+    view over the same rows.  The view body names ``main.observation``, so
+    the query plans keep using the real table's indexes, and the shadow is
+    dropped as soon as the pass ends.
+    """
+
+    connection.execute("DROP VIEW IF EXISTS temp.observation")
+    # Views cannot bind parameters; the bounds are internally generated
+    # ISO-8601 text, never caller input.
+    connection.execute(
+        "CREATE TEMP VIEW observation AS "
+        "SELECT * FROM main.observation "
+        f"WHERE ts_utc >= '{week_start.isoformat()}' "
+        f"AND ts_utc < '{week_end.isoformat()}'"
+    )
+
+
+def _unshadow_weeks(connection: sqlite3.Connection) -> None:
+    connection.execute("DROP VIEW IF EXISTS temp.observation")
+
+
+def _week_hits(
+    connection: sqlite3.Connection,
+    detector: Detector,
+    week_start: datetime,
+) -> set[tuple[str, str]]:
+    """Read one detector's ``(key, session_id)`` hits inside one week.
+
+    The caller has already shadowed ``observation`` down to the week, so the
+    start-bounded window the SQL binds cannot reach past the week's end.
+    """
+
+    cursor = connection.execute(
+        detector.session_hits_sql,
+        {"window_start_utc": week_start.isoformat(), "window_days": 7},
+    )
+    columns = [description[0] for description in cursor.description or ()]
+    missing = [column for column in SESSION_HIT_COLUMNS if column not in columns]
+    if missing:
+        raise twill_detectors.DetectorContractError(
+            f"{detector.full_id} session-hit SQL must emit "
+            f"{', '.join(SESSION_HIT_COLUMNS)}; missing {', '.join(missing)} "
+            f"(got {', '.join(columns)})"
+        )
+    key_column = columns.index("key")
+    session_column = columns.index("session_id")
+    return {
+        (
+            _emitted_key(detector, row[key_column]),
+            _emitted_session(detector, row[session_column]),
+        )
+        for row in cursor.fetchall()
+    }
+
+
+def _weekly_cell_hits(
+    connection: sqlite3.Connection,
+    detectors: Sequence[Detector],
+    start: datetime,
+    end: datetime,
+) -> tuple[dict[tuple[str, str, str], set[str]], frozenset[str]]:
+    """Collect every attributable (detector, key, week) cell's sessions.
+
+    Returns the cells mapped to their distinct contributing sessions plus the
+    detector ids that attributed cleanly.  A detector whose hit query fails
+    is skipped for the whole pass — its cells are dropped so neither its rows
+    nor the denominators count them — which is how a failed query degrades to
+    "this detector's rows keep their last estimate" without failing the pass.
+    """
+
+    cells: dict[tuple[str, str, str], set[str]] = {}
+    skipped: set[str] = set()
+    try:
+        for label, week_start, week_end in _iter_weeks(start, end):
+            _shadow_week(connection, week_start, week_end)
+            for detector in detectors:
+                if detector.detector_id in skipped:
+                    continue
+                try:
+                    hits = _week_hits(connection, detector, week_start)
+                except (sqlite3.Error, twill_detectors.DetectorContractError):
+                    # Per-detector isolation, as elsewhere in the pipeline:
+                    # one broken hit query skips that detector's attribution
+                    # for this pass; the denominator simply does not count
+                    # its cells until the query is fixed.
+                    skipped.add(detector.detector_id)
+                    cells = {
+                        cell: sessions
+                        for cell, sessions in cells.items()
+                        if cell[0] != detector.detector_id
+                    }
+                    continue
+                for key, session_id in hits:
+                    cell = (detector.detector_id, key, label)
+                    cells.setdefault(cell, set()).add(session_id)
+    finally:
+        _unshadow_weeks(connection)
+    attributed = frozenset(
+        detector.detector_id
+        for detector in detectors
+        if detector.detector_id not in skipped
+    )
+    return cells, attributed
+
+
+def attribute_weekly_waste(
+    connection: sqlite3.Connection,
+    *,
+    registry: Sequence[Detector] | None = None,
+    now: str | datetime | None = None,
+    history_days: int = WEEKLY_HISTORY_DAYS,
+    manage_transaction: bool = True,
+) -> int:
+    """Fill ``cluster_week.est_waste_usd`` for the trailing weekly window.
+
+    The 2026-09-24 equal-split decision applied per cell: each session's
+    source-reported dollar cost is divided equally across every distinct
+    persisted cluster-week cell it hit across all detectors, so repeated
+    observations within a week do not increase a cell's share and the sums
+    across a session's cells never exceed its usage.  A cell's estimate is
+    NULL when any session contributing that week lacks a known cost —
+    missing usage is unavailable, not zero.  Detectors without session-hit
+    SQL, and detectors whose hit query failed over the weekly windows, are
+    not attributed and their rows keep their previous value.
+    """
+
+    active = twill_detectors.build_registry(
+        *(tuple(registry) if registry is not None else twill_detectors.REGISTRY)
+    )
+    attributable = [
+        detector for detector in active if detector.session_hits_sql is not None
+    ]
+    if not attributable:
+        return 0
+    days = _positive_days(history_days)
+    current = _clock(now)
+    start = current - timedelta(days=days)
+    end = current + timedelta(microseconds=1)
+    labels = {label for label, _, _ in _iter_weeks(start, end)}
+    cells, attributed_ids = _weekly_cell_hits(
+        connection, attributable, start, end
+    )
+    rows = connection.execute(
+        "SELECT detector_id, key, week FROM cluster_week"
+    ).fetchall()
+    persisted = {
+        (str(detector_id), str(key), str(week))
+        for detector_id, key, week in rows
+        if str(detector_id) in attributed_ids and str(week) in labels
+    }
+    contributing = {
+        cell: sessions for cell, sessions in cells.items() if cell in persisted
+    }
+    denominators: dict[str, int] = {}
+    for sessions in contributing.values():
+        for session_id in sessions:
+            denominators[session_id] = denominators.get(session_id, 0) + 1
+    costs = {
+        str(session_id): _known_cost(cost_usd)
+        for session_id, cost_usd in connection.execute(
+            "SELECT session_id, cost_usd FROM session_usage"
+        )
+    }
+    updates: list[tuple[float | None, str, str, str]] = []
+    for cell in sorted(persisted):
+        sessions = contributing.get(cell, ())
+        value: float | None = None
+        if sessions:
+            total = 0.0
+            known = True
+            for session_id in sorted(sessions):
+                cost = costs.get(session_id)
+                if cost is None:
+                    known = False
+                    break
+                total += cost / denominators[session_id]
+            if known:
+                value = total
+        updates.append((value, *cell))
+    return _persist_rows(
+        connection,
+        _WEEKLY_WASTE_UPDATE,
+        updates,
+        savepoint="twill_cluster_week_waste",
+        manage_transaction=manage_transaction,
+    )
 
 
 def aggregate_detector_weeks(
@@ -303,12 +568,16 @@ def refresh_cluster_weeks(
 ) -> int:
     """Refresh the weekly series for the selected detector registry."""
 
-    active = twill_detectors.build_registry(
+    selected = twill_detectors.build_registry(
         *(tuple(registry) if registry is not None else twill_detectors.REGISTRY)
     )
-    if only:
-        active = twill_detectors.select_detectors(active, only)
-    return sum(
+    # The waste pass always sees the full selection: attribution divides a
+    # session's cost across every cluster-week cell it hit across all
+    # detectors, so a narrowed refresh must not shrink the denominators.
+    active = (
+        twill_detectors.select_detectors(selected, only) if only else selected
+    )
+    refreshed = sum(
         aggregate_detector_weeks(
             connection,
             detector,
@@ -317,6 +586,13 @@ def refresh_cluster_weeks(
         )
         for detector in active
     )
+    attribute_weekly_waste(
+        connection,
+        registry=selected,
+        now=now,
+        history_days=history_days,
+    )
+    return refreshed
 
 
 # ---------------------------------------------------------------------------
@@ -871,6 +1147,7 @@ __all__ = [
     "aggregate_all_cluster_weeks",
     "aggregate_cluster_weeks",
     "aggregate_detector_weeks",
+    "attribute_weekly_waste",
     "build_trend_report",
     "change_points",
     "detect_trends",

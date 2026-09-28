@@ -2185,9 +2185,12 @@ def run_detectors(
         raise ValueError("window_days must be an integer")
     if window_days < 1:
         raise ValueError(f"window_days must be at least 1: {window_days}")
-    active = build_registry(*(registry if registry is not None else REGISTRY))
-    if only:
-        active = select_detectors(active, only)
+    selected = build_registry(*(registry if registry is not None else REGISTRY))
+    # Waste attribution divides a session's usage across every distinct
+    # (cluster, ISO week) cell it hit across ALL detectors, so it always
+    # runs over the full selection even when --only narrows this run's
+    # cluster refresh: a partial run must not shrink the denominators.
+    active = select_detectors(selected, only) if only else selected
     if window_days_by_detector is not None:
         for detector in active:
             _detector_window(detector, window_days, window_days_by_detector)
@@ -2313,6 +2316,14 @@ def run_detectors(
         resolved_windows[0]
         if resolved_windows and len(set(resolved_windows)) == 1
         else window_days
+    )
+    from twill_trend import attribute_weekly_waste
+
+    attribute_weekly_waste(
+        connection,
+        registry=selected,
+        now=ran_at,
+        manage_transaction=manage_transactions,
     )
     return DetectorRunReport(
         window_days=report_window_days,
