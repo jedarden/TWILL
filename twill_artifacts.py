@@ -13,14 +13,16 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import stat
 import tempfile
 from contextlib import contextmanager
-from datetime import datetime, timezone
+from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Iterator, Mapping, Sequence
 
 from twill_lessons import LESSON_ID_RE, lessons_dir
+from twill_redactor import redact_text
 
 
 MANIFEST_FILENAME = "manifest.json"
@@ -39,6 +41,18 @@ _GUARD_NAME_RE = re.compile(
     r"^L-[0-9a-f]{8}\.(?:environment\.md|hook\.json|wrapper\.sh|gate\.txt|"
     r"skill\.md|agents\.md|memory\.md|retrieval\.md)$"
 )
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+_GUARD_SUFFIXES = (
+    ".environment.md",
+    ".hook.json",
+    ".wrapper.sh",
+    ".gate.txt",
+    ".skill.md",
+    ".agents.md",
+    ".memory.md",
+    ".retrieval.md",
+)
+_MAX_LINE_LENGTH = 240
 
 PATH_CONTRACT: Mapping[str, Mapping[str, str]] = {
     "lessons": {
@@ -152,7 +166,7 @@ def _inventory(root: Path) -> list[dict[str, object]]:
     entries: list[dict[str, object]] = []
     for namespace in ARTIFACT_DIRS:
         directory = root / namespace
-        if not directory.exists():
+        if not os.path.lexists(directory):
             continue
         if directory.is_symlink() or not directory.is_dir():
             raise ArtifactContractError(f"artifact namespace is not a regular directory: {namespace}")
@@ -171,6 +185,221 @@ def _inventory(root: Path) -> list[dict[str, object]]:
                 }
             )
     return entries
+
+
+def _reject_duplicate_json_keys(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON object key: {key}")
+        result[key] = value
+    return result
+
+
+def _read_json(path: Path, *, label: str) -> object:
+    try:
+        return json.loads(
+            path.read_text(encoding="utf-8"),
+            object_pairs_hook=_reject_duplicate_json_keys,
+        )
+    except (OSError, UnicodeError, json.JSONDecodeError, ValueError) as exc:
+        raise ArtifactContractError(f"{label} is not valid UTF-8 JSON") from exc
+
+
+def _read_text(path: Path, *, label: str) -> str:
+    try:
+        return path.read_text(encoding="utf-8")
+    except (OSError, UnicodeError) as exc:
+        raise ArtifactContractError(f"{label} is not valid UTF-8 text") from exc
+
+
+def _validate_lines(text: str, *, label: str) -> None:
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if len(line) > _MAX_LINE_LENGTH:
+            raise ArtifactContractError(
+                f"{label} line {line_number} exceeds {_MAX_LINE_LENGTH} characters"
+            )
+        content = line.strip()
+        if redact_text(content) != content:
+            raise ArtifactContractError(
+                f"{label} line {line_number} contains unredacted content"
+            )
+
+
+def _validate_lesson(path: Path, *, repo_root: Path | None) -> object:
+    from twill_lessons import load_lesson
+
+    try:
+        record = load_lesson(path, repo_root=repo_root)
+    except Exception as exc:
+        raise ArtifactContractError(f"invalid lesson content: {path.name}") from exc
+    _validate_lines(_read_text(path, label=f"lesson {path.name}"), label=f"lesson {path.name}")
+    return record
+
+
+def _validate_digest(path: Path, *, label: str) -> None:
+    import twill_digest
+
+    week_label = path.stem
+    try:
+        year, week = twill_digest.parse_week(week_label)
+    except Exception as exc:
+        raise ArtifactContractError(f"digest filename is not a valid ISO week: {path.name}") from exc
+    week_end = date.fromisocalendar(year, week, 1).toordinal() + 6
+    if week_end >= datetime.now(timezone.utc).date().toordinal():
+        raise ArtifactContractError(f"digest week is not complete: {path.name}")
+    text = _read_text(path, label=label)
+    if not text.splitlines():
+        raise ArtifactContractError(f"digest {path.name} must contain at least one line")
+    try:
+        twill_digest._validate_digest_text(text)
+    except Exception as exc:
+        raise ArtifactContractError(f"invalid digest content: {path.name}") from exc
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line:
+            raise ArtifactContractError(f"digest {path.name} line {line_number} is empty")
+        marker = " | $ "
+        marker_position = line.rfind(marker)
+        if marker_position <= 0:
+            raise ArtifactContractError(
+                f"digest {path.name} line {line_number} has no reproduction command"
+            )
+        command = line[marker_position + len(marker) :]
+        try:
+            tokens = shlex.split(command)
+        except ValueError as exc:
+            raise ArtifactContractError(
+                f"digest {path.name} line {line_number} has an invalid reproduction command"
+            ) from exc
+        if len(tokens) != 7 or tokens[:4] != ["twill", "digest", "--week", week_label]:
+            raise ArtifactContractError(
+                f"digest {path.name} line {line_number} has an invalid reproduction command"
+            )
+        if tokens[4:6] != ["--stdout", "--state-dir"] or not tokens[6]:
+            raise ArtifactContractError(
+                f"digest {path.name} line {line_number} has an invalid reproduction command"
+            )
+    _validate_lines(text, label=f"digest {path.name}")
+
+
+def _validate_measurement_json(path: Path, *, label: str) -> None:
+    text = _read_text(path, label=label)
+    for line_number, line in enumerate(text.splitlines(), start=1):
+        if not line.strip():
+            continue
+        try:
+            json.loads(line, object_pairs_hook=_reject_duplicate_json_keys)
+        except (json.JSONDecodeError, ValueError) as exc:
+            raise ArtifactContractError(
+                f"measurement {path.name} line {line_number} is not valid JSON"
+            ) from exc
+
+
+def _validate_guard(path: Path, lesson_id: str, *, label: str) -> None:
+    text = _read_text(path, label=label)
+    _validate_lines(text, label=f"guard {path.name}")
+    if path.name.endswith(".hook.json"):
+        payload = _read_json(path, label=f"guard {path.name}")
+        if not isinstance(payload, dict):
+            raise ArtifactContractError(f"guard {path.name} must contain a JSON object")
+        required = {"schema", "lesson_id", "detector", "key", "install"}
+        if not required.issubset(payload):
+            raise ArtifactContractError(f"guard {path.name} is missing required fields")
+        if payload["schema"] != GUARD_SCHEMA or payload["lesson_id"] != lesson_id:
+            raise ArtifactContractError(f"guard {path.name} has an invalid lesson reference")
+        if not isinstance(payload["detector"], str) or not payload["detector"]:
+            raise ArtifactContractError(f"guard {path.name} has an invalid detector")
+        if not isinstance(payload["key"], str) or not payload["key"]:
+            raise ArtifactContractError(f"guard {path.name} has an invalid key")
+        for field in ("detector", "key"):
+            value = payload[field]
+            if (
+                redact_text(value) != value
+                or "\n" in value
+                or "\r" in value
+                or len(value) > _MAX_LINE_LENGTH
+            ):
+                raise ArtifactContractError(f"guard {path.name} has an invalid {field}")
+        install = payload["install"]
+        if not isinstance(install, dict) or install.get("human_only") is not True:
+            raise ArtifactContractError(f"guard {path.name} must be human-installable")
+        if not isinstance(install.get("instruction"), str) or not install["instruction"]:
+            raise ArtifactContractError(f"guard {path.name} has an invalid install block")
+        return
+    expected_prefix = {
+        ".environment.md": f"# TWILL environment-fix proposal {lesson_id}\n",
+        ".wrapper.sh": f"#!/bin/sh\nset -eu\n# TWILL guard proposal {lesson_id} ",
+        ".gate.txt": f"- [ ] TWILL guard {lesson_id} (",
+        ".skill.md": f"---\nid: {lesson_id}\n",
+        ".agents.md": f"<!-- TWILL guard {lesson_id};",
+        ".memory.md": f"---\nid: {lesson_id}\n",
+        ".retrieval.md": f"---\nid: {lesson_id}\n",
+    }
+    suffix = next((item for item in _GUARD_SUFFIXES if path.name.endswith(item)), None)
+    if suffix is None or not text.startswith(expected_prefix[suffix]):
+        raise ArtifactContractError(f"guard {path.name} has invalid template content")
+
+
+def _validate_snapshot_contents(
+    root: Path,
+    entries: Sequence[Mapping[str, object]],
+    *,
+    repo_root: Path | None,
+) -> None:
+    lesson_records: dict[str, object] = {}
+    lesson_paths = {
+        str(entry["path"]): root / str(entry["path"])
+        for entry in entries
+        if str(entry["path"]).startswith("lessons/")
+    }
+    for relative, path in lesson_paths.items():
+        lesson_id = path.stem
+        lesson_records[lesson_id] = _validate_lesson(path, repo_root=repo_root)
+
+    measurement_paths = {
+        str(entry["path"]): root / str(entry["path"])
+        for entry in entries
+        if str(entry["path"]).startswith("measurements/")
+    }
+    digest_paths = {
+        str(entry["path"]): root / str(entry["path"])
+        for entry in entries
+        if str(entry["path"]).startswith("digests/")
+    }
+    guard_paths = {
+        str(entry["path"]): root / str(entry["path"])
+        for entry in entries
+        if str(entry["path"]).startswith("guards/")
+    }
+    for relative, path in digest_paths.items():
+        _validate_digest(path, label=f"digest {path.name}")
+    for relative, path in measurement_paths.items():
+        lesson_id = path.stem
+        if lesson_id not in lesson_records:
+            raise ArtifactContractError(f"measurement {relative} references a missing lesson")
+        _validate_measurement_json(path, label=f"measurement {path.name}")
+        import twill_measure
+
+        try:
+            twill_measure.read_measurements(root, lesson_id, repo_root=repo_root)
+        except Exception as exc:
+            raise ArtifactContractError(f"invalid measurement content: {relative}") from exc
+    for relative, path in guard_paths.items():
+        lesson_id = path.name.split(".", 1)[0]
+        if lesson_id not in lesson_records:
+            raise ArtifactContractError(f"guard {relative} references a missing lesson")
+        _validate_guard(path, lesson_id, label=f"guard {path.name}")
+
+    available_guards = set(guard_paths)
+    for lesson_id, record in lesson_records.items():
+        guard = getattr(record, "guard", {})
+        artifact = guard.get("artifact") if isinstance(guard, dict) else None
+        if artifact is None:
+            continue
+        if not isinstance(artifact, str) or artifact not in available_guards:
+            raise ArtifactContractError(f"lesson {lesson_id} references a missing guard")
+        if Path(artifact).parts[0:1] != ("guards",) or Path(artifact).name.split(".", 1)[0] != lesson_id:
+            raise ArtifactContractError(f"lesson {lesson_id} references the wrong guard")
 
 
 def _manifest_payload(root: Path, generated_at: str | None) -> dict[str, object]:
@@ -280,10 +509,7 @@ def read_manifest(
     path = root / MANIFEST_FILENAME
     if path.is_symlink() or not path.is_file():
         raise ArtifactContractError("artifact root has no regular manifest.json")
-    try:
-        payload = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ArtifactContractError("manifest.json is not valid UTF-8 JSON") from exc
+    payload = _read_json(path, label="manifest.json")
     if not isinstance(payload, dict) or payload.get("schema") != CONTRACT_SCHEMA:
         raise ArtifactContractError(f"manifest schema must be {CONTRACT_SCHEMA}")
     if payload.get("producer") != "twill":
@@ -291,7 +517,10 @@ def read_manifest(
     _timestamp(payload.get("generated_at"))
     paths = payload.get("paths")
     if not isinstance(paths, dict) or any(
-        paths.get(name) != dict(PATH_CONTRACT[name]) for name in ARTIFACT_DIRS
+        not isinstance(paths.get(name), dict)
+        or paths[name].get("pattern") != PATH_CONTRACT[name]["pattern"]
+        or paths[name].get("schema") != PATH_CONTRACT[name]["schema"]
+        for name in ARTIFACT_DIRS
     ):
         raise ArtifactContractError("manifest paths do not match the twill-artifacts/v1 contract")
     artifacts = payload.get("artifacts")
@@ -302,11 +531,19 @@ def read_manifest(
         if not isinstance(item, dict):
             raise ArtifactContractError("manifest artifact entries must be objects")
         relative = item.get("path")
-        if not isinstance(relative, str) or Path(relative).is_absolute() or ".." in Path(relative).parts:
+        candidate = Path(relative) if isinstance(relative, str) else None
+        if (
+            not isinstance(relative, str)
+            or candidate is None
+            or candidate.is_absolute()
+            or candidate.as_posix() != relative
+            or any(part in {"", ".", ".."} for part in candidate.parts)
+        ):
             raise ArtifactContractError("manifest artifact paths must be relative")
         if relative in listed:
             raise ArtifactContractError(f"manifest lists an artifact twice: {relative}")
-        expected_schema = _schema_for(Path(relative))
+        assert candidate is not None
+        expected_schema = _schema_for(candidate)
         if item.get("schema") != expected_schema:
             raise ArtifactContractError(f"manifest schema mismatch for {relative}")
         if (
@@ -315,10 +552,13 @@ def read_manifest(
             or item["bytes"] < 0
         ):
             raise ArtifactContractError(f"manifest byte count is invalid for {relative}")
-        if not isinstance(item.get("sha256"), str) or not re.fullmatch(r"[0-9a-f]{64}", item["sha256"]):
+        if not isinstance(item.get("sha256"), str) or not _SHA256_RE.fullmatch(item["sha256"]):
             raise ArtifactContractError(f"manifest hash is invalid for {relative}")
         listed[relative] = item
-    actual = {item["path"]: item for item in _inventory(root)}
+    try:
+        actual = {item["path"]: item for item in _inventory(root)}
+    except (OSError, UnicodeError) as exc:
+        raise ArtifactContractError("artifact tree cannot be read") from exc
     if set(listed) != set(actual):
         raise ArtifactContractError("manifest inventory does not match the artifact tree")
     for relative, item in listed.items():
@@ -326,6 +566,7 @@ def read_manifest(
         content = path.read_bytes()
         if len(content) != item["bytes"] or hashlib.sha256(content).hexdigest() != item["sha256"]:
             raise ArtifactContractError(f"manifest hash mismatch for {relative}")
+    _validate_snapshot_contents(root, tuple(actual.values()), repo_root=repo_root)
     return payload
 
 

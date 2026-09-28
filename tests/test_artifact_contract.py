@@ -2,6 +2,7 @@
 
 import hashlib
 import json
+import os
 import sys
 import tempfile
 import unittest
@@ -31,10 +32,29 @@ class ArtifactContractTests(unittest.TestCase):
         for directory in ARTIFACT_DIRS:
             (self.artifacts / directory).mkdir(parents=True)
         files = {
-            "lessons/L-0123abcd.md": b"lesson\n",
-            "digests/2026-W38.txt": b"digest\n",
-            "measurements/L-0123abcd.jsonl": b"measurement\n",
-            "guards/L-0123abcd.hook.json": b"guard\n",
+            "lessons/L-0123abcd.md": (
+                b"---\n"
+                b"id: L-0123abcd\n"
+                b"summary: \"A safe lesson.\"\n"
+                b"state: draft\n"
+                b"detector: D-01\n"
+                b"key: \"command-not-found:test\"\n"
+                b"evidence: {sessions: 1, events: 1, first_seen: \"2026-09-01\", session_ids: [\"session-1\"]}\n"
+                b"routing: {recommended: null, reason: null, applied: null, applied_at: null, bead: null}\n"
+                b"backtest: {window_days: 30, sessions: 1, first_seen: \"2026-09-01\", weeks_present: 1}\n"
+                b"guard: {layer: null, artifact: null, installed: false}\n"
+                b"---\n"
+                b"A safe lesson.\n"
+            ),
+            "digests/2026-W38.txt": (
+                b"digest | $ twill digest --week 2026-W38 --stdout --state-dir /tmp/twill-state\n"
+            ),
+            "measurements/L-0123abcd.jsonl": (
+                b"{\"lesson_id\":\"L-0123abcd\",\"detector_id\":\"D-01@1\",\"measured_at\":\"2026-09-20T00:00:00Z\",\"window_days\":7,\"sessions\":1,\"events\":1}\n"
+            ),
+            "guards/L-0123abcd.hook.json": (
+                b"{\"schema\":\"twill-guard/v1\",\"lesson_id\":\"L-0123abcd\",\"detector\":\"D-01\",\"key\":\"command-not-found:test\",\"install\":{\"human_only\":true,\"instruction\":\"Review and install manually.\"}}\n"
+            ),
         }
         for relative, content in files.items():
             (self.artifacts / relative).write_bytes(content)
@@ -135,6 +155,111 @@ class ArtifactContractTests(unittest.TestCase):
             read_manifest(self.artifacts, repo_root=ROOT)["artifacts"],
             json.loads(previous_manifest)["artifacts"],
         )
+
+    def test_unknown_root_files_and_additive_fields_are_compatible(self):
+        write_manifest(self.artifacts, repo_root=ROOT)
+        (self.artifacts / "README.md").write_text("private repository notes\n", encoding="utf-8")
+        (self.artifacts / "metadata").mkdir()
+        path = self.artifacts / "manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["future_metadata"] = {"retention_hint": "consumer-defined"}
+        payload["paths"]["lessons"]["future_pattern"] = "consumer-defined"
+        payload["artifacts"][0]["future_field"] = True
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+
+        self.assertEqual(read_manifest(self.artifacts, repo_root=ROOT)["schema"], CONTRACT_SCHEMA)
+
+    def test_inventory_entries_must_be_unique_and_complete(self):
+        write_manifest(self.artifacts, repo_root=ROOT)
+        path = self.artifacts / "manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["artifacts"].append(dict(payload["artifacts"][0]))
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+        write_manifest(self.artifacts, repo_root=ROOT)
+        path = self.artifacts / "manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["artifacts"].pop()
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+    def test_symlink_size_and_hash_mismatches_are_rejected(self):
+        write_manifest(self.artifacts, repo_root=ROOT)
+        target = self.artifacts / "guards/L-0123abcd.hook.json"
+        target.unlink()
+        os.symlink("../lessons/L-0123abcd.md", target)
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+        target.unlink()
+        target.write_text(
+            "{\"schema\":\"twill-guard/v1\",\"lesson_id\":\"L-0123abcd\",\"detector\":\"D-01\",\"key\":\"command-not-found:test\",\"install\":{\"human_only\":true,\"instruction\":\"Review and install manually.\"}}\n",
+            encoding="utf-8",
+        )
+        path = self.artifacts / "manifest.json"
+        payload = json.loads(path.read_text(encoding="utf-8"))
+        payload["artifacts"][-1]["bytes"] += 1
+        path.write_text(json.dumps(payload) + "\n", encoding="utf-8")
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+    def test_each_artifact_payload_and_reference_is_validated(self):
+        lesson = self.artifacts / "lessons/L-0123abcd.md"
+        lesson.write_text(lesson.read_text(encoding="utf-8") + ("x" * 241) + "\n", encoding="utf-8")
+        write_manifest(self.artifacts, repo_root=ROOT)
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+        lesson.write_text(lesson.read_text(encoding="utf-8")[:-243], encoding="utf-8")
+        digest = self.artifacts / "digests/2026-W38.txt"
+        digest.write_text("leaked token=secret | $ twill digest --week 2026-W38 --stdout --state-dir /tmp/state\n", encoding="utf-8")
+        write_manifest(self.artifacts, repo_root=ROOT)
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+        digest.write_text(
+            "digest | $ twill digest --week 2026-W38 --stdout --state-dir /tmp/twill-state\n",
+            encoding="utf-8",
+        )
+        measurement = self.artifacts / "measurements/L-0123abcd.jsonl"
+        measurement.write_text(measurement.read_text(encoding="utf-8") * 2, encoding="utf-8")
+        write_manifest(self.artifacts, repo_root=ROOT)
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+        measurement.write_text(
+            "{\"lesson_id\":\"L-0123abcd\",\"detector_id\":\"D-01@1\",\"measured_at\":\"2026-09-20T00:00:00Z\",\"window_days\":7,\"sessions\":1,\"events\":1}\n",
+            encoding="utf-8",
+        )
+        guard = self.artifacts / "guards/L-0123abcd.hook.json"
+        guard.write_text("{}\n", encoding="utf-8")
+        write_manifest(self.artifacts, repo_root=ROOT)
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+        guard.write_text(
+            "{\"schema\":\"twill-guard/v1\",\"lesson_id\":\"L-0123abcd\",\"detector\":\"D-01\",\"key\":\"command-not-found:test\",\"install\":{\"human_only\":true,\"instruction\":\"Review and install manually.\"}}\n",
+            encoding="utf-8",
+        )
+        lesson.write_text(
+            lesson.read_text(encoding="utf-8").replace(
+                "guard: {layer: null, artifact: null, installed: false}",
+                'guard: {layer: hook, artifact: "guards/L-deadbeef.hook.json", installed: false}',
+            ),
+            encoding="utf-8",
+        )
+        write_manifest(self.artifacts, repo_root=ROOT)
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+    def test_measurements_and_guards_must_reference_an_existing_lesson(self):
+        (self.artifacts / "lessons/L-0123abcd.md").unlink()
+        write_manifest(self.artifacts, repo_root=ROOT)
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
 
 
 if __name__ == "__main__":
