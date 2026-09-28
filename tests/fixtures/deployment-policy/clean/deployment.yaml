@@ -1,0 +1,10 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: twill
+spec:
+  template:
+    spec:
+      containers:
+        - name: twill
+          image: ghcr.io/example/twill:1.2.3

@@ -1,0 +1,4 @@
+apiVersion: batch/v1
+kind: __FORBIDDEN_CRON_KIND__
+metadata:
+  name: forbidden-cronjob

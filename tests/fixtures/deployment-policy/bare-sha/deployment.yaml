@@ -1,0 +1,10 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forbidden-bare-sha
+spec:
+  template:
+    spec:
+      containers:
+        - name: twill
+          image: ghcr.io/example/twill:0123456789abcdef0123456789abcdef01234567

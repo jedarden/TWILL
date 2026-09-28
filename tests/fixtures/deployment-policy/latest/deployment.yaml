@@ -1,0 +1,10 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: forbidden-latest
+spec:
+  template:
+    spec:
+      containers:
+        - name: twill
+          image: ghcr.io/example/twill:__FORBIDDEN_TAG__

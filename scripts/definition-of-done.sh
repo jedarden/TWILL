@@ -47,6 +47,11 @@ run() {
 # that made it into that tree before running the rest of the gates.
 run sh scripts/check-published-tree.sh .
 
+# Deployment policy is part of the documented stop-ship contract: CI must be
+# an Argo WorkflowTemplate, workloads must not use Job/CronJob resources, and
+# images must use a version or digest rather than latest or a bare SHA.
+run sh scripts/check-deployment-policy.sh .
+
 # The gated suite: the open-path stop-ship gate plus every unit test,
 # including the mandatory secret-fixture and idempotency property tests.
 run make test
