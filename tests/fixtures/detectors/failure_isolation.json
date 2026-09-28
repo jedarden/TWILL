@@ -1,0 +1,90 @@
+{
+  "now": "2026-09-27T00:00:00+00:00",
+  "week": "2026-W38",
+  "window_days": 30,
+  "observations": [
+    {
+      "session_id": "healthy-a",
+      "ts_utc": "2026-09-20T00:00:00+00:00",
+      "kind": "run_failed",
+      "program": "healthy-tool",
+      "command": "healthy-tool --one",
+      "signature": "healthy failure",
+      "sig_hash": "healthy-1",
+      "excerpt": "healthy-tool failed"
+    },
+    {
+      "session_id": "healthy-b",
+      "ts_utc": "2026-09-21T00:00:00+00:00",
+      "kind": "run_failed",
+      "program": "healthy-tool",
+      "command": "healthy-tool --two",
+      "signature": "healthy failure",
+      "sig_hash": "healthy-2",
+      "excerpt": "healthy-tool failed"
+    },
+    {
+      "session_id": "contract-a",
+      "ts_utc": "2026-09-20T00:00:00+00:00",
+      "kind": "run_failed",
+      "program": "contract-tool",
+      "command": "contract-tool --one",
+      "signature": "contract failure",
+      "sig_hash": "contract-1",
+      "excerpt": "contract-tool failed"
+    },
+    {
+      "session_id": "contract-b",
+      "ts_utc": "2026-09-21T00:00:00+00:00",
+      "kind": "run_failed",
+      "program": "contract-tool",
+      "command": "contract-tool --two",
+      "signature": "contract failure",
+      "sig_hash": "contract-2",
+      "excerpt": "contract-tool failed"
+    }
+  ],
+  "detectors": {
+    "healthy": {
+      "detector_id": "D-90",
+      "version": 1,
+      "description": "groups healthy fixture failures by program",
+      "sql": "SELECT program AS key, count(DISTINCT session_id) AS sessions, count(*) AS events, min(ts_utc) AS first_seen, max(ts_utc) AS last_seen FROM observation WHERE program = 'healthy-tool' AND ts_utc >= :window_start_utc GROUP BY program"
+    },
+    "sql_error": {
+      "detector_id": "D-91",
+      "version": 1,
+      "description": "references a missing SQL column",
+      "sql": "SELECT no_such_column AS key, count(*) AS sessions, count(*) AS events, min(ts_utc) AS first_seen, max(ts_utc) AS last_seen FROM observation WHERE ts_utc >= :window_start_utc GROUP BY no_such_column"
+    },
+    "contract_baseline": {
+      "detector_id": "D-92",
+      "version": 1,
+      "description": "groups contract fixture failures by program",
+      "sql": "SELECT program AS key, count(DISTINCT session_id) AS sessions, count(*) AS events, min(ts_utc) AS first_seen, max(ts_utc) AS last_seen FROM observation WHERE program = 'contract-tool' AND ts_utc >= :window_start_utc GROUP BY program"
+    },
+    "contract_refusing": {
+      "detector_id": "D-92",
+      "version": 1,
+      "description": "changes the meaning of the recorded detector version",
+      "sql": "SELECT command AS key, count(DISTINCT session_id) AS sessions, count(*) AS events, min(ts_utc) AS first_seen, max(ts_utc) AS last_seen FROM observation WHERE program = 'contract-tool' AND ts_utc >= :window_start_utc GROUP BY command"
+    }
+  },
+  "expected": {
+    "healthy": {
+      "status": "ok",
+      "clusters": 1,
+      "rows": {
+        "healthy-tool": {"sessions": 2, "events": 2}
+      }
+    },
+    "sql_error": {
+      "status": "error",
+      "clusters": 0
+    },
+    "contract_refusing": {
+      "status": "refused",
+      "clusters": 0
+    }
+  }
+}

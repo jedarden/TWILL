@@ -24,6 +24,7 @@ from twill_detectors import (
     MAX_ERROR_LENGTH,
     STATUS_ERROR,
     STATUS_OK,
+    STATUS_REFUSED,
     Detector,
     DetectorContractError,
     read_clusters,
@@ -414,6 +415,29 @@ def _read_window(
         for detector in detectors:
             try:
                 twill_detectors.validate_detector_semantics(source, detector)
+            except DetectorContractError as exc:
+                results.append(
+                    _DetectorWindow(
+                        detector=detector,
+                        status=STATUS_REFUSED,
+                        clusters={},
+                        error=_one_line(exc, MAX_ERROR_LENGTH),
+                        estimated_waste={},
+                    )
+                )
+                continue
+            except sqlite3.Error as exc:
+                results.append(
+                    _DetectorWindow(
+                        detector=detector,
+                        status=STATUS_ERROR,
+                        clusters={},
+                        error=_one_line(exc, MAX_ERROR_LENGTH),
+                        estimated_waste={},
+                    )
+                )
+                continue
+            try:
                 clusters = read_clusters(
                     memory,
                     detector,
@@ -1100,6 +1124,22 @@ def render_text(report: DigestReport) -> str:
         for warning in report.trend.warnings:
             lines.append(_line(f"trend warning: {warning}", report.command))
     for detector in report.detectors:
+        if detector.current_status != STATUS_OK:
+            lines.append(
+                _line(
+                    f"detector skipped: {detector.full_id} {report.week_id} "
+                    f"({detector.current_status})",
+                    report.command,
+                )
+            )
+        if detector.previous_status != STATUS_OK:
+            lines.append(
+                _line(
+                    f"detector skipped: {detector.full_id} "
+                    f"{report.previous_week_id} ({detector.previous_status})",
+                    report.command,
+                )
+            )
         if detector.current_error is not None:
             lines.append(
                 _line(

@@ -597,7 +597,8 @@ class DetectorRunTests(unittest.TestCase):
         # drift never silently redefines the series.
         after = run_row(self.connection, "D-01", 1)
         self.assertEqual(after[3], stamped[3])
-        self.assertEqual(after[6], "ok")
+        self.assertEqual(after[6], "refused")
+        self.assertIn("bump the version", after[7])
         self.assertEqual(
             [row[1] for row in cluster_rows(self.connection, "D-01")], ["sqlite3"]
         )

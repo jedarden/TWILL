@@ -2116,6 +2116,7 @@ def _record_failure(
     ran_at: str,
     error_text: str,
     *,
+    status: str = STATUS_ERROR,
     manage_transaction: bool = True,
 ) -> None:
     """Note a failed run on a version that has succeeded before, if it has.
@@ -2124,18 +2125,24 @@ def _record_failure(
     ever describes semantics that committed clusters, so fixing a detector
     that has only ever errored does not trip the drift check.  Best-effort by
     design — the run report is authoritative; this row is bookkeeping for a
-    detector that already failed once.
+    detector that already failed once.  A refusal uses the same bookkeeping
+    path, but preserves the validation-specific status for operator and digest
+    visibility.
     """
+
+    if status not in (STATUS_ERROR, STATUS_REFUSED):
+        raise ValueError(f"unsupported detector failure status: {status}")
 
     savepoint = "twill_detector_failure"
     try:
         if manage_transaction:
             with connection:
                 connection.execute(
-                    "UPDATE detector_run SET last_run_at = ?, last_status = 'error', "
+                    "UPDATE detector_run SET last_run_at = ?, last_status = ?, "
                     "last_error = ? WHERE detector_id = ? AND version = ?",
                     (
                         ran_at,
+                        status,
                         _bounded(error_text),
                         detector.detector_id,
                         detector.version,
@@ -2145,10 +2152,11 @@ def _record_failure(
             connection.execute(f"SAVEPOINT {savepoint}")
             try:
                 connection.execute(
-                    "UPDATE detector_run SET last_run_at = ?, last_status = 'error', "
+                    "UPDATE detector_run SET last_run_at = ?, last_status = ?, "
                     "last_error = ? WHERE detector_id = ? AND version = ?",
                     (
                         ran_at,
+                        status,
                         _bounded(error_text),
                         detector.detector_id,
                         detector.version,
@@ -2225,12 +2233,21 @@ def run_detectors(
                 (detector.detector_id, detector.version),
             ).fetchone()
         if row is not None and row[0] != detector.semantics_sha:
+            error = _drift_message(detector, str(row[0]))
+            _record_failure(
+                connection,
+                detector,
+                ran_at,
+                error,
+                status=STATUS_REFUSED,
+                manage_transaction=manage_transactions,
+            )
             outcomes.append(
                 DetectorOutcome(
                     detector_id=detector.detector_id,
                     version=detector.version,
                     status=STATUS_REFUSED,
-                    error=_drift_message(detector, str(row[0])),
+                    error=error,
                 )
             )
             continue
@@ -2240,12 +2257,21 @@ def run_detectors(
             and row[1] is not None
             and row[1] != detector.attribution_sha
         ):
+            error = _attribution_drift_message(detector, str(row[1]))
+            _record_failure(
+                connection,
+                detector,
+                ran_at,
+                error,
+                status=STATUS_REFUSED,
+                manage_transaction=manage_transactions,
+            )
             outcomes.append(
                 DetectorOutcome(
                     detector_id=detector.detector_id,
                     version=detector.version,
                     status=STATUS_REFUSED,
-                    error=_attribution_drift_message(detector, str(row[1])),
+                    error=error,
                 )
             )
             continue
@@ -2254,12 +2280,21 @@ def run_detectors(
             and row[2] is not None
             and row[2] != detector.backtest_sha
         ):
+            error = _backtest_drift_message(detector, str(row[2]))
+            _record_failure(
+                connection,
+                detector,
+                ran_at,
+                error,
+                status=STATUS_REFUSED,
+                manage_transaction=manage_transactions,
+            )
             outcomes.append(
                 DetectorOutcome(
                     detector_id=detector.detector_id,
                     version=detector.version,
                     status=STATUS_REFUSED,
-                    error=_backtest_drift_message(detector, str(row[2])),
+                    error=error,
                 )
             )
             continue
@@ -2269,12 +2304,21 @@ def run_detectors(
             and row[3] is not None
             and row[3] != detector.weekly_sha
         ):
+            error = _weekly_drift_message(detector, str(row[3]))
+            _record_failure(
+                connection,
+                detector,
+                ran_at,
+                error,
+                status=STATUS_REFUSED,
+                manage_transaction=manage_transactions,
+            )
             outcomes.append(
                 DetectorOutcome(
                     detector_id=detector.detector_id,
                     version=detector.version,
                     status=STATUS_REFUSED,
-                    error=_weekly_drift_message(detector, str(row[3])),
+                    error=error,
                 )
             )
             continue
