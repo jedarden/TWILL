@@ -1577,6 +1577,11 @@ def _drift_message(detector: Detector, recorded_sha: str) -> str:
 
 
 def _attribution_drift_message(detector: Detector, recorded_sha: str) -> str:
+    if detector.attribution_sha is None:
+        return (
+            f"{detector.full_id} removed waste-attribution semantics without a "
+            "version bump; restore them or bump the version"
+        )
     registered_sha = detector.attribution_sha or ""
     return (
         f"waste-attribution semantics changed without a version bump "
@@ -1584,6 +1589,18 @@ def _attribution_drift_message(detector: Detector, recorded_sha: str) -> str:
         f"{_short_sha(registered_sha)}); bump the version so estimates remain "
         "reproducible"
     )
+
+
+def _check_attribution_semantics(
+    detector: Detector, recorded_sha: str | None
+) -> None:
+    if recorded_sha is None:
+        return
+    registered_sha = detector.attribution_sha
+    if registered_sha is None or recorded_sha != registered_sha:
+        raise DetectorContractError(
+            _attribution_drift_message(detector, recorded_sha)
+        )
 
 
 def _backtest_drift_message(detector: Detector, recorded_sha: str | None) -> str:
@@ -1819,26 +1836,39 @@ def _check_weekly_semantics(
 def validate_detector_semantics(
     connection: sqlite3.Connection, detector: Detector
 ) -> None:
-    if _has_detector_run_column(connection, "weekly_sha"):
-        row = connection.execute(
-            "SELECT semantics_sha, backtest_sha, weekly_sha FROM detector_run "
-            "WHERE detector_id = ? AND version = ?",
-            (detector.detector_id, detector.version),
-        ).fetchone()
-    else:
-        row = connection.execute(
-            "SELECT semantics_sha, backtest_sha FROM detector_run "
-            "WHERE detector_id = ? AND version = ?",
-            (detector.detector_id, detector.version),
-        ).fetchone()
+    available = {
+        str(row[1])
+        for row in connection.execute("PRAGMA table_info(detector_run)")
+    }
+    hash_columns = [
+        column
+        for column in ("semantics_sha", "attribution_sha", "backtest_sha", "weekly_sha")
+        if column in available
+    ]
+    if "semantics_sha" not in hash_columns:
+        return
+    row = connection.execute(
+        "SELECT "
+        + ", ".join(hash_columns)
+        + " FROM detector_run WHERE detector_id = ? AND version = ?",
+        (detector.detector_id, detector.version),
+    ).fetchone()
     if row is None:
         return
-    if row[0] != detector.semantics_sha:
-        raise DetectorContractError(_drift_message(detector, str(row[0])))
-    if row[1] != detector.backtest_sha:
-        raise DetectorContractError(_backtest_drift_message(detector, row[1]))
-    if len(row) > 2:
-        _check_weekly_semantics(detector, row[2])
+    recorded = dict(zip(hash_columns, row))
+    if recorded["semantics_sha"] != detector.semantics_sha:
+        raise DetectorContractError(
+            _drift_message(detector, str(recorded["semantics_sha"]))
+        )
+    _check_attribution_semantics(
+        detector, recorded.get("attribution_sha")
+    )
+    if "backtest_sha" in recorded and recorded["backtest_sha"] != detector.backtest_sha:
+        raise DetectorContractError(
+            _backtest_drift_message(detector, recorded["backtest_sha"])
+        )
+    if "weekly_sha" in recorded:
+        _check_weekly_semantics(detector, recorded["weekly_sha"])
 
 
 def read_clusters(
@@ -2253,7 +2283,6 @@ def run_detectors(
             continue
         if (
             row is not None
-            and detector.attribution_sha is not None
             and row[1] is not None
             and row[1] != detector.attribution_sha
         ):

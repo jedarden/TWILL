@@ -195,6 +195,70 @@ class AuxiliaryQueryContractTests(unittest.TestCase):
             ("D-90@1", detector.attribution_sha),
         )
 
+    def test_auxiliary_hashes_ignore_whitespace_only_edits(self):
+        session_sql = SESSION_HITS_SQL
+        week_sql = "SELECT 'finding' AS key, '2026-W36' AS week"
+        reflowed_session = "  " + " \n ".join(session_sql.split()) + "  "
+        reflowed_week = "\n" + "\n".join(week_sql.split()) + "\n"
+
+        original = make_detector(
+            session_hits_sql=session_sql,
+            week_hits_sql=week_sql,
+        )
+        reflowed = make_detector(
+            session_hits_sql=reflowed_session,
+            week_hits_sql=reflowed_week,
+        )
+
+        self.assertEqual(original.attribution_sha, reflowed.attribution_sha)
+        self.assertEqual(original.backtest_sha, reflowed.backtest_sha)
+
+    def test_each_query_hash_is_stamped_and_version_bump_redefines_all_of_them(self):
+        self.seed_observations()
+        week_sql = "SELECT 'finding' AS key, '2026-W36' AS week"
+        first = make_detector(
+            session_hits_sql=SESSION_HITS_SQL,
+            week_hits_sql=week_sql,
+        )
+        self.assertEqual(
+            twill_detectors.run_detectors(
+                self.connection, registry=(first,), window_days=30, now=NOW
+            ).exit_code,
+            EXIT_SUCCESS,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT semantics_sha, attribution_sha, backtest_sha "
+                "FROM detector_run WHERE detector_id = 'D-90' AND version = 1"
+            ).fetchone(),
+            (first.semantics_sha, first.attribution_sha, first.backtest_sha),
+        )
+
+        second = make_detector(
+            version=2,
+            cluster_sql=PRIMARY_CLUSTER_SQL + "\n",
+            session_hits_sql=SESSION_HITS_SQL.replace(
+                "ORDER BY session_id", "ORDER BY session_id DESC"
+            ),
+            week_hits_sql="SELECT 'finding' AS key, '2026-W37' AS week",
+        )
+        self.assertEqual(
+            twill_detectors.run_detectors(
+                self.connection, registry=(second,), window_days=30, now=NOW
+            ).exit_code,
+            EXIT_SUCCESS,
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT version, semantics_sha, attribution_sha, backtest_sha "
+                "FROM detector_run WHERE detector_id = 'D-90' ORDER BY version"
+            ).fetchall(),
+            [
+                (1, first.semantics_sha, first.attribution_sha, first.backtest_sha),
+                (2, second.semantics_sha, second.attribution_sha, second.backtest_sha),
+            ],
+        )
+
     def test_attribution_hash_drift_is_refused_without_replacing_persisted_hits(self):
         self.seed_observations()
         first = make_detector(session_hits_sql=SESSION_HITS_SQL)
@@ -204,6 +268,10 @@ class AuxiliaryQueryContractTests(unittest.TestCase):
             ).exit_code,
             EXIT_SUCCESS,
         )
+        clusters_before = self.connection.execute(
+            "SELECT detector_id, key, sessions, events, first_seen, last_seen "
+            "FROM cluster ORDER BY detector_id, key"
+        ).fetchall()
 
         changed_sql = SESSION_HITS_SQL.replace(
             "SELECT 'finding' AS key, session_id",
@@ -223,6 +291,66 @@ class AuxiliaryQueryContractTests(unittest.TestCase):
                 "ORDER BY session_id"
             ).fetchall(),
             [("finding", "s1"), ("finding", "s2")],
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT detector_id, key, sessions, events, first_seen, last_seen "
+                "FROM cluster ORDER BY detector_id, key"
+            ).fetchall(),
+            clusters_before,
+        )
+
+    def test_shared_semantics_validation_rejects_session_hit_drift(self):
+        self.seed_observations()
+        first = make_detector(session_hits_sql=SESSION_HITS_SQL)
+        self.assertEqual(
+            twill_detectors.run_detectors(
+                self.connection, registry=(first,), window_days=30, now=NOW
+            ).exit_code,
+            EXIT_SUCCESS,
+        )
+        changed = make_detector(
+            session_hits_sql=SESSION_HITS_SQL.replace(
+                "ORDER BY session_id", "ORDER BY session_id DESC"
+            )
+        )
+
+        with self.assertRaisesRegex(
+            twill_detectors.DetectorContractError,
+            "waste-attribution semantics changed",
+        ):
+            twill_detectors.validate_detector_semantics(self.connection, changed)
+
+    def test_removing_session_hits_is_refused_without_replacing_clusters(self):
+        self.seed_observations()
+        first = make_detector(session_hits_sql=SESSION_HITS_SQL)
+        self.assertEqual(
+            twill_detectors.run_detectors(
+                self.connection, registry=(first,), window_days=30, now=NOW
+            ).exit_code,
+            EXIT_SUCCESS,
+        )
+        clusters_before = self.connection.execute(
+            "SELECT detector_id, key, sessions, events, first_seen, last_seen "
+            "FROM cluster ORDER BY detector_id, key"
+        ).fetchall()
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            registry=(make_detector(),),
+            window_days=30,
+            now=NOW,
+        )
+
+        self.assertEqual(report.exit_code, EXIT_VALIDATION_FAILURE)
+        self.assertEqual(report.outcomes[0].status, "refused")
+        self.assertIn("removed waste-attribution semantics", report.outcomes[0].error)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT detector_id, key, sessions, events, first_seen, last_seen "
+                "FROM cluster ORDER BY detector_id, key"
+            ).fetchall(),
+            clusters_before,
         )
 
     def test_version_bump_allows_new_attribution_hash_and_replaces_hits(self):
