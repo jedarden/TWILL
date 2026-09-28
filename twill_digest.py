@@ -141,12 +141,24 @@ def _line(claim: str, command: str) -> str:
     available = MAX_LINE_LENGTH - len(suffix)
     if available < 1:
         raise ValueError("digest reproduction command exceeds the line budget")
-    safe_claim = _one_line(claim, MAX_LINE_LENGTH)
-    if len(safe_claim) <= available:
-        return safe_claim + suffix
-    if available <= 3:
-        return safe_claim[:available] + suffix
-    return safe_claim[: available - 3] + "..." + suffix
+    safe_claim = " ".join(redact_text(claim).split())
+    if not safe_claim:
+        return suffix.lstrip()
+
+    # Preserve the complete claim instead of dropping its tail when the
+    # reproduction command is long.  A digest line remains bounded and every
+    # continuation repeats the command, so each line is independently useful
+    # when copied from the report.
+    chunks: list[str] = []
+    remaining = safe_claim
+    while len(remaining) > available:
+        cut = remaining.rfind(" ", 0, available + 1)
+        if cut <= 0:
+            cut = available
+        chunks.append(remaining[:cut].rstrip())
+        remaining = remaining[cut:].lstrip()
+    chunks.append(remaining)
+    return "\n".join(f"{chunk}{suffix}" for chunk in chunks)
 
 
 @dataclass(frozen=True)
@@ -1308,20 +1320,31 @@ def render_text(report: DigestReport) -> str:
                 if finding.previous is not None
                 else None
             )
+            # Keep each semantic field intact when the reproduction command
+            # consumes most of the 240-character line budget.  Truncating the
+            # whole finding used to hide its waste estimate and could split a
+            # redaction marker out of the key.  Every line still carries the
+            # command, so the digest remains directly reproducible.
             lines.append(
                 _line(
-                    f"- {finding.n} {finding.verdict} {finding.detector} "
-                    f"{_display_key(finding.key)} "
-                    f"{_count_text(previous)}->{_count_text(current)}; "
-                    f"{_waste_text(finding.estimated_waste)}"
-                    + (
-                        f"; trend={finding.trend_status}"
-                        if finding.trend_status is not None
-                        else ""
-                    ),
+                    f"- {finding.n} {finding.verdict} {finding.detector}",
                     report.command,
                 )
             )
+            lines.append(
+                _line(f"  key: {_display_key(finding.key)}", report.command)
+            )
+            lines.append(
+                _line(
+                    f"  {_count_text(previous)}->{_count_text(current)}; "
+                    f"{_waste_text(finding.estimated_waste)}",
+                    report.command,
+                )
+            )
+            if finding.trend_status is not None:
+                lines.append(
+                    _line(f"  trend={finding.trend_status}", report.command)
+                )
 
     for trend_status in TREND_ORDER:
         render_findings(

@@ -8,6 +8,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from dataclasses import replace
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
@@ -394,6 +395,32 @@ class DigestDiffTests(DigestStateCase):
         text = twill_digest.render_text(report)
         self.assertNotIn(token, text)
         self.assertIn("<redacted:github-token>", text)
+        for line in text.splitlines():
+            self.assertLessEqual(len(line), twill_digest.MAX_LINE_LENGTH)
+            self.assertTrue(line.endswith(f" | $ {report.command}"))
+
+    def test_long_reproduction_command_keeps_finding_fields_visible(self):
+        seed_failure(self.connection, "long-command", 2, IN_WEEK)
+        self.connection.executemany(
+            "INSERT INTO session_usage(session_id, input_tokens, output_tokens, "
+            "cache_read_tokens, cost_usd) VALUES (?, ?, ?, ?, ?)",
+            [
+                ("long-command-session-0", 100, 200, 300, 1.0),
+                ("long-command-session-1", 100, 200, 300, 1.0),
+            ],
+        )
+        self.connection.commit()
+
+        state = self.root / ("nested-" + "x" * 170) / "state"
+        report = replace(
+            self.build(registry=(MISSING_BINARY,)),
+            state_dir=state,
+            command=twill_digest.reproduction_command(state, SUBJECT),
+        )
+        text = twill_digest.render_text(report)
+
+        self.assertIn("key: command-not-found:long-command", text)
+        self.assertIn("estimated waste: 2.000000 USD; estimated tokens: 1,200.00", text)
         for line in text.splitlines():
             self.assertLessEqual(len(line), twill_digest.MAX_LINE_LENGTH)
             self.assertTrue(line.endswith(f" | $ {report.command}"))
