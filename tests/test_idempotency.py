@@ -62,12 +62,15 @@ CROSS_STORE_DROPS = {
     "observation": frozenset({"launch_dir"}),
 }
 
-#: Cursor fields compared across stores; the omitted three are the path key
-#: and the two wall-clock stamps.  ``mtime_ns`` stays because it is pinned.
+#: Cursor fields compared across stores; the omitted four are the path key,
+#: the two wall-clock stamps, and the run-local EC-04 streak.  The streak is
+#: intentionally lifecycle-dependent: an idle pass carries a parse error
+#: forward so doctor can alarm after three runs, while a one-shot rebuild only
+#: observes the final file once.  ``mtime_ns`` stays because it is pinned.
 CURSOR_COMPARED_FIELDS = tuple(
     field.name
     for field in fields(CursorRow)
-    if field.name not in ("path", "first_seen", "last_indexed_at")
+    if field.name not in ("path", "first_seen", "last_indexed_at", "parse_error_runs")
 )
 
 # The child is killed after the 128th transcript-event INSERT is traced, so
@@ -285,6 +288,10 @@ class IdempotencyPropertyTests(unittest.TestCase):
                     self.cursor_fields(before_cursor),
                     f"{case.label}: cursor bookkeeping changed beyond its stamps",
                 )
+                expected_runs = before_cursor.parse_error_runs + (
+                    1 if before_cursor.parse_errors > 0 else 0
+                )
+                self.assertEqual(after_cursor.parse_error_runs, expected_runs, case.label)
                 self.assert_offset_monotone(before_cursor, after_cursor, case.label)
                 # Every fixture is newline-terminated, so each scenario — the
                 # truncated one included — commits every byte it saw: the
