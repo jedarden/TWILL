@@ -51,6 +51,7 @@ COLUMN_CONTRACT = {
         ("first_seen", "TEXT", 1, None, 0),
         ("last_indexed_at", "TEXT", 1, None, 0),
         ("path_missing", "INTEGER", 1, "0", 0),
+        ("parse_error_runs", "INTEGER", 1, "0", 0),
     ],
     "observation": [
         ("obs_id", "INTEGER", 0, None, 1),
@@ -195,7 +196,8 @@ class SchemaContractTests(unittest.TestCase):
     def test_additive_column_migrates_a_pre_existing_cursor_table(self):
         # A database created before cursor.path_missing shipped keeps its
         # data and gains the column on the next writer open (plan §8.4:
-        # additive only; a fresh database gets it from the DDL directly).
+        # additive only; a fresh database gets it from the DDL directly) —
+        # and the same convergence adds cursor.parse_error_runs (EC-04).
         self.connection.execute(
             "INSERT INTO cursor(path, session_id, source, identity_sha, size, mtime_ns, "
             "last_offset, first_seen, last_indexed_at) "
@@ -224,11 +226,16 @@ class SchemaContractTests(unittest.TestCase):
         migrated = twill_schema.connect(self.state_dir)
         self.addCleanup(migrated.close)
         columns = [row[1] for row in migrated.execute("PRAGMA table_info(cursor)")]
-        self.assertEqual(columns[-1], "path_missing")
+        self.assertEqual(columns[-2:], ["path_missing", "parse_error_runs"])
+        self.assertIn(
+            ("cursor", "parse_error_runs", "INTEGER NOT NULL DEFAULT 0"),
+            twill_schema.ADDITIVE_COLUMNS,
+        )
         row = migrated.execute(
-            "SELECT path, last_offset, path_missing FROM cursor"
+            "SELECT path, last_offset, parse_errors, parse_error_runs, path_missing "
+            "FROM cursor"
         ).fetchone()
-        self.assertEqual(row, ("/t/old.jsonl", 4, 0))
+        self.assertEqual(row, ("/t/old.jsonl", 4, 0, 0, 0))
         # The migrated shape matches a fresh one exactly.
         fresh = twill_schema.connect(self.state_dir.parent / "fresh")
         self.addCleanup(fresh.close)

@@ -123,7 +123,17 @@ class DoctorChecksTests(unittest.TestCase):
         self.assertEqual(check.details["stage"], "detect")
         self.assertTrue(check.details["misses"])
 
-    def add_cursor(self, *, now, first_seen=None, mtime_ns=None, session_id="s1"):
+    def add_cursor(
+        self,
+        *,
+        now,
+        first_seen=None,
+        mtime_ns=None,
+        session_id="s1",
+        parse_errors=0,
+        parse_error_runs=0,
+        path_missing=0,
+    ):
         first_seen = first_seen or now
         mtime_ns = (
             mtime_ns
@@ -133,9 +143,18 @@ class DoctorChecksTests(unittest.TestCase):
         connection = twill_schema.connect(self.state)
         connection.execute(
             "INSERT INTO cursor(path, session_id, source, identity_sha, size, mtime_ns, "
-            "last_offset, parse_errors, first_seen, last_indexed_at) "
-            "VALUES (?, ?, 'claude', 'sha', 1, ?, 1, 0, ?, ?)",
-            (f"/transcripts/{session_id}.jsonl", session_id, mtime_ns, first_seen.isoformat(), now.isoformat()),
+            "last_offset, parse_errors, parse_error_runs, first_seen, last_indexed_at, "
+            "path_missing) VALUES (?, ?, 'claude', 'sha', 1, ?, 1, ?, ?, ?, ?, ?)",
+            (
+                f"/transcripts/{session_id}.jsonl",
+                session_id,
+                mtime_ns,
+                parse_errors,
+                parse_error_runs,
+                first_seen.isoformat(),
+                now.isoformat(),
+                path_missing,
+            ),
         )
         connection.commit()
         connection.close()
@@ -535,11 +554,11 @@ class DoctorChecksTests(unittest.TestCase):
         connection = twill_schema.connect(self.state)
         connection.executemany(
             "INSERT INTO cursor(path, session_id, source, identity_sha, size, mtime_ns, "
-            "last_offset, parse_errors, first_seen, last_indexed_at, path_missing) "
-            "VALUES (?, ?, 'claude', 'sha', 1, 1, 0, ?, 't', 't', ?)",
+            "last_offset, parse_errors, parse_error_runs, first_seen, last_indexed_at, "
+            "path_missing) VALUES (?, ?, 'claude', 'sha', 1, 1, 0, ?, ?, 't', 't', ?)",
             [
-                ("/t/errors.jsonl", "s1", 1, 0),
-                ("/t/missing.jsonl", "s2", 0, 1),
+                ("/t/errors.jsonl", "s1", 1, 3, 0),
+                ("/t/missing.jsonl", "s2", 0, 0, 1),
             ],
         )
         connection.commit()
@@ -551,7 +570,65 @@ class DoctorChecksTests(unittest.TestCase):
         check = self.check(report, "cursor_health")
         self.assertEqual(check.status, twill_doctor.DEGRADED)
         self.assertEqual(check.details["parse_error_file_count"], 1)
+        self.assertEqual(check.details["parse_error_alarm_file_count"], 1)
         self.assertEqual(check.details["missing_path_count"], 1)
+
+    def test_parse_error_alarm_waits_for_three_runs_and_clears_cleanly(self):
+        now = datetime(2026, 9, 27, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.add_cursor(
+            now=now,
+            session_id="tail",
+            parse_errors=1,
+            parse_error_runs=2,
+        )
+        self.add_cursor(
+            now=now,
+            session_id="invalid",
+            parse_errors=1,
+            parse_error_runs=twill_doctor.PARSE_ERROR_ALARM_RUNS,
+        )
+
+        report = twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+        check = self.check(report, "cursor_health")
+        self.assertEqual(check.status, twill_doctor.DEGRADED)
+        self.assertEqual(check.details["parse_error_file_count"], 2)
+        self.assertEqual(check.details["parse_error_alarm_file_count"], 1)
+        self.assertEqual(
+            check.details["parse_error_alarm_files"],
+            [
+                {
+                    "path": "/transcripts/invalid.jsonl",
+                    "parse_errors": 1,
+                    "parse_error_runs": twill_doctor.PARSE_ERROR_ALARM_RUNS,
+                }
+            ],
+        )
+        self.assertIn("3+ consecutive runs", check.message)
+
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "UPDATE cursor SET parse_errors = 0, parse_error_runs = 0 "
+            "WHERE session_id = 'invalid'"
+        )
+        connection.commit()
+        connection.close()
+
+        report = twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+        check = self.check(report, "cursor_health")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["parse_error_file_count"], 1)
+        self.assertEqual(check.details["parse_error_alarm_file_count"], 0)
+        self.assertEqual(check.details["parse_error_alarm_files"], [])
+        self.assertIn("fewer than 3 consecutive runs", check.message)
 
     def test_rule_corpus_reports_hash_drift_and_vanished_paths(self):
         self.create_database()

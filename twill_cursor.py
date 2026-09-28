@@ -13,6 +13,9 @@ first 4 KiB (rewrite-in-place detection), the file size, and the committed
   rows in the same transaction that rewrites this row.
 - **EC-04 (torn final line):** bytes after the last newline are left for the
   next run — the offset never advances past a line that may still be growing.
+  ``parse_error_runs`` counts the consecutive runs ``parse_errors`` stayed
+  above zero (idle passes included), which is the signal ``doctor``'s alarm
+  reads; a clean pass zeroes both.
 - **EC-05 (vanished):** ``path_missing`` is flagged by :func:`mark_missing`;
   observations are never deleted on absence.
 
@@ -75,6 +78,7 @@ class CursorRow:
     mtime_ns: int
     last_offset: int
     parse_errors: int
+    parse_error_runs: int
     first_seen: str
     last_indexed_at: str
     path_missing: bool
@@ -89,6 +93,7 @@ _CURSOR_COLUMNS = (
     "mtime_ns",
     "last_offset",
     "parse_errors",
+    "parse_error_runs",
     "first_seen",
     "last_indexed_at",
     "path_missing",
@@ -131,7 +136,8 @@ class LineScan:
         Distinguishes "nothing new happened" from "a torn tail is waiting":
         an empty region leaves the stored row untouched (``parse_errors`` is
         sticky across idle passes so `doctor`'s three-consecutive-runs
-        signal can fire), a pending tail is recounted every pass.
+        signal can fire), while a pending tail is recounted every pass.  The
+        caller turns either nonzero result into one more consecutive run.
         """
 
         return self.new_offset == self.start_offset and not self.pending_tail
@@ -249,9 +255,10 @@ def load_cursor(connection: sqlite3.Connection, path: str) -> CursorRow | None:
         mtime_ns=row[5],
         last_offset=row[6],
         parse_errors=row[7],
-        first_seen=row[8],
-        last_indexed_at=row[9],
-        path_missing=bool(row[10]),
+        parse_error_runs=row[8],
+        first_seen=row[9],
+        last_indexed_at=row[10],
+        path_missing=bool(row[11]),
     )
 
 
@@ -264,23 +271,27 @@ def upsert_cursor(
     facts: FileFacts,
     last_offset: int,
     parse_errors: int,
+    parse_error_runs: int,
     now: str,
 ) -> None:
     """Write the cursor row after a parsed span, inside the caller's transaction.
 
     ``first_seen`` is set only on insert; every later write updates the
     resume position and clears ``path_missing`` — the file demonstrably
-    exists again.
+    exists again.  ``parse_error_runs`` is the EC-04 streak the caller derives
+    from this run's ``parse_errors`` and the row it replaces: one more run
+    with errors, or zero for a clean pass.
     """
 
     connection.execute(
         "INSERT INTO cursor(path, session_id, source, identity_sha, size, mtime_ns, "
-        "last_offset, parse_errors, first_seen, last_indexed_at, path_missing) "
-        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) "
+        "last_offset, parse_errors, parse_error_runs, first_seen, last_indexed_at, path_missing) "
+        "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 0) "
         "ON CONFLICT(path) DO UPDATE SET session_id=excluded.session_id, "
         "source=excluded.source, identity_sha=excluded.identity_sha, "
         "size=excluded.size, mtime_ns=excluded.mtime_ns, "
         "last_offset=excluded.last_offset, parse_errors=excluded.parse_errors, "
+        "parse_error_runs=excluded.parse_error_runs, "
         "last_indexed_at=excluded.last_indexed_at, path_missing=0",
         (
             path,
@@ -291,6 +302,7 @@ def upsert_cursor(
             facts.mtime_ns,
             last_offset,
             parse_errors,
+            parse_error_runs,
             now,
             now,
         ),

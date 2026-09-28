@@ -104,6 +104,7 @@ class PlanTests(unittest.TestCase):
             mtime_ns=path.stat().st_mtime_ns,
             last_offset=path.stat().st_size,
             parse_errors=0,
+            parse_error_runs=0,
             first_seen="2026-09-22T00:00:00+00:00",
             last_indexed_at="2026-09-22T00:00:00+00:00",
             path_missing=False,
@@ -394,15 +395,17 @@ class StoreCursorTests(unittest.TestCase):
         row = self.cursor_row(path)
         self.assertEqual(row.last_offset, len(complete.encode()))
         self.assertEqual(row.parse_errors, 1)
+        self.assertEqual(row.parse_error_runs, 1)
         self.assertEqual(self.observation_texts(), ["complete turn"])
 
         # Completing the torn line parses it on the next run and clears the
-        # error counter for the span.
+        # error counter — and the consecutive-run streak — for the span.
         with path.open("a") as handle:
             handle.write('f turn"}}\n')
         self.store.ingest_path(path)
         row = self.cursor_row(path)
         self.assertEqual(row.parse_errors, 0)
+        self.assertEqual(row.parse_error_runs, 0)
         self.assertEqual(row.last_offset, path.stat().st_size)
         self.assertEqual(self.observation_texts(), ["complete turn", "half turn"])
 
@@ -412,10 +415,45 @@ class StoreCursorTests(unittest.TestCase):
         path.write_text(complete + '{"half":')
         self.store.ingest_path(path)
         self.assertEqual(self.cursor_row(path).parse_errors, 1)
-        self.store.ingest_path(path)
+        self.assertEqual(self.cursor_row(path).parse_error_runs, 1)
         self.store.ingest_path(path)
         self.assertEqual(self.cursor_row(path).parse_errors, 1)
+        self.assertEqual(self.cursor_row(path).parse_error_runs, 2)
+        self.store.ingest_path(path)
+        self.assertEqual(self.cursor_row(path).parse_errors, 1)
+        self.assertEqual(self.cursor_row(path).parse_error_runs, 3)
         self.assertEqual(self.cursor_row(path).last_offset, len(complete.encode()))
+
+    def test_error_streak_accrues_across_idle_passes_and_clears_on_clean_append(self):
+        # EC-04's alarm input: every run that leaves parse_errors above zero —
+        # an idle pass carrying the sticky counter, or a tail that grew but
+        # still has no newline — is one more consecutive run, and the first
+        # clean pass restarts the streak from zero.
+        complete = claude_line("cursor-session", "complete turn", 0) + "\n"
+        path = self.root / "streak.jsonl"
+        path.write_text(complete + '{"type":"user","message":{"content":"hal')
+        self.store.ingest_path(path)
+        self.assertEqual(self.cursor_row(path).parse_error_runs, 1)
+
+        self.store.ingest_path(path)  # idle: nothing new, counter sticky
+        self.assertEqual(self.cursor_row(path).parse_error_runs, 2)
+
+        with path.open("a") as handle:  # tail grows, still unterminated
+            handle.write('f tu')
+        self.store.ingest_path(path)
+        row = self.cursor_row(path)
+        self.assertEqual(row.parse_errors, 1)
+        self.assertEqual(row.parse_error_runs, 3)
+        self.assertEqual(row.last_offset, len(complete.encode()))
+
+        with path.open("a") as handle:  # the line finally completes
+            handle.write('rn"}}\n')
+        self.store.ingest_path(path)
+        row = self.cursor_row(path)
+        self.assertEqual(row.parse_errors, 0)
+        self.assertEqual(row.parse_error_runs, 0)
+        self.assertEqual(row.last_offset, path.stat().st_size)
+        self.assertEqual(self.observation_texts(), ["complete turn", "half turn"])
 
     def test_flushed_but_invalid_final_line_is_counted_and_passed(self):
         # The corpus's truncated fixture: the record is torn but its newline
@@ -428,13 +466,16 @@ class StoreCursorTests(unittest.TestCase):
         row = self.cursor_row(path)
         self.assertEqual(row.last_offset, path.stat().st_size)
         self.assertEqual(row.parse_errors, 1)
+        self.assertEqual(row.parse_error_runs, 1)
         self.assertIn("The complete line is available", " ".join(self.observation_texts("claude-truncated-001")))
         self.assertNotIn("half-written", " ".join(self.observation_texts("claude-truncated-001")))
 
         with path.open("a") as handle:
             handle.write(claude_line("claude-truncated-001", "after repair", 3) + "\n")
         self.store.ingest_path(path)
-        self.assertEqual(self.cursor_row(path).parse_errors, 0)
+        row = self.cursor_row(path)
+        self.assertEqual(row.parse_errors, 0)
+        self.assertEqual(row.parse_error_runs, 0)
         self.assertIn("after repair", self.observation_texts("claude-truncated-001"))
 
     # -- EC-05: transcript disappears between runs ----------------------------

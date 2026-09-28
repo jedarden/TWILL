@@ -942,6 +942,23 @@ class CursorUpdate:
     facts: twill_cursor.FileFacts
     last_offset: int
     parse_errors: int
+    parse_error_runs: int
+
+
+def _next_parse_error_runs(
+    row: twill_cursor.CursorRow | None, parse_errors: int
+) -> int:
+    """Advance the EC-04 streak for one ingest run of one file.
+
+    ``parse_errors`` is a per-pass count (docs/notes/cursor-semantics.md), so
+    the three-consecutive-runs alarm needs this beside it: every run that
+    leaves the counter above zero — including an idle pass carrying a sticky
+    value — is one more consecutive run, and any clean pass restarts the
+    streak from zero.
+    """
+
+    previous = row.parse_error_runs if row is not None else 0
+    return previous + 1 if parse_errors > 0 else 0
 
 
 class Store:
@@ -1152,6 +1169,7 @@ class Store:
                     facts=cursor_update.facts,
                     last_offset=cursor_update.last_offset,
                     parse_errors=cursor_update.parse_errors,
+                    parse_error_runs=cursor_update.parse_error_runs,
                     now=now,
                 )
         return observation_count
@@ -1182,6 +1200,7 @@ class Store:
             # bookkeeping is refreshed; an empty region keeps the stored
             # parse_errors sticky so doctor's consecutive-run signal can fire.
             parse_errors = row.parse_errors if scan.region_empty else 1
+            parse_error_runs = _next_parse_error_runs(row, parse_errors)
             now = datetime.now(timezone.utc).isoformat()
             with self.connection:
                 twill_cursor.upsert_cursor(
@@ -1192,6 +1211,7 @@ class Store:
                     facts=facts,
                     last_offset=scan.new_offset,
                     parse_errors=parse_errors,
+                    parse_error_runs=parse_error_runs,
                     now=now,
                 )
             observations = self._count_observations(row.session_id)
@@ -1209,12 +1229,18 @@ class Store:
         )
         session, invalid_lines = parse_scan(path, scan, fallback_id)
         parse_errors = invalid_lines + (1 if scan.pending_tail else 0)
+        parse_error_runs = _next_parse_error_runs(row, parse_errors)
         stale_ids = (row.session_id,) if row is not None else ()
         observations = self._persist(
             session,
             replace=plan.replace_session,
             stale_session_ids=stale_ids,
-            cursor_update=CursorUpdate(facts, scan.new_offset, parse_errors),
+            cursor_update=CursorUpdate(
+                facts=facts,
+                last_offset=scan.new_offset,
+                parse_errors=parse_errors,
+                parse_error_runs=parse_error_runs,
+            ),
         )
         return {
             "path": str(path),

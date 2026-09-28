@@ -45,6 +45,11 @@ FREE_DISK_WARN_BYTES = 5 * 1024**3
 TIMER_INTERVALS = {"ingest": 3600.0}
 DEAD_MAN_WINDOW_SECONDS = 24 * 3600.0
 ZERO_OUTPUT_CONSECUTIVE_WEEKS = 2
+# EC-04 (§8.1): a torn tail or one flushed-but-invalid line is a normal pass;
+# the alarm waits for parse_errors > 0 across this many consecutive runs —
+# the streak ingest maintains in cursor.parse_error_runs, which idle passes
+# extend precisely because the per-pass counter is sticky.
+PARSE_ERROR_ALARM_RUNS = 3
 # §8.2's parser-drift tolerance lives in how the trailing median is taken:
 # "current" pools the newest runs so one sparse ingest — a lone settled
 # append of three records — cannot read as a vanished type (the zero-output
@@ -376,6 +381,18 @@ def _check_cursor_health(
     connection: sqlite3.Connection | None,
     open_error: str | None,
 ) -> CheckResult:
+    """Report cursor anomalies, with EC-04's alarm gated on the run streak.
+
+    One pass with ``parse_errors > 0`` is normal operation — a torn tail the
+    producer may still finish, or one flushed-but-invalid line the cursor
+    already advanced past — so it is carried in the details without failing
+    the check.  The alarm (plan §8.1 EC-04) fires for a file whose errors
+    held across :data:`PARSE_ERROR_ALARM_RUNS` consecutive runs, the streak
+    ``ingest`` maintains in ``cursor.parse_error_runs``: that is a persistent
+    parse condition, whether the source was a tail or a flushed bad line.
+    Vanished paths (EC-05) degrade as before.
+    """
+
     if connection is None:
         return _result(
             "cursor_health",
@@ -385,7 +402,7 @@ def _check_cursor_health(
         )
     try:
         rows = connection.execute(
-            "SELECT path, parse_errors, path_missing FROM cursor"
+            "SELECT path, parse_errors, parse_error_runs, path_missing FROM cursor"
         ).fetchall()
     except Exception as exc:
         return _result(
@@ -396,12 +413,15 @@ def _check_cursor_health(
         )
     parse_errors: list[dict[str, object]] = []
     missing_paths: list[str] = []
-    for row_index, (path, error_count, path_missing) in enumerate(rows):
+    for row_index, (path, error_count, error_runs, path_missing) in enumerate(rows):
         if (
             not isinstance(path, str)
             or isinstance(error_count, bool)
             or not isinstance(error_count, int)
             or error_count < 0
+            or isinstance(error_runs, bool)
+            or not isinstance(error_runs, int)
+            or error_runs < 0
             or isinstance(path_missing, bool)
             or not isinstance(path_missing, int)
             or path_missing < 0
@@ -414,23 +434,48 @@ def _check_cursor_health(
             )
         safe_path = redact_text(path)
         if error_count > 0:
-            parse_errors.append({"path": safe_path, "parse_errors": error_count})
+            parse_errors.append(
+                {
+                    "path": safe_path,
+                    "parse_errors": error_count,
+                    "parse_error_runs": error_runs,
+                }
+            )
         if path_missing != 0:
             missing_paths.append(safe_path)
     parse_errors.sort(key=lambda item: str(item["path"]))
     missing_paths.sort()
+    # Keep the full parse-error list for diagnosis, but only promote files
+    # whose consecutive-run streak reached the EC-04 threshold to an alarm.
+    alarm = [
+        item
+        for item in parse_errors
+        if int(item["parse_error_runs"]) >= PARSE_ERROR_ALARM_RUNS
+    ]
     details = {
         "parse_error_files": parse_errors,
-        "missing_paths": missing_paths,
+        "parse_error_alarm_runs": PARSE_ERROR_ALARM_RUNS,
+        "parse_error_alarm_files": alarm,
         "parse_error_file_count": len(parse_errors),
+        "parse_error_alarm_file_count": len(alarm),
+        "missing_paths": missing_paths,
         "missing_path_count": len(missing_paths),
     }
-    if not parse_errors and not missing_paths:
+    if not alarm and not missing_paths:
+        if parse_errors:
+            return _result(
+                "cursor_health",
+                HEALTHY,
+                f"{len(parse_errors)} cursor file(s) have parse errors on fewer "
+                f"than {PARSE_ERROR_ALARM_RUNS} consecutive runs",
+                details,
+            )
         return _result("cursor_health", HEALTHY, "no cursor anomalies", details)
     return _result(
         "cursor_health",
         DEGRADED,
-        f"{len(parse_errors)} cursor file(s) have parse errors; "
+        f"{len(alarm)} cursor file(s) have parse errors on "
+        f"{PARSE_ERROR_ALARM_RUNS}+ consecutive runs; "
         f"{len(missing_paths)} path(s) are missing",
         details,
     )

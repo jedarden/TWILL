@@ -16,7 +16,8 @@ newest migration is opened untouched (the stamp is never lowered, unknown
 columns are kept), which is what lets a rolled-back release still read a newer
 database.  The v1 tables are not migration consumers: they come from
 ``V1_SCHEMA`` directly, and the columns added after the v1 DDL shipped —
-``cursor.path_missing`` (EC-05) and ``rule_doc.stale`` (EC-11) — remain inline
+``cursor.path_missing`` (EC-05), ``cursor.parse_error_runs`` (EC-04) and
+``rule_doc.stale`` (EC-11) — remain inline
 baseline convergence via :func:`_apply_additive_columns`, idempotently, so a
 database created before they exist converges on the same shape a fresh one
 gets.  The interim Phase 0 working tables (``session``, ``transcript_event``)
@@ -68,6 +69,11 @@ ADDITIVE_COLUMNS = (
     # EC-05: a vanished upstream transcript is flagged, never avenged — its
     # observations survive and `doctor` reports the spike.
     ("cursor", "path_missing", "INTEGER NOT NULL DEFAULT 0"),
+    # EC-04: `parse_errors` is a per-pass count, so the alarm needs the run
+    # streak beside it — every ingest run that leaves errors increments it,
+    # including idle passes that carry a sticky count; a clean pass resets it,
+    # and `doctor` alarms at three.
+    ("cursor", "parse_error_runs", "INTEGER NOT NULL DEFAULT 0"),
     # EC-11 (§8.1): a vanished rule file is flagged stale, never deleted —
     # its row and FTS text survive so coverage degrades visibly, not
     # silently.
@@ -84,7 +90,8 @@ CREATE TABLE IF NOT EXISTS cursor(
   last_offset INTEGER NOT NULL DEFAULT 0,
   parse_errors INTEGER NOT NULL DEFAULT 0,
   first_seen TEXT NOT NULL, last_indexed_at TEXT NOT NULL,
-  path_missing INTEGER NOT NULL DEFAULT 0);   -- EC-05: vanished upstream, evidence kept
+  path_missing INTEGER NOT NULL DEFAULT 0,   -- EC-05: vanished upstream, evidence kept
+  parse_error_runs INTEGER NOT NULL DEFAULT 0);  -- EC-04: consecutive runs with parse_errors > 0
 
 -- the atom of evidence; text fields are POST-redaction and <=240 chars
 CREATE TABLE IF NOT EXISTS observation(
