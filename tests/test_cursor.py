@@ -154,6 +154,33 @@ class PlanTests(unittest.TestCase):
         self.assertEqual(plan.action, twill_cursor.ACTION_RESUME)
         self.assertEqual(plan.start_offset, len(small))
 
+    def test_changed_stored_prefix_reparses_after_growth_past_4kib(self):
+        stored = b"a" * 4000
+        path = self.write("changed-boundary.bin", stored)
+        row = self.row(path)
+        path.write_bytes(b"b" + stored[1:] + b"growth" * 100)
+
+        self.assertGreater(path.stat().st_size, twill_cursor.IDENTITY_PREFIX_BYTES)
+        plan = self.plan(path, row)
+        self.assertEqual(plan.action, twill_cursor.ACTION_REPARSE)
+        self.assertEqual(plan.reason, twill_cursor.REASON_IDENTITY_CHANGED)
+        self.assertEqual(plan.start_offset, 0)
+        self.assertTrue(plan.replace_session)
+
+    def test_mtime_only_change_resumes_at_last_offset(self):
+        path = self.write("mtime-only.jsonl", b'{"one":1}\n')
+        row = self.row(path)
+        stat = path.stat()
+        os.utime(path, ns=(stat.st_atime_ns, stat.st_mtime_ns + 1_000_000_000))
+
+        facts = twill_cursor.file_facts(path)
+        self.assertNotEqual(facts.mtime_ns, row.mtime_ns)
+        self.assertEqual(facts.size, row.size)
+        self.assertEqual(facts.identity_sha, row.identity_sha)
+        plan = twill_cursor.plan_ingest(row, path, facts)
+        self.assertEqual(plan.action, twill_cursor.ACTION_RESUME)
+        self.assertEqual(plan.start_offset, row.last_offset)
+
     def test_rewrite_in_place_reparses(self):
         path = self.write("rewritten.jsonl", b'{"version":1}\n{"x":1}\n')
         row = self.row(path)
@@ -230,6 +257,26 @@ class ScanTests(unittest.TestCase):
         self.assertEqual(scan.new_offset, len(b'{"one":1}\n'))
         self.assertTrue(scan.pending_tail)
         self.assertFalse(scan.region_empty)
+
+    def test_offset_waits_for_newline_when_a_tail_grows(self):
+        complete = b'{"one":1}\n'
+        path = self.write("growing-tail.jsonl", complete + b'{"two":2')
+
+        first = twill_cursor.scan_lines(path, 0)
+        self.assertEqual(first.new_offset, len(complete))
+        self.assertTrue(first.pending_tail)
+
+        with path.open("ab") as handle:
+            handle.write(b" still incomplete")
+        second = twill_cursor.scan_lines(path, first.new_offset)
+        self.assertEqual(second.new_offset, first.new_offset)
+        self.assertTrue(second.pending_tail)
+
+        with path.open("ab") as handle:
+            handle.write(b"}\n")
+        third = twill_cursor.scan_lines(path, second.new_offset)
+        self.assertEqual(third.new_offset, path.stat().st_size)
+        self.assertFalse(third.pending_tail)
 
     def test_empty_region_reports_nothing(self):
         path = self.write("empty-region.jsonl", b'{"one":1}\n')
