@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 
 import twill_rulecorpus  # noqa: E402
 import twill_schema  # noqa: E402
+import twill_detectors  # noqa: E402
 from twill_rulecorpus import (  # noqa: E402
     DEFAULT_RULE_GLOBS,
     MAX_RULE_DOC_BYTES,
@@ -432,6 +433,7 @@ class IndexTests(CorpusTestCase):
         self.index()
         memory.unlink()
         self.index(now=LATER)
+        self.assertEqual(self.rule_row(memory)[4], 1)
         memory.write_text(MEMORY_TEXT)
         third = self.index(now="2026-09-23T23:00:00+00:00")
 
@@ -444,12 +446,59 @@ class IndexTests(CorpusTestCase):
         self.index()
         memory.unlink()
         self.index(now=LATER)
-        memory.write_text("# Memory\n\nUse bead, never bf.\n")
+        new_text = "# Memory\n\nUse bead, never bf.\n"
+        memory.write_text(new_text)
         third = self.index(now="2026-09-23T23:00:00+00:00")
 
         self.assertEqual(third.reindexed, (str(memory.resolve()),))
         self.assertEqual(self.rule_row(memory)[4], 0)
+        self.assertEqual(
+            self.rule_row(memory)[1], hashlib.sha256(new_text.encode()).hexdigest()
+        )
         self.assertEqual(self.fts_paths("bead"), [str(memory.resolve())])
+
+    def test_stale_read_history_is_restored_for_d09(self):
+        memory = self.write_doc("home/projects/p/memory/MEMORY.md", MEMORY_TEXT)
+        self.index()
+        memory.unlink()
+        self.index(now=LATER)
+        self.assertEqual(self.rule_row(memory)[4], 1)
+
+        # The file is still absent when the observation is materialized.  The
+        # retained stale row must resolve the path to its old content hash;
+        # reading the path from disk is impossible in this interval.
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
+            "VALUES ('read-session', ?, ?, 'file_read', ?)",
+            (
+                "2026-09-23T19:00:00+00:00",
+                "2026-09-23T19:00:00+00:00",
+                str(memory),
+            ),
+        )
+        self.connection.commit()
+        stale_report = self.index(now="2026-09-23T19:30:00+00:00")
+        self.assertEqual(stale_report.still_stale, 1)
+        self.assertEqual(
+            self.rule_row(memory)[3], "2026-09-23T19:00:00+00:00"
+        )
+
+        memory.write_text(MEMORY_TEXT)
+        restored_report = self.index(now="2026-09-23T20:00:00+00:00")
+        self.assertEqual(restored_report.restored, (str(memory.resolve()),))
+        self.assertEqual(self.rule_row(memory)[4], 0)
+
+        d09 = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.UNREAD_RULE_DOC,),
+            now="2026-09-23T20:00:00+00:00",
+        )
+        self.assertEqual(d09.exit_code, 0)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in d09.outcomes],
+            [("D-09@1", "ok", 0)],
+        )
 
     def test_present_but_unglobbed_file_is_not_marked_stale(self):
         # Existence is checked per stored path, not against this run's
