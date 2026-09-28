@@ -35,6 +35,7 @@ sys.path.insert(0, str(ROOT))
 
 import twill_app  # noqa: E402
 import twill_detectors  # noqa: E402
+import twill_measure  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_config import TwillConfig  # noqa: E402
 from twill_contract import (  # noqa: E402
@@ -787,6 +788,120 @@ class DetectorRunTests(unittest.TestCase):
         )
         for row in cluster_rows(self.connection, "D-01"):
             self.assertEqual(row[3], 1)  # one session per command-level cluster
+
+    def test_version_rollover_keeps_active_identity_and_history(self):
+        artifacts = Path(self._temporary.name) / "artifacts"
+        lessons = artifacts / "lessons"
+        lessons.mkdir(parents=True)
+        (lessons / "L-00000001.md").write_text(
+            "\n".join(
+                (
+                    "---",
+                    "id: L-00000001",
+                    'summary: "A command fails repeatedly. Install it before retrying."',
+                    "state: accepted",
+                    "detector: D-01",
+                    'key: "sqlite3"',
+                    'evidence: {sessions: 2, events: 2, first_seen: 2026-09-20, '
+                    'session_ids: ["s1", "s2"]}',
+                    "routing: {recommended: null, applied: null, applied_at: null, bead: null}",
+                    "backtest: {window_days: 180, sessions: 2, first_seen: 2026-09-20, "
+                    "weeks_present: 1}",
+                    "guard: {layer: null, artifact: null, installed: false}",
+                    "---",
+                    "",
+                )
+            ),
+            encoding="utf-8",
+        )
+
+        seed_observation(self.connection, program="sqlite3", session_id="s1")
+        seed_observation(self.connection, program="sqlite3", session_id="s2")
+        v1 = make_detector("D-01", 1, sql=program_failure_sql("program"))
+        first = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(v1,),
+            now="2026-09-27T12:00:00+00:00",
+        )
+        self.assertEqual(first.exit_code, EXIT_SUCCESS)
+
+        with self.connection:
+            self.connection.execute(
+                "UPDATE cluster SET state = 'drafted', covered_by = ?, score = 4.5 "
+                "WHERE detector_id = 'D-01' AND key = 'sqlite3'",
+                ("AGENTS.md",),
+            )
+        first_measurement = twill_measure.measure_lessons(
+            self.connection,
+            artifacts,
+            registry=(v1,),
+            now="2026-09-27T12:00:00Z",
+            window_days=30,
+        )
+        self.assertEqual(first_measurement.measurements[0].detector_id, "D-01@1")
+
+        v2_sql = program_failure_sql("program").replace(
+            "WHERE kind = 'run_failed'",
+            "WHERE kind IN ('run_failed', 'tool_error')",
+        )
+        v2 = make_detector("D-01", 2, sql=v2_sql)
+        active_registry = twill_detectors.build_registry(v2)
+        self.assertEqual(active_registry, (v2,))
+        self.assertEqual(
+            twill_detectors.select_detectors(active_registry, ("D-01",)),
+            (v2,),
+        )
+        with self.assertRaises(ValueError):
+            twill_detectors.build_registry(v1, v2)
+
+        seed_observation(
+            self.connection,
+            program="sqlite3",
+            session_id="s3",
+            kind="tool_error",
+        )
+        second = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=active_registry,
+            now="2026-09-28T12:00:00+00:00",
+        )
+        self.assertEqual(second.exit_code, EXIT_SUCCESS)
+
+        cluster = self.connection.execute(
+            "SELECT detector_id, key, sessions, events, score, covered_by, state "
+            "FROM cluster ORDER BY detector_id, key"
+        ).fetchall()
+        self.assertEqual(
+            cluster,
+            [("D-01", "sqlite3", 3, 3, 4.5, "AGENTS.md", "drafted")],
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT version, full_id FROM detector_run "
+                "WHERE detector_id = 'D-01' ORDER BY version"
+            ).fetchall(),
+            [(1, "D-01@1"), (2, "D-01@2")],
+        )
+
+        second_measurement = twill_measure.measure_lessons(
+            self.connection,
+            artifacts,
+            registry=active_registry,
+            now="2026-09-28T12:00:00Z",
+            window_days=30,
+        )
+        self.assertEqual(second_measurement.measurements[0].detector_id, "D-01@2")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT detector_id, sessions, events FROM measurement "
+                "ORDER BY measured_at"
+            ).fetchall(),
+            [("D-01@1", 2, 2), ("D-01@2", 3, 3)],
+        )
+        mirror = twill_measure.measurement_path(artifacts, "L-00000001")
+        self.assertEqual(len(mirror.read_text(encoding="utf-8").splitlines()), 2)
 
     def test_refresh_deletes_stale_open_clusters_and_keeps_review_state(self):
         seed_observation(self.connection, program="sqlite3", session_id="s1")
