@@ -338,6 +338,16 @@ class StoreCursorTests(unittest.TestCase):
             )
         )
 
+    def assert_offset_after_newline(self, path: Path) -> None:
+        row = self.cursor_row(path)
+        payload = path.read_bytes()
+        self.assertGreaterEqual(row.last_offset, 0)
+        self.assertLessEqual(row.last_offset, len(payload))
+        self.assertTrue(
+            row.last_offset == 0 or payload[row.last_offset - 1 : row.last_offset] == b"\n",
+            f"last_offset={row.last_offset} is not immediately after a newline",
+        )
+
     # -- EC-02: file grew since last run --------------------------------------
 
     def test_append_resumes_at_last_offset(self):
@@ -524,6 +534,33 @@ class StoreCursorTests(unittest.TestCase):
         self.assertEqual(row.parse_errors, 0)
         self.assertEqual(row.parse_error_runs, 0)
         self.assertIn("after repair", self.observation_texts("claude-truncated-001"))
+
+    def test_last_offset_only_lands_after_a_newline_across_tail_lifecycle(self):
+        complete = claude_line("cursor-session", "complete turn", 0) + "\n"
+        path = self.root / "boundaries.jsonl"
+        path.write_bytes((complete + '{"type":"user","message":{"content":"half').encode())
+        self.store.ingest_path(path)
+        self.assert_offset_after_newline(path)
+        self.assertEqual(self.cursor_row(path).last_offset, len(complete.encode()))
+
+        with path.open("ab") as handle:
+            handle.write(b' turn"}}\n')
+        self.store.ingest_path(path)
+        self.assert_offset_after_newline(path)
+        self.assertEqual(self.cursor_row(path).parse_errors, 0)
+
+        with path.open("ab") as handle:
+            handle.write(b"not-json\n")
+        self.store.ingest_path(path)
+        self.assert_offset_after_newline(path)
+        self.assertEqual(self.cursor_row(path).parse_errors, 1)
+
+        with path.open("a") as handle:
+            handle.write(claude_line("cursor-session", "after corrupt line", 2) + "\n")
+        self.store.ingest_path(path)
+        self.assert_offset_after_newline(path)
+        self.assertEqual(self.cursor_row(path).parse_errors, 0)
+        self.assertIn("after corrupt line", self.observation_texts())
 
     # -- EC-05: transcript disappears between runs ----------------------------
 
