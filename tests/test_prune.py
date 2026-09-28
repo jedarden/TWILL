@@ -84,16 +84,21 @@ class PruneTests(unittest.TestCase):
         self.connection = twill_schema.connect(self.state)
         self.addCleanup(self.connection.close)
 
-    def test_old_observations_are_removed_at_the_retention_boundary(self):
+    def test_records_at_cutoff_survive_and_just_beyond_cutoff_are_removed(self):
         boundary = NOW - timedelta(days=180)
         seed_observation(
             self.connection,
-            "old-micro",
+            "just-beyond-cutoff",
             boundary - timedelta(microseconds=1),
-            "old",
+            "just-beyond",
         )
-        seed_observation(self.connection, "old", NOW - timedelta(days=181), "old")
-        seed_observation(self.connection, "boundary", boundary, "boundary")
+        seed_observation(self.connection, "at-cutoff", boundary, "at-cutoff")
+        seed_observation(
+            self.connection,
+            "just-inside-cutoff",
+            boundary + timedelta(microseconds=1),
+            "just-inside",
+        )
         seed_observation(self.connection, "recent", NOW - timedelta(days=1), "recent")
         self.connection.commit()
 
@@ -101,19 +106,206 @@ class PruneTests(unittest.TestCase):
             self.connection,
             retention_seconds=180 * 86400,
             now=NOW,
-            registry=(detector(),),
+            registry=(),
         )
 
         self.assertTrue(report.committed)
-        self.assertEqual(report.pruned_observations, 2)
-        self.assertEqual(report.remaining_observations, 2)
+        self.assertEqual(report.pruned_observations, 1)
+        self.assertEqual(report.remaining_observations, 3)
         self.assertEqual(
             [row[0] for row in self.connection.execute(
                 "SELECT session_id FROM observation ORDER BY session_id"
             )],
-            ["boundary", "recent"],
+            ["at-cutoff", "just-inside-cutoff", "recent"],
         )
         self.assertEqual(report.cutoff_utc, boundary.isoformat())
+
+    def test_repeated_prune_runs_are_idempotent(self):
+        seed_observation(self.connection, "expired", NOW - timedelta(days=181), "old")
+        seed_observation(self.connection, "retained", NOW - timedelta(days=1), "new")
+        self.connection.commit()
+
+        first = twill_prune.prune_observations(
+            self.connection,
+            retention_days=180,
+            now=NOW,
+            registry=(),
+        )
+        after_first = self.connection.execute(
+            "SELECT session_id, ts_utc, program FROM observation ORDER BY session_id"
+        ).fetchall()
+
+        second = twill_prune.prune_observations(
+            self.connection,
+            retention_days=180,
+            now=NOW,
+            registry=(),
+        )
+
+        self.assertEqual(first.pruned_observations, 1)
+        self.assertEqual(first.remaining_observations, 1)
+        self.assertEqual(second.pruned_observations, 0)
+        self.assertEqual(second.remaining_observations, 1)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT session_id, ts_utc, program FROM observation ORDER BY session_id"
+            ).fetchall(),
+            after_first,
+        )
+
+    def test_empty_state_prune_is_a_noop(self):
+        report = twill_prune.prune_observations(
+            self.connection,
+            retention_days=180,
+            now=NOW,
+            registry=(),
+        )
+
+        self.assertTrue(report.committed)
+        self.assertEqual(report.pruned_observations, 0)
+        self.assertEqual(report.remaining_observations, 0)
+        self.assertEqual(report.clusters, 0)
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM observation").fetchone()[0],
+            0,
+        )
+
+    def test_prune_preserves_source_files_and_unrelated_state(self):
+        transcript = self.root / "transcripts" / "session.jsonl"
+        rule_document = self.root / "rules" / "AGENTS.md"
+        transcript.parent.mkdir()
+        rule_document.parent.mkdir()
+        transcript.write_bytes(b'{"type":"user","message":{"content":"keep"}}\n')
+        rule_document.write_bytes(b"Keep this rule document unchanged.\n")
+        source_snapshots = {
+            path: (path.read_bytes(), path.stat().st_mtime_ns)
+            for path in (transcript, rule_document)
+        }
+
+        seed_observation(self.connection, "expired", NOW - timedelta(days=181), "old")
+        self.connection.execute(
+            "INSERT INTO cursor(path, session_id, source, identity_sha, size, mtime_ns, "
+            "first_seen, last_indexed_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                str(transcript),
+                "expired",
+                "claude",
+                "source-sha",
+                transcript.stat().st_size,
+                transcript.stat().st_mtime_ns,
+                NOW.isoformat(),
+                NOW.isoformat(),
+            ),
+        )
+        self.connection.execute(
+            "INSERT INTO rule_doc(path, layer, sha, indexed_at, last_read_by_agent) "
+            "VALUES (?, ?, ?, ?, ?)",
+            (str(rule_document), "agents_md", "rule-sha", NOW.isoformat(), None),
+        )
+        self.connection.execute(
+            "INSERT INTO rule_fts(text, path) VALUES (?, ?)",
+            (rule_document.read_text(), str(rule_document)),
+        )
+        self.connection.execute(
+            "INSERT INTO session_usage(session_id, model, input_tokens, output_tokens, "
+            "cache_read_tokens, cost_usd, wall_seconds, messages) "
+            "VALUES ('unrelated-session', 'fixture-model', 1, 2, 3, 0.04, 5, 6)"
+        )
+        self.connection.execute(
+            "INSERT INTO measurement(lesson_id, detector_id, measured_at, window_days, "
+            "sessions, events) VALUES ('L-00000001', 'D-01@1', ?, 30, 4, 5)",
+            (NOW.isoformat(),),
+        )
+        self.connection.execute(
+            "INSERT INTO cluster_week(detector_id, key, week, sessions, events) "
+            "VALUES ('D-01', 'unrelated', '2026-W39', 2, 3)"
+        )
+        self.connection.execute(
+            "INSERT INTO meta(key, value, updated_at) VALUES ('unrelated', 'keep', ?)",
+            (NOW.isoformat(),),
+        )
+        unrelated_before = {
+            "cursor": self.connection.execute(
+                "SELECT path, session_id, source, identity_sha, size, mtime_ns, "
+                "first_seen, last_indexed_at, path_missing, parse_error_runs "
+                "FROM cursor"
+            ).fetchall(),
+            "rule_doc": self.connection.execute(
+                "SELECT path, layer, sha, indexed_at, last_read_by_agent, stale "
+                "FROM rule_doc"
+            ).fetchall(),
+            "rule_fts": self.connection.execute(
+                "SELECT text, path FROM rule_fts"
+            ).fetchall(),
+            "session_usage": self.connection.execute(
+                "SELECT session_id, model, input_tokens, output_tokens, "
+                "cache_read_tokens, cost_usd, wall_seconds, messages FROM session_usage"
+            ).fetchall(),
+            "measurement": self.connection.execute(
+                "SELECT lesson_id, detector_id, measured_at, window_days, sessions, events "
+                "FROM measurement"
+            ).fetchall(),
+            "cluster_week": self.connection.execute(
+                "SELECT detector_id, key, week, sessions, events FROM cluster_week"
+            ).fetchall(),
+            "meta": self.connection.execute(
+                "SELECT key, value, updated_at FROM meta WHERE key = 'unrelated'"
+            ).fetchall(),
+        }
+        self.connection.commit()
+
+        report = twill_prune.prune_observations(
+            self.connection,
+            retention_days=180,
+            now=NOW,
+            registry=(),
+        )
+
+        self.assertEqual(report.pruned_observations, 1)
+        self.assertEqual(
+            {
+                path: (path.read_bytes(), path.stat().st_mtime_ns)
+                for path in (transcript, rule_document)
+            },
+            source_snapshots,
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM cursor").fetchone()[0], 1
+        )
+        self.assertEqual(
+            self.connection.execute("SELECT count(*) FROM rule_doc").fetchone()[0], 1
+        )
+        self.assertEqual(
+            {
+                "cursor": self.connection.execute(
+                    "SELECT path, session_id, source, identity_sha, size, mtime_ns, "
+                    "first_seen, last_indexed_at, path_missing, parse_error_runs "
+                    "FROM cursor"
+                ).fetchall(),
+                "rule_doc": self.connection.execute(
+                    "SELECT path, layer, sha, indexed_at, last_read_by_agent, stale "
+                    "FROM rule_doc"
+                ).fetchall(),
+                "rule_fts": self.connection.execute(
+                    "SELECT text, path FROM rule_fts"
+                ).fetchall(),
+                "session_usage": self.connection.execute(
+                    "SELECT session_id, model, input_tokens, output_tokens, "
+                    "cache_read_tokens, cost_usd, wall_seconds, messages FROM session_usage"
+                ).fetchall(),
+                "measurement": self.connection.execute(
+                    "SELECT lesson_id, detector_id, measured_at, window_days, sessions, events "
+                    "FROM measurement"
+                ).fetchall(),
+                "cluster_week": self.connection.execute(
+                    "SELECT detector_id, key, week, sessions, events FROM cluster_week"
+                ).fetchall(),
+                "meta": self.connection.execute(
+                    "SELECT key, value, updated_at FROM meta WHERE key = 'unrelated'"
+                ).fetchall(),
+            },
+            unrelated_before,
+        )
 
     def test_cluster_refresh_uses_the_previous_analysis_window(self):
         fixture = detector()
