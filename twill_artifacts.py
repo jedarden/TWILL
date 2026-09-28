@@ -570,6 +570,17 @@ def read_manifest(
         raise ArtifactContractError("artifact tree cannot be read") from exc
     if set(listed) != set(actual):
         raise ArtifactContractError("manifest inventory does not match the artifact tree")
+    # Compare the manifest with the single complete inventory scan before any
+    # consumer uses the candidate. This closes the producer/consumer handoff
+    # boundary for a worktree caught between file renames: a manifest from one
+    # snapshot cannot be paired with bytes observed from another.
+    for relative, item in listed.items():
+        observed = actual[relative]
+        if (
+            observed["bytes"] != item["bytes"]
+            or observed["sha256"] != item["sha256"]
+        ):
+            raise ArtifactContractError(f"manifest hash/size mismatch for {relative}")
     for relative, item in listed.items():
         path = root / relative
         content = path.read_bytes()

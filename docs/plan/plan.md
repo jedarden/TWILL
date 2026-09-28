@@ -452,11 +452,15 @@ The private repository is a versioned pull transport, not an ad-hoc directory. I
 defined in `docs/notes/artifact-contract.md`: `manifest.json` inventories the four reserved
 namespaces (`lessons/`, `digests/`, `measurements/`, `guards/`) with a schema name, byte count and
 SHA-256 for every recognized file. Producers write files atomically and regenerate the manifest;
-the publisher commits the changed files and manifest together, and the recall consumer validates
-the committed manifest before replacing its disposable index. A v1 reader accepts additive
-manifest metadata and ignores unrelated root files, but rejects unknown contract versions,
-malformed paths, symlinks, stale inventories and hash mismatches. This is the compatibility
-boundary for Phase 8 and does not weaken the public-tree or secret-containment guards.
+the publisher validates, commits the changed files and manifest together, and the recall consumer
+validates an exact committed tree before replacing its disposable index. TWILL owns the producer
+boundary only; the private-repository publisher owns commit/push, and recall owns staging and index
+replacement. A failed producer publication restores the last local artifact snapshot; a failed push
+is retried with the same commit; a failed recall validation or index build discards only its
+candidate and keeps the last valid index. A v1 reader accepts additive manifest metadata and ignores
+unrelated root files, but rejects unknown contract versions, malformed paths, symlinks, stale
+inventories and hash mismatches. This is the compatibility boundary for Phase 8 and does not weaken
+the public-tree or secret-containment guards.
 
 ## 8. Pre-Flight Safety
 

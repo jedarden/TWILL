@@ -85,15 +85,63 @@ or hash/size mismatch. A future incompatible layout uses a new major schema
 
 ## Publication semantics
 
-TWILL stages each file in the external root, fsyncs it, and atomically renames
-it into place; the manifest is then regenerated from the complete artifact
-tree. Temporary dot-files are never inventory entries. The artifact repository
-publisher MUST commit the changed artifact files and `manifest.json` together
-and push that commit to the private Forgejo origin. The recall service MUST
-pull committed state, validate the manifest and all listed hashes, and only
-then replace its disposable index. It MUST keep serving the last valid
-snapshot when validation fails or a pull is in progress. A worktree with a
-changed artifact but an old manifest is therefore not a publication.
+There are three owners and two snapshot boundaries:
+
+1. **TWILL owns production.** It writes only below the configured
+   `artifacts_root`, stages each file in that same directory, fsyncs it, and
+   atomically renames it into place. It then regenerates `manifest.json` from
+   the complete tree and atomically replaces the old manifest. The
+   `manifest_after_write` boundary restores the touched files when manifest
+   generation fails, so the previous valid local snapshot remains available
+   for a retry. Temporary dot-files are never inventory entries. TWILL does
+   not commit, push, or write an artifact into this public repository.
+2. **The private-repository publisher owns transport.** The operator or
+   publisher process validates the external tree with `read_manifest`, stages
+   the changed artifact files and `manifest.json` together, and creates one
+   normal commit. The commit is the immutable snapshot boundary: an artifact
+   and its manifest are either both in the commit tree or neither is. The
+   publisher pushes that commit to the configured private Forgejo `origin`
+   without force-pushing. A working tree, index, or unpushed local commit is
+   not visible to recall and is not a publication.
+3. **The recall service owns consumption.** It fetches a commit, materializes
+   that exact commit into a disposable staging directory, runs the v1 reader
+   there, and builds its disposable index there. It atomically swaps the
+   index only after the manifest, inventory, hashes, and payload validation
+   all pass. It never indexes a live publisher worktree.
+
+The publisher must use this sequence for every attempt:
+
+```text
+write/repair artifacts_root
+  -> read_manifest(artifacts_root)
+  -> stage manifest.json and changed artifact files
+  -> validate the staged tree
+  -> commit one snapshot
+  -> push that commit to private origin
+```
+
+The second validation is important: validating the producer's worktree does
+not prove that the staged index contains the same bytes. The publisher must
+also ensure the staged diff contains no unrelated paths and that the commit
+contains `manifest.json` with every inventory entry. A failed validation or
+commit leaves the last remote commit unchanged. A transient push failure is
+retried with the same local commit; it must not regenerate artifacts or amend
+the commit. If the remote has advanced, stop and reconcile the private
+repository before retrying—never force-push or silently discard either
+snapshot.
+
+The recall retry is similarly fail-closed: fetch failures, incomplete
+checkouts, manifest errors, hash mismatches, and index-build failures discard
+only the temporary candidate and retain the last valid index. The next poll
+retries the same remote commit (or a newly fetched one). A worktree with a
+changed artifact but an old manifest, or a manifest advertising a missing or
+partially written artifact, is therefore rejected rather than indexed.
+
+Git's commit tree is the cross-process publication boundary; the atomic file
+renames are only the local producer boundary. A consumer reading the external
+worktree during the short interval between those renames may see an old
+manifest beside new bytes, but `read_manifest` rejects that mixed state. Only
+the validated tree of one committed snapshot may replace the recall index.
 
 The existing containment boundary remains unchanged: `artifacts_root` is
 required, must resolve outside the public TWILL tree, and is the only place

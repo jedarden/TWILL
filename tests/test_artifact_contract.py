@@ -217,15 +217,14 @@ class ArtifactContractTests(unittest.TestCase):
     def test_each_artifact_payload_and_reference_is_validated(self):
         lesson = self.artifacts / "lessons/L-0123abcd.md"
         valid_lesson = lesson.read_text(encoding="utf-8")
-        lesson.write_text(valid_lesson + ("x" * 241) + "\n", encoding="utf-8")
         write_manifest(self.artifacts, repo_root=ROOT)
+        lesson.write_text(valid_lesson + ("x" * 241) + "\n", encoding="utf-8")
         with self.assertRaises(ArtifactContractError):
             read_manifest(self.artifacts, repo_root=ROOT)
 
         lesson.write_text(valid_lesson, encoding="utf-8")
         digest = self.artifacts / "digests/2026-W38.txt"
         digest.write_text("leaked token=secret | $ twill digest --week 2026-W38 --stdout --state-dir /tmp/state\n", encoding="utf-8")
-        write_manifest(self.artifacts, repo_root=ROOT)
         with self.assertRaises(ArtifactContractError):
             read_manifest(self.artifacts, repo_root=ROOT)
 
@@ -235,7 +234,6 @@ class ArtifactContractTests(unittest.TestCase):
         )
         measurement = self.artifacts / "measurements/L-0123abcd.jsonl"
         measurement.write_text(measurement.read_text(encoding="utf-8") * 2, encoding="utf-8")
-        write_manifest(self.artifacts, repo_root=ROOT)
         with self.assertRaises(ArtifactContractError):
             read_manifest(self.artifacts, repo_root=ROOT)
 
@@ -245,7 +243,6 @@ class ArtifactContractTests(unittest.TestCase):
         )
         guard = self.artifacts / "guards/L-0123abcd.hook.json"
         guard.write_text("{}\n", encoding="utf-8")
-        write_manifest(self.artifacts, repo_root=ROOT)
         with self.assertRaises(ArtifactContractError):
             read_manifest(self.artifacts, repo_root=ROOT)
 
@@ -260,13 +257,29 @@ class ArtifactContractTests(unittest.TestCase):
             ),
             encoding="utf-8",
         )
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+    def test_consumer_rejects_manifest_for_missing_or_partial_artifact(self):
         write_manifest(self.artifacts, repo_root=ROOT)
+        manifest_path = self.artifacts / "manifest.json"
+        digest = self.artifacts / "digests/2026-W38.txt"
+        digest.unlink()
+
+        # A manifest copied from a candidate commit must never make a missing
+        # artifact look consumable.
+        with self.assertRaises(ArtifactContractError):
+            read_manifest(self.artifacts, repo_root=ROOT)
+
+        digest.write_bytes(b"partial artifact")
+        # The old manifest still names the complete artifact's size/hash; a
+        # partially written replacement is rejected before indexing too.
         with self.assertRaises(ArtifactContractError):
             read_manifest(self.artifacts, repo_root=ROOT)
 
     def test_measurements_and_guards_must_reference_an_existing_lesson(self):
-        (self.artifacts / "lessons/L-0123abcd.md").unlink()
         write_manifest(self.artifacts, repo_root=ROOT)
+        (self.artifacts / "lessons/L-0123abcd.md").unlink()
         with self.assertRaises(ArtifactContractError):
             read_manifest(self.artifacts, repo_root=ROOT)
 
