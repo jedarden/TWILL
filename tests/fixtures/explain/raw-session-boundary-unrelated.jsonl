@@ -1,0 +1,1 @@
+{"type":"user","sessionId":"explain-boundary-unrelated","timestamp":"2026-09-27T12:00:03Z","cwd":"/workspace/explain-boundary","message":{"role":"user","content":"UNRELATED_SESSION_CONTENT_9d52 must not enter the boundary-tool cluster prompt."}}
