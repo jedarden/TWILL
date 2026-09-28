@@ -1740,12 +1740,14 @@ def _collect_session_hits(
         key = _emitted_key(detector, value["key"])
         session_id = _emitted_session(detector, value["session_id"])
         hit = (key, session_id)
-        if hit in hits:
-            raise DetectorContractError(
-                f"{detector.full_id} emitted duplicate session hit for {key!r}"
-            )
-        hits.add(hit)
-        counts[key] = counts.get(key, 0) + 1
+        # Session-hit SQL commonly reads event-level observations, so one
+        # session can contribute several rows to the same key.  Attribution
+        # is defined over distinct (key, session) pairs; retain the first
+        # normalized pair and ignore repeats before checking the cluster's
+        # distinct-session count.
+        if hit not in hits:
+            hits.add(hit)
+            counts[key] = counts.get(key, 0) + 1
     for key, values in emitted.items():
         observed = counts.get(key, 0)
         expected = values[0]

@@ -4,7 +4,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -451,6 +451,105 @@ class WeeklyWasteTests(unittest.TestCase):
         return self.connection.execute(
             "SELECT week, est_waste_usd FROM cluster_week ORDER BY week"
         ).fetchall()
+
+    def test_current_and_weekly_attribution_share_distinct_hits_across_iso_weeks(self):
+        detector = twill_detectors.Detector(
+            "D-94",
+            1,
+            "duplicate session-hit parity fixture",
+            """
+            SELECT 'fixture' AS key,
+                   count(DISTINCT session_id) AS sessions,
+                   count(*) AS events,
+                   min(ts_utc) AS first_seen,
+                   max(ts_utc) AS last_seen
+            FROM observation
+            WHERE ts_utc >= :window_start_utc
+            """,
+            session_hits_sql="""
+                SELECT 'fixture' AS key, session_id
+                FROM observation
+                WHERE ts_utc >= :window_start_utc
+            """,
+            weekly_hits_sql="""
+                SELECT 'fixture' AS key,
+                       strftime('%G-W%V', ts_utc) AS week,
+                       count(DISTINCT session_id) AS sessions,
+                       count(*) AS events
+                FROM observation
+                WHERE ts_utc >= :window_start_utc
+                  AND ts_utc < :window_end_utc
+                GROUP BY strftime('%G-W%V', ts_utc)
+            """,
+        )
+        for session_id, day in (
+            ("a", 14),
+            ("a", 15),
+            ("b", 15),
+            ("a", 21),
+            ("a", 21),
+            ("c", 22),
+        ):
+            seed_observation(
+                self.connection,
+                session_id,
+                datetime(2026, 9, day, 10, tzinfo=timezone.utc),
+            )
+        self.add_usage("a", 2.0)
+        self.add_usage("b", 1.0)
+        self.add_usage("c", 3.0)
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(detector,),
+            now=NOW,
+        )
+
+        self.assertEqual(report.exit_code, 0)
+        current_pairs = set(
+            self.connection.execute(
+                "SELECT key, session_id FROM cluster_session "
+                "WHERE detector_id = 'D-94'"
+            ).fetchall()
+        )
+        self.assertEqual(
+            current_pairs,
+            {("fixture", "a"), ("fixture", "b"), ("fixture", "c")},
+        )
+
+        start = NOW - timedelta(days=30)
+        end = NOW + timedelta(microseconds=1)
+        cells, attributed = twill_trend._weekly_cell_hits(
+            self.connection, (detector,), start, end
+        )
+        weekly_pairs = {
+            (key, session_id)
+            for (_, key, _), session_ids in cells.items()
+            for session_id in session_ids
+        }
+        self.assertEqual(attributed, frozenset({"D-94"}))
+        self.assertEqual(weekly_pairs, current_pairs)
+        self.assertEqual(
+            {
+                (key, week): tuple(sorted(session_ids))
+                for (_, key, week), session_ids in cells.items()
+            },
+            {
+                ("fixture", "2026-W38"): ("a", "b"),
+                ("fixture", "2026-W39"): ("a", "c"),
+            },
+        )
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT week, sessions, events, est_waste_usd "
+                "FROM cluster_week ORDER BY week"
+            ).fetchall(),
+            [
+                ("2026-W38", 2, 3, 2.0),
+                ("2026-W39", 2, 3, 4.0),
+            ],
+        )
 
     def test_cost_is_split_across_the_weeks_and_clusters_a_session_hits(self):
         # Session "a" hits the same cluster in two weeks (with a repeated

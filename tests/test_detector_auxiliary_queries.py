@@ -98,7 +98,7 @@ class AuxiliaryQueryContractTests(unittest.TestCase):
 
         self.assertEqual(hits, (("finding", "s1"), ("finding", "s2")))
 
-    def test_session_hit_output_contract_rejects_missing_and_duplicate_rows(self):
+    def test_session_hit_output_contract_deduplicates_rows(self):
         self.seed_observations()
         expected = {"finding": (2, 4, "first", "last")}
 
@@ -120,14 +120,14 @@ class AuxiliaryQueryContractTests(unittest.TestCase):
                 "WHERE session_id = 's1'"
             )
         )
-        with self.assertRaisesRegex(
-            twill_detectors.DetectorContractError, "duplicate session hit"
-        ):
+        self.assertEqual(
             twill_detectors._collect_session_hits(
                 duplicate_session,
                 self.connection.execute(duplicate_session.session_hits_sql),
-                expected,
-            )
+                {"finding": (1, 3, "first", "last")},
+            ),
+            (("finding", "s1"),),
+        )
 
     def test_week_hits_count_distinct_iso_weeks_without_running_primary_query(self):
         self.seed_observations()
