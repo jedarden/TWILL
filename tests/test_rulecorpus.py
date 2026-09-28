@@ -117,6 +117,24 @@ class DiscoveryTests(CorpusTestCase):
         self.assertEqual(doc.text, MEMORY_TEXT)
         self.assertEqual(doc.path, (self.root / "home/projects/p/memory/MEMORY.md").resolve())
 
+    def test_hash_includes_bytes_past_the_cursor_identity_prefix(self):
+        path = self.write_doc(
+            "home/projects/p/memory/MEMORY.md", "x" * 4096 + "first tail\n"
+        )
+        pattern = [f"memory:{self.root}/home/projects/*/memory/*.md"]
+        first = discover_docs(pattern).docs[0]
+
+        # Rule identity is the whole file, unlike transcript cursor identity:
+        # changing only bytes after the first 4 KiB must still reclassify it.
+        path.write_text("x" * 4096 + "second tail\n")
+        second = discover_docs(pattern).docs[0]
+
+        self.assertNotEqual(first.sha, second.sha)
+        self.assertEqual(
+            second.sha,
+            hashlib.sha256(path.read_bytes()).hexdigest(),
+        )
+
     def test_a_file_matched_twice_keeps_the_first_layer(self):
         self.write_doc("rules/both.md", MEMORY_TEXT)
         discovery = discover_docs(
@@ -310,6 +328,36 @@ class IndexTests(CorpusTestCase):
         self.assertEqual(restored_report.restored, (str(old.resolve()),))
         self.assertEqual(self.rule_row(old)[4], 0)
         self.assertEqual(self.rule_row(old)[3], "2026-09-23T17:00:00+00:00")
+
+    def test_read_history_follows_a_move_to_all_duplicate_paths(self):
+        old = self.write_doc("home/projects/p/memory/MEMORY.md", MEMORY_TEXT)
+        self.index()
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
+            "VALUES ('read-session', ?, ?, 'file_read', ?)",
+            (
+                "2026-09-23T17:00:00+00:00",
+                "2026-09-23T17:00:00+00:00",
+                str(old),
+            ),
+        )
+        self.connection.commit()
+        # Materialize the old path's observation before it disappears.  The
+        # next run must carry that marker through the hash, not the pathname.
+        self.index(now=LATER)
+
+        old.unlink()
+        moved = self.write_doc("home/projects/p/memory/REMEMBER.md", MEMORY_TEXT)
+        duplicate = self.write_doc("home/projects/q/memory/MEMORY.md", MEMORY_TEXT)
+        report = self.index(now="2026-09-23T19:00:00+00:00")
+
+        self.assertEqual(report.moves, ((str(old.resolve()), (str(moved.resolve()), str(duplicate.resolve()))),))
+        self.assertEqual(self.rule_row(old)[4], 1)
+        for path in (moved, duplicate):
+            with self.subTest(path=path):
+                self.assertEqual(
+                    self.rule_row(path)[3], "2026-09-23T17:00:00+00:00"
+                )
 
     def test_relative_read_path_uses_cwd_before_hash_matching(self):
         memory = self.write_doc("home/projects/p/memory/MEMORY.md", MEMORY_TEXT)
