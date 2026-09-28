@@ -46,6 +46,23 @@ Two consequences worth stating:
   (`restored`), with or without new content; `doctor` (a later Phase 3 bead)
   is what reports stale rows to a human. Nothing here deletes.
 
+## Agent reads are file-read observations
+
+The transcript readers report an agent opening a rule as a `file_read`
+observation: its timestamp is the read time and its path is only a lookup
+hint.  Ingest materializes the observation into `rule_doc.last_read_by_agent`
+by resolving the path to a stored content hash.  A relative path is tried
+against the observation's working and launch directories; an indexed vanished
+path still resolves through its retained stale row.  Every row with the
+matching hash receives the newest read time, including duplicate live paths
+and stale rows, so D-09 and the rule earnings report see one read history
+regardless of which spelling the agent used.
+
+Corpus indexing replays the same observations after discovering new paths.
+That closes the ordering gap where a transcript was ingested before its rule
+was first indexed, and makes a later rename or restoration inherit the
+already-materialized history without relying on path identity.
+
 ## Existence is checked per stored path, not per discovery
 
 The staleness sweep tests each stored path's existence directly — not

@@ -23,6 +23,7 @@ from twill_rulecorpus import (  # noqa: E402
     DEFAULT_RULE_GLOBS,
     MAX_RULE_DOC_BYTES,
     discover_docs,
+    ingest_rule_reads,
     index_corpus,
     parse_rule_pattern,
 )
@@ -240,6 +241,94 @@ class IndexTests(CorpusTestCase):
 
         self.assertEqual(report.moves, ((str(old.resolve()), (str(new.resolve()),)),))
         self.assertEqual(self.rule_row(new)[3], "2026-09-20T10:00:00+00:00")
+
+    def test_file_read_marks_every_live_copy_by_content_hash(self):
+        first = self.write_doc("home/projects/p/memory/MEMORY.md", MEMORY_TEXT)
+        second = self.write_doc("home/projects/q/memory/MEMORY.md", MEMORY_TEXT)
+        self.index()
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
+            "VALUES ('read-session', ?, ?, 'file_read', ?)",
+            (
+                "2026-09-23T17:00:00Z",
+                "2026-09-23T17:00:00Z",
+                str(first),
+            ),
+        )
+        self.connection.commit()
+
+        report = ingest_rule_reads(self.connection)
+
+        self.assertEqual(report.matched, 1)
+        self.assertEqual(
+            report.updated,
+            (str(first.resolve()), str(second.resolve())),
+        )
+        self.assertEqual(self.rule_row(first)[3], "2026-09-23T17:00:00+00:00")
+        self.assertEqual(self.rule_row(second)[3], "2026-09-23T17:00:00+00:00")
+
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
+            "VALUES ('read-session', ?, ?, 'file_read', ?)",
+            (
+                "2026-09-23T16:00:00Z",
+                "2026-09-23T16:00:00Z",
+                str(second),
+            ),
+        )
+        self.connection.commit()
+        ingest_rule_reads(self.connection)
+        self.assertEqual(self.rule_row(first)[3], "2026-09-23T17:00:00+00:00")
+        self.assertEqual(self.rule_row(second)[3], "2026-09-23T17:00:00+00:00")
+
+    def test_read_history_survives_move_stale_and_restored_path(self):
+        old = self.write_doc("home/projects/p/memory/MEMORY.md", MEMORY_TEXT)
+        self.index()
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
+            "VALUES ('read-session', ?, ?, 'file_read', ?)",
+            (
+                "2026-09-23T17:00:00+00:00",
+                "2026-09-23T17:00:00+00:00",
+                str(old),
+            ),
+        )
+        self.connection.commit()
+        self.index(now=LATER)
+
+        old.unlink()
+        moved = self.write_doc("home/projects/p/memory/REMEMBER.md", MEMORY_TEXT)
+        moved_report = self.index(now="2026-09-23T19:00:00+00:00")
+        self.assertEqual(moved_report.vanished, (str(old.resolve()),))
+        self.assertEqual(self.rule_row(old)[3], "2026-09-23T17:00:00+00:00")
+        self.assertEqual(self.rule_row(old)[4], 1)
+        self.assertEqual(self.rule_row(moved)[3], "2026-09-23T17:00:00+00:00")
+
+        moved.unlink()
+        old.write_text(MEMORY_TEXT)
+        restored_report = self.index(now="2026-09-23T20:00:00+00:00")
+        self.assertEqual(restored_report.restored, (str(old.resolve()),))
+        self.assertEqual(self.rule_row(old)[4], 0)
+        self.assertEqual(self.rule_row(old)[3], "2026-09-23T17:00:00+00:00")
+
+    def test_relative_read_path_uses_cwd_before_hash_matching(self):
+        memory = self.write_doc("home/projects/p/memory/MEMORY.md", MEMORY_TEXT)
+        self.index()
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path, cwd) "
+            "VALUES ('read-session', ?, ?, 'file_read', 'MEMORY.md', ?)",
+            (
+                "2026-09-23T17:00:00+00:00",
+                "2026-09-23T17:00:00+00:00",
+                str(memory.parent),
+            ),
+        )
+        self.connection.commit()
+
+        report = ingest_rule_reads(self.connection)
+
+        self.assertEqual(report.matched, 1)
+        self.assertEqual(self.rule_row(memory)[3], "2026-09-23T17:00:00+00:00")
 
     def test_move_is_detected_by_hash_while_the_old_row_goes_stale(self):
         self.write_doc("home/projects/p/memory/MEMORY.md", MEMORY_TEXT)

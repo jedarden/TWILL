@@ -223,6 +223,16 @@ class IndexReport:
     skipped: tuple[SkippedDoc, ...]
 
 
+@dataclass(frozen=True)
+class RuleReadReport:
+    """The result of materializing persisted ``file_read`` observations."""
+
+    #: Number of observations that named a rule content hash.
+    matched: int
+    #: Rule rows whose durable marker advanced, in path order.
+    updated: tuple[str, ...]
+
+
 def _fts_replace(connection: sqlite3.Connection, path_text: str, text: str) -> None:
     """Point the FTS row for ``path_text`` at ``text``.
 
@@ -247,6 +257,135 @@ def _last_read_by_sha(connection: sqlite3.Connection, sha: str) -> str | None:
         (sha,),
     ).fetchone()
     return row[0] if row else None
+
+
+def _read_timestamp(value: object) -> tuple[datetime, str] | None:
+    """Parse a read timestamp and render it in one comparable UTC form."""
+
+    if isinstance(value, datetime):
+        parsed = value
+    elif isinstance(value, str):
+        text = value.strip()
+        if not text:
+            return None
+        if text.endswith(("Z", "z")):
+            text = text[:-1] + "+00:00"
+        try:
+            parsed = datetime.fromisoformat(text)
+        except ValueError:
+            return None
+    else:
+        return None
+    if parsed.tzinfo is None:
+        parsed = parsed.replace(tzinfo=timezone.utc)
+    parsed = parsed.astimezone(timezone.utc)
+    return parsed, parsed.isoformat()
+
+
+def _read_path_candidates(
+    path: object,
+    cwd: object,
+    launch_dir: object,
+) -> tuple[Path, ...]:
+    """Resolve absolute and transcript-relative spellings of one read path."""
+
+    if not isinstance(path, str) or not path.strip():
+        return ()
+    text = path.strip()
+    raw = Path(text).expanduser()
+    candidates: list[Path] = []
+    if raw.is_absolute():
+        candidates.append(raw)
+    else:
+        for base in (cwd, launch_dir):
+            if isinstance(base, str) and base.strip():
+                candidates.append(Path(base).expanduser() / raw)
+        # This is only a last-resort filesystem probe.  Indexed rows use
+        # resolved paths, so relative reports should normally match one of the
+        # transcript's stored cwd/launch-dir spellings above.
+        candidates.append(raw)
+    resolved: list[Path] = []
+    for candidate in candidates:
+        try:
+            normalized = candidate.resolve()
+        except OSError:
+            normalized = candidate.absolute()
+        if normalized not in resolved:
+            resolved.append(normalized)
+    return tuple(resolved)
+
+
+def ingest_rule_reads(
+    connection: sqlite3.Connection,
+    *,
+    manage_transaction: bool = True,
+) -> RuleReadReport:
+    """Materialize file_read observations into hash-based read markers.
+
+    A reader reports a read as an observation containing the path the agent
+    opened.  The path is only a lookup hint: an indexed row supplies the
+    content hash even when the file has since moved or gone stale, while a
+    live unindexed spelling is hashed from disk.  Every rule_doc row with
+    that hash receives the newest timestamp, so duplicate live paths and
+    stale rows preserve one shared read history.
+    """
+
+    rows = connection.execute(
+        "SELECT path, sha, last_read_by_agent FROM rule_doc"
+    ).fetchall()
+    sha_by_path = {str(path): str(sha) for path, sha, _ in rows}
+    latest_by_sha: dict[str, tuple[datetime, str]] = {}
+    matched = 0
+
+    observations = connection.execute(
+        "SELECT path, cwd, launch_dir, ts_utc FROM observation "
+        "WHERE kind = 'file_read' AND path IS NOT NULL"
+    ).fetchall()
+    for path, cwd, launch_dir, timestamp in observations:
+        sha: str | None = None
+        for candidate in _read_path_candidates(path, cwd, launch_dir):
+            sha = sha_by_path.get(str(candidate))
+            if sha is not None:
+                break
+        if sha is None:
+            for candidate in _read_path_candidates(path, cwd, launch_dir):
+                try:
+                    payload = candidate.read_bytes()
+                except OSError:
+                    continue
+                if len(payload) > MAX_RULE_DOC_BYTES:
+                    continue
+                candidate_sha = content_sha(payload)
+                if candidate_sha in sha_by_path.values():
+                    sha = candidate_sha
+                    break
+        parsed = _read_timestamp(timestamp)
+        if sha is None or parsed is None:
+            continue
+        matched += 1
+        previous = latest_by_sha.get(sha)
+        if previous is None or parsed[0] > previous[0]:
+            latest_by_sha[sha] = parsed
+
+    updated: list[str] = []
+    transaction = connection if manage_transaction else nullcontext()
+    with transaction:
+        for sha, (read_at, timestamp) in latest_by_sha.items():
+            for path, last_read in connection.execute(
+                "SELECT path, last_read_by_agent FROM rule_doc "
+                "WHERE sha = ? ORDER BY path",
+                (sha,),
+            ).fetchall():
+                previous = _read_timestamp(last_read)
+                if previous is not None and previous[0] >= read_at:
+                    continue
+                connection.execute(
+                    "UPDATE rule_doc SET last_read_by_agent = ? WHERE path = ?",
+                    (timestamp, path),
+                )
+                updated.append(str(path))
+
+    return RuleReadReport(matched=matched, updated=tuple(sorted(updated)))
 
 
 def index_corpus(
@@ -350,6 +489,11 @@ def index_corpus(
             successors = paths_by_sha.get(sha, ())
             if successors:
                 moves.append((path_text, successors))
+
+        # Read reports are path-shaped observations, but their durable marker
+        # is content-shaped.  Run this after indexing so a newly discovered
+        # path can join an observation from the same or an earlier ingest.
+        ingest_rule_reads(connection, manage_transaction=False)
 
     return IndexReport(
         docs=len(discovery.docs),

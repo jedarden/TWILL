@@ -37,6 +37,7 @@ import twill_prune
 import twill_perf
 import twill_ranker
 import twill_review
+import twill_rulecorpus
 import twill_rules
 import twill_trend
 import twill_router
@@ -249,6 +250,7 @@ class TranscriptEvent:
     source_line: int
     event_index: int
     cwd: str | None = None
+    file_path: str | None = None
 
 
 @dataclass(frozen=True)
@@ -358,6 +360,28 @@ def _event_texts(record: dict[str, object]) -> Iterator[str]:
     for key in ("text", "message", "content"):
         if key in record:
             yield from _text_values(record[key])
+
+
+def _claude_file_read_paths(record: dict[str, object]) -> Iterator[str]:
+    """Extract Claude Read tool inputs from a transcript record."""
+
+    if record.get("type") != "assistant":
+        return
+    message = record.get("message")
+    content = message.get("content") if isinstance(message, dict) else None
+    if not isinstance(content, list):
+        return
+    for block in content:
+        if not isinstance(block, dict) or block.get("type") != "tool_use":
+            continue
+        if block.get("name") not in {"Read", "read_file"}:
+            continue
+        inputs = block.get("input")
+        if not isinstance(inputs, dict):
+            continue
+        path = inputs.get("file_path", inputs.get("path"))
+        if isinstance(path, str) and path.strip():
+            yield path
 
 
 def _session_id(record: dict[str, object], fallback: str) -> str:
@@ -477,6 +501,7 @@ def _parse_codex_scan(
             source_line=event.source_line,
             event_index=event.event_index,
             cwd=event.cwd,
+            file_path=event.file_path,
         )
         for event in normalized_events
     )
@@ -557,7 +582,8 @@ def parse_scan(
         cwd = record.get("cwd")
         if isinstance(cwd, str) and cwd:
             session_cwd = cwd
-        for event_index, text in enumerate(_event_texts(record)):
+        event_index = 0
+        for text in _event_texts(record):
             if not text.strip():
                 continue
             events.append(
@@ -571,6 +597,21 @@ def parse_scan(
                     cwd=session_cwd,
                 )
             )
+            event_index += 1
+        for file_path in _claude_file_read_paths(record):
+            events.append(
+                TranscriptEvent(
+                    session_id=session_id,
+                    timestamp=_timestamp(record),
+                    kind="file_read",
+                    text=file_path,
+                    source_line=source_line,
+                    event_index=event_index,
+                    cwd=session_cwd,
+                    file_path=file_path,
+                )
+            )
+            event_index += 1
     usage, usage_rows = _extract_usage(
         path, source_kind, session_id, scan.new_offset
     )
@@ -1101,6 +1142,7 @@ class Store:
                 self.retention_seconds,
                 stored_launch_dir,
             )
+            twill_rulecorpus.ingest_rule_reads(conn, manage_transaction=False)
             if cursor_update is not None:
                 twill_cursor.upsert_cursor(
                     conn,
@@ -1217,7 +1259,7 @@ class Store:
         # measurement attribute detectors); D-00@1 events are recognisable by
         # their kind until Phase 2 replaces this detector.
         query = (
-            "SELECT ts_utc, ts_local, text, signature, cwd "
+            "SELECT ts_utc, ts_local, kind, text, signature, cwd "
             "FROM transcript_event WHERE session_key = ? AND trim(text) <> ''"
         )
         parameters: list[object] = [session_key]
@@ -1230,28 +1272,32 @@ class Store:
         query += " ORDER BY source_line, event_index LIMIT ?"
         parameters.append(MAX_OBSERVATIONS_PER_SESSION)
         rows = conn.execute(query, parameters).fetchall()
-        for ts_utc, ts_local, text, stored_signature, cwd in rows:
+        for ts_utc, ts_local, kind, text, stored_signature, cwd in rows:
             normalized = (
                 stored_signature if stored_signature is not None else signature(text)
             )
             sig_hash = h12(normalized)
+            observation_kind = "file_read" if kind == "file_read" else "session_activity"
+            stored_path = redact_text(text) if observation_kind == "file_read" else None
             conn.execute(
                 "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
-                "signature, sig_hash, excerpt, launch_dir, cwd) "
-                "VALUES (?, ?, ?, 'session_activity', ?, ?, ?, ?, ?)",
+                "signature, sig_hash, excerpt, launch_dir, cwd, path) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     ts_utc,
                     ts_local,
+                    observation_kind,
                     normalized,
                     sig_hash,
                     text,
                     launch_dir,
                     cwd,
+                    stored_path,
                 ),
             )
         row = conn.execute(
-            "SELECT count(*) FROM observation WHERE session_id = ? AND kind = 'session_activity'",
+            "SELECT count(*) FROM observation WHERE session_id = ?",
             (session_id,),
         ).fetchone()
         return int(row[0]) if row else 0

@@ -19,6 +19,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import twill_app  # noqa: E402
+import twill_rulecorpus  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_contract import EXIT_RUNTIME_ERROR, CliError  # noqa: E402
 
@@ -749,6 +750,55 @@ class StoreIntegrationTests(unittest.TestCase):
         total, digest = store.digest_rows(limit=1)
         self.assertEqual(total, 2)
         self.assertEqual(digest[0]["detector_id"], "D-00@1")
+
+    def test_store_materializes_file_reads_for_all_matching_rule_paths(self):
+        store = twill_app.Store(self.root / "state")
+        self.addCleanup(store.close)
+        rule = self.root / "rules" / "MEMORY.md"
+        duplicate = self.root / "rules" / "copy.md"
+        rule.parent.mkdir()
+        rule.write_text("one shared rule\n")
+        duplicate.write_text(rule.read_text())
+        sha = twill_rulecorpus.content_sha(rule.read_bytes())
+        for path in (rule, duplicate):
+            store.connection.execute(
+                "INSERT INTO rule_doc(path, layer, sha, indexed_at, stale) "
+                "VALUES (?, 'memory', ?, ?, 0)",
+                (str(path.resolve()), sha, "2026-09-01T00:00:00+00:00"),
+            )
+        store.connection.commit()
+
+        session = twill_app.SessionData(
+            self.root / "session.jsonl",
+            "rule-read-session",
+            "jsonl",
+            (
+                twill_app.TranscriptEvent(
+                    session_id="rule-read-session",
+                    timestamp="2026-09-27T12:00:00Z",
+                    kind="file_read",
+                    text=str(rule),
+                    source_line=1,
+                    event_index=0,
+                    file_path=str(rule),
+                ),
+            ),
+        )
+        events, observations = store.ingest(session)
+
+        self.assertEqual((events, observations), (1, 1))
+        self.assertEqual(
+            store.connection.execute(
+                "SELECT kind, path FROM observation"
+            ).fetchall(),
+            [("file_read", str(rule))],
+        )
+        self.assertEqual(
+            store.connection.execute(
+                "SELECT last_read_by_agent FROM rule_doc ORDER BY path"
+            ).fetchall(),
+            [("2026-09-27T12:00:00+00:00",)] * 2,
+        )
 
     def test_rereading_the_same_session_replaces_its_observations(self):
         store = twill_app.Store(self.root / "state")
