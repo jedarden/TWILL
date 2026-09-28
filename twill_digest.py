@@ -19,6 +19,7 @@ import twill_lessons
 import twill_measure
 import twill_rules
 import twill_trend
+from twill_config import ConfigError
 from twill_contract import ValidationError
 from twill_detectors import (
     MAX_ERROR_LENGTH,
@@ -1440,9 +1441,29 @@ def _validate_digest_text(text: str) -> None:
             )
 
 
-def write_digest_file(text: str, artifacts_root: Path, week: Week) -> Path:
+def write_digest_file(
+    text: str,
+    artifacts_root: Path,
+    week: Week,
+    *,
+    repo_root: Path | None = None,
+) -> Path:
+    if artifacts_root is None:
+        raise ConfigError(
+            "artifacts_root is not set and it has no default",
+            "set artifacts_root to a directory outside the TWILL repository tree",
+        )
+    root = Path(artifacts_root).expanduser().resolve()
+    repository = (
+        Path(__file__).resolve().parent if repo_root is None else Path(repo_root)
+    ).resolve()
+    if root == repository or repository in root.parents:
+        raise ConfigError(
+            f"{root} resolves inside the TWILL repository tree ({repository})",
+            "this repository is public; digests belong under artifacts_root outside it",
+        )
     _validate_digest_text(text)
-    directory = Path(artifacts_root).expanduser().resolve() / "digests"
+    directory = root / "digests"
     if directory.is_symlink():
         raise ValueError("digest directory may not be a symbolic link")
     directory.mkdir(parents=True, exist_ok=True, mode=DIGEST_DIR_MODE)

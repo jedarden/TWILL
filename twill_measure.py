@@ -278,6 +278,11 @@ def _format_timestamp(value: datetime) -> str:
 
 
 def _validate_root(artifacts_root: Path, repo_root: Path | None = None) -> Path:
+    if artifacts_root is None:
+        raise ConfigError(
+            "artifacts_root is not set and it has no default",
+            "set artifacts_root to a directory outside the TWILL repository tree",
+        )
     root = Path(artifacts_root).expanduser().resolve()
     repository = (
         Path(__file__).resolve().parent if repo_root is None else Path(repo_root)
