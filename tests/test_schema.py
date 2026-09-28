@@ -376,6 +376,153 @@ class MigrationRunnerTests(unittest.TestCase):
         self.assertIsNotNone(row)
         return row[0]
 
+    def _seed_historical_database(self, state_dir, version):
+        """Create a database as it would have looked at a supported stamp."""
+
+        registry = tuple(
+            migration
+            for migration in twill_schema.MIGRATIONS
+            if migration.version <= version
+        )
+        with mock.patch.object(twill_schema, "MIGRATIONS", registry):
+            connection = twill_schema.connect(state_dir)
+        connection.execute(
+            "INSERT INTO observation("
+            "obs_id, session_id, ts_utc, ts_local, kind, program, command, "
+            "signature, sig_hash, excerpt, host"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                41,
+                "legacy-session",
+                "2026-09-20T12:00:00+00:00",
+                "2026-09-20T08:00:00-04:00",
+                "run_failed",
+                "claude",
+                "pytest",
+                "assertion failed",
+                "hash-41",
+                "kept observation",
+                "codinghome",
+            ),
+        )
+        connection.execute(
+            "INSERT INTO cursor("
+            "path, session_id, source, identity_sha, size, mtime_ns, last_offset, "
+            "parse_errors, first_seen, last_indexed_at, path_missing"
+            ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                "/transcripts/legacy.jsonl",
+                "legacy-session",
+                "claude",
+                "identity-41",
+                4096,
+                123,
+                2048,
+                2,
+                "2026-09-19T12:00:00+00:00",
+                "2026-09-20T12:00:00+00:00",
+                1,
+            ),
+        )
+        if version >= 2:
+            connection.execute(
+                "INSERT INTO detector_run("
+                "detector_id, version, full_id, semantics_sha, first_run_at, "
+                "last_run_at, last_status, last_error, clusters, window_days"
+                ") VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    "D-01",
+                    2,
+                    "D-01@2",
+                    "semantics-41",
+                    "2026-09-19T12:00:00+00:00",
+                    "2026-09-20T12:00:00+00:00",
+                    "ok",
+                    None,
+                    1,
+                    7,
+                ),
+            )
+        connection.commit()
+        connection.close()
+
+    @staticmethod
+    def _migration_snapshot(connection):
+        return {
+            "objects": connection.execute(
+                "SELECT type, name, tbl_name, sql FROM sqlite_master "
+                "WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            ).fetchall(),
+            "schema_version": connection.execute(
+                "SELECT key, value, updated_at FROM meta WHERE key = 'schema_version'"
+            ).fetchall(),
+            "observations": connection.execute(
+                "SELECT * FROM observation ORDER BY obs_id"
+            ).fetchall(),
+            "cursors": connection.execute(
+                "SELECT path, session_id, source, identity_sha, size, mtime_ns, "
+                "last_offset, parse_errors, first_seen, last_indexed_at, path_missing "
+                "FROM cursor ORDER BY path"
+            ).fetchall(),
+            "detector_runs": connection.execute(
+                "SELECT * FROM detector_run ORDER BY detector_id, version"
+            ).fetchall(),
+        }
+
+    def test_every_supported_schema_version_upgrades_without_losing_rows(self):
+        """Each historical stamp reaches HEAD, including detector-run steps."""
+
+        supported_versions = (
+            twill_schema.BASELINE_VERSION,
+            *(migration.version for migration in twill_schema.MIGRATIONS),
+        )
+        newest = twill_schema.MIGRATIONS[-1].version
+        for version in supported_versions:
+            with self.subTest(version=version):
+                state_dir = self.state_dir.parent / f"state-v{version}"
+                self._seed_historical_database(state_dir, version)
+
+                migrated = twill_schema.connect(state_dir)
+                first = self._migration_snapshot(migrated)
+                self.assertEqual(
+                    first["schema_version"][0][0:2],
+                    ("schema_version", str(newest)),
+                )
+                self.assertEqual(
+                    first["observations"][0][0:3],
+                    (41, "legacy-session", "2026-09-20T12:00:00+00:00"),
+                )
+                self.assertEqual(
+                    first["cursors"][0][0:9],
+                    (
+                        "/transcripts/legacy.jsonl",
+                        "legacy-session",
+                        "claude",
+                        "identity-41",
+                        4096,
+                        123,
+                        2048,
+                        2,
+                        "2026-09-19T12:00:00+00:00",
+                    ),
+                )
+                expected_detector_runs = (
+                    [("D-01", 2, "D-01@2", "semantics-41")]
+                    if version >= 2
+                    else []
+                )
+                self.assertEqual(
+                    [row[0:4] for row in first["detector_runs"]],
+                    expected_detector_runs,
+                )
+                migrated.close()
+
+                # A second writer open must not add duplicate objects, rows,
+                # or a new migration stamp.
+                reopened = twill_schema.connect(state_dir)
+                self.addCleanup(reopened.close)
+                self.assertEqual(self._migration_snapshot(reopened), first)
+
     def test_shipped_registry_applies_and_stamps_its_newest_version(self):
         # The v1 tables ship unmigrated; version 2 adds detector_run (the
         # registry's run record, plan §8.1 EC-12 / §8.2).  _connect patches

@@ -155,6 +155,39 @@ class RebuildUnitTests(unittest.TestCase):
         self.assertIsNotNone(version)
         self.assertEqual(int(version[0]), twill_schema.MIGRATIONS[-1].version)
 
+    def test_disposable_database_rebuilds_from_on_disk_transcripts(self):
+        """Recovery can create a useful state DB from transcripts alone."""
+
+        alpha = self.write_session("alpha.jsonl")
+        beta = self.write_session("beta.jsonl")
+
+        result = rebuild_state_database(
+            self.state, roots=(self.transcripts,), settle_seconds=0
+        )
+
+        self.assertEqual(result, {"sessions": 2, "events": 2, "observations": 2})
+        connection = sqlite3.connect(twill_schema.state_db_path(self.state))
+        try:
+            self.assertEqual(
+                connection.execute(
+                    "SELECT value FROM meta WHERE key = ?",
+                    (twill_schema.SCHEMA_VERSION_KEY,),
+                ).fetchone()[0],
+                str(twill_schema.MIGRATIONS[-1].version),
+            )
+            self.assertEqual(
+                connection.execute(
+                    "SELECT session_id FROM observation ORDER BY session_id"
+                ).fetchall(),
+                [("unit-alpha",), ("unit-beta",)],
+            )
+            self.assertEqual(
+                connection.execute("SELECT path FROM cursor ORDER BY path").fetchall(),
+                [(str(alpha),), (str(beta),)],
+            )
+        finally:
+            connection.close()
+
     def test_a_missing_source_root_is_an_error(self):
         with self.assertRaises(CliError):
             rebuild_state_database(
