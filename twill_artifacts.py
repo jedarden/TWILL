@@ -24,7 +24,7 @@ from pathlib import Path
 from dataclasses import dataclass
 from typing import Iterator, Mapping, Sequence
 
-from twill_lessons import LESSON_ID_RE, lessons_dir
+from twill_lessons import LESSON_ID_RE, TERMINAL_STATES, lessons_dir
 from twill_redactor import redact_text
 
 
@@ -617,6 +617,61 @@ def read_manifest(
     return payload
 
 
+def is_retrieval_eligible(lesson: object) -> bool:
+    """Return whether a validated lesson belongs in the recall index.
+
+    Accepted lessons and lessons with an applied layer are live retrieval
+    material.  A terminal lesson remains useful when it records the layer it
+    reached; terminal state alone is not a reason to erase that applied
+    knowledge.  Callers should pass a :class:`twill_lessons.LessonRecord` from
+    one of the reader functions, rather than unvalidated input.
+    """
+
+    state = getattr(lesson, "state", None)
+    if state == "accepted" or (
+        isinstance(state, str) and state.startswith("applied:")
+    ):
+        return True
+    if state not in TERMINAL_STATES:
+        return False
+    routing = getattr(lesson, "routing", None)
+    return isinstance(routing, Mapping) and routing.get("applied") is not None
+
+
+def _retrieval_lessons(
+    root: Path,
+    manifest: Mapping[str, object],
+    *,
+    repo_root: Path | None,
+) -> tuple[object, ...]:
+    from twill_lessons import load_lesson
+
+    artifacts = manifest["artifacts"]
+    assert isinstance(artifacts, list)
+    records: list[object] = []
+    for item in artifacts:
+        assert isinstance(item, dict)
+        if item.get("schema") != LESSON_SCHEMA:
+            continue
+        path = root / str(item["path"])
+        record = load_lesson(path, repo_root=repo_root)
+        if is_retrieval_eligible(record):
+            records.append(record)
+    return tuple(records)
+
+
+def read_retrieval_lessons(
+    artifacts_root: Path,
+    *,
+    repo_root: Path | None = None,
+) -> tuple[object, ...]:
+    """Read the retrieval-eligible lessons from one validated artifact tree."""
+
+    root = _root(Path(artifacts_root), repo_root=repo_root)
+    manifest = read_manifest(root, repo_root=repo_root)
+    return _retrieval_lessons(root, manifest, repo_root=repo_root)
+
+
 def _git(
     root: Path,
     arguments: Sequence[str],
@@ -753,6 +808,22 @@ def _extract_archive(archive_path: Path, destination: Path) -> None:
             archive.extract(member, path=destination, filter="data")
 
 
+@contextmanager
+def _git_tree_checkout(root: Path, treeish: str) -> Iterator[Path]:
+    """Materialize one immutable git tree for a consumer read."""
+
+    with tempfile.TemporaryDirectory(prefix="twill-reader-") as directory:
+        temporary = Path(directory)
+        archive_path = temporary / "snapshot.tar"
+        _git(
+            root,
+            ("archive", "--format=tar", "--output", str(archive_path), treeish),
+        )
+        checkout = temporary / "checkout"
+        _extract_archive(archive_path, checkout)
+        yield checkout
+
+
 def _validate_git_tree(
     root: Path,
     treeish: str,
@@ -762,15 +833,7 @@ def _validate_git_tree(
 ) -> dict[str, object]:
     """Validate an exact index/commit tree through the public v1 reader."""
 
-    with tempfile.TemporaryDirectory(prefix="twill-publish-") as directory:
-        temporary = Path(directory)
-        archive_path = temporary / "snapshot.tar"
-        _git(
-            root,
-            ("archive", "--format=tar", "--output", str(archive_path), treeish),
-        )
-        checkout = temporary / "checkout"
-        _extract_archive(archive_path, checkout)
+    with _git_tree_checkout(root, treeish) as checkout:
         manifest_path = checkout / MANIFEST_FILENAME
         if expected_manifest is not None and manifest_path.read_bytes() != expected_manifest:
             raise ArtifactPublicationError(
@@ -795,6 +858,20 @@ def read_committed_manifest(
         expected_manifest=None,
         repo_root=repo_root,
     )
+
+
+def read_committed_lessons(
+    artifacts_root: Path,
+    *,
+    commit: str = "HEAD",
+    repo_root: Path | None = None,
+) -> tuple[object, ...]:
+    """Read retrieval lessons from one exact committed artifact snapshot."""
+
+    root = _root(Path(artifacts_root), repo_root=repo_root)
+    _git_repo(root)
+    with _git_tree_checkout(root, commit) as checkout:
+        return read_retrieval_lessons(checkout, repo_root=repo_root)
 
 
 def publish_snapshot(
@@ -921,11 +998,14 @@ __all__ = [
     "PATH_CONTRACT",
     "ArtifactContractError",
     "ArtifactPublicationError",
+    "is_retrieval_eligible",
     "manifest_after_write",
     "PublicationResult",
     "publish_artifacts",
     "publish_snapshot",
     "read_committed_manifest",
+    "read_committed_lessons",
     "read_manifest",
+    "read_retrieval_lessons",
     "write_manifest",
 ]
