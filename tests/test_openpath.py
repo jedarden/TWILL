@@ -200,18 +200,28 @@ class HarnessInstallationTests(unittest.TestCase):
         self.assertEqual(child.returncode, 0, child.stderr)
 
     def test_a_spawned_child_is_stopped_at_the_open(self):
-        canary = Path.home() / ".twill-openpath-child-canary"
-        child = subprocess.run(
-            [sys.executable, "-c", f"open({str(canary)!r}, 'w')"],
-            cwd=str(ROOT),
-            env=dict(os.environ),
-            text=True,
-            capture_output=True,
-            check=False,
-        )
-        self.assertNotEqual(child.returncode, 0, "an out-of-tree child write was not stopped")
-        self.assertIn("OpenPathViolation", child.stderr)
-        self.assertFalse(canary.exists(), "the refused open still touched the disk")
+        canary = Path.home() / f".twill-openpath-child-canary-{os.getpid()}"
+        # A failed run can leave the old fixed-name canary behind.  Keep this
+        # probe isolated per test process and clean it up even when the child
+        # violates the policy, so a later verifier run starts from a known
+        # state.
+        canary.unlink(missing_ok=True)
+        try:
+            child = subprocess.run(
+                [sys.executable, "-c", f"open({str(canary)!r}, 'w')"],
+                cwd=str(ROOT),
+                env=dict(os.environ),
+                text=True,
+                capture_output=True,
+                check=False,
+            )
+            self.assertNotEqual(
+                child.returncode, 0, "an out-of-tree child write was not stopped"
+            )
+            self.assertIn("OpenPathViolation", child.stderr)
+            self.assertFalse(canary.exists(), "the refused open still touched the disk")
+        finally:
+            canary.unlink(missing_ok=True)
 
     def test_a_denied_open_in_this_process_fails_at_the_open(self):
         canary = Path.home() / ".twill-openpath-canary"
