@@ -12,6 +12,21 @@ silently ungated: ``tests/test_openpath.py`` asserts the hook is installed
 in this process and in a spawned child, so a broken startup fails the run.
 """
 
-import openpath
+import os
+from pathlib import Path
+
+
+def _canonicalize_temp_environment():
+    """Keep tempfile paths stable when the configured temp root is a symlink."""
+
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        value = os.environ.get(name)
+        if value:
+            os.environ[name] = str(Path(value).expanduser().resolve())
+
+
+_canonicalize_temp_environment()
+
+import openpath  # noqa: E402
 
 openpath.install()

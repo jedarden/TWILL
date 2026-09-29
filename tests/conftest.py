@@ -7,6 +7,21 @@ module runs.  :func:`openpath.install` is idempotent and also puts this
 directory on ``PYTHONPATH`` so every spawned CLI verb self-installs.
 """
 
-import openpath
+import os
+from pathlib import Path
+
+
+def _canonicalize_temp_environment():
+    """Keep tempfile paths stable when the configured temp root is a symlink."""
+
+    for name in ("TMPDIR", "TEMP", "TMP"):
+        value = os.environ.get(name)
+        if value:
+            os.environ[name] = str(Path(value).expanduser().resolve())
+
+
+_canonicalize_temp_environment()
+
+import openpath  # noqa: E402
 
 openpath.install()
