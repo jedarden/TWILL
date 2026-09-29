@@ -23,6 +23,18 @@ set -u
 
 cd "$(dirname "$0")/.." || exit 41
 
+# tempfile preserves the spelling of TMPDIR, while TWILL resolves paths at
+# its write boundaries.  The shared scratch path is a symlink on this host,
+# so normalize the environment before either make or pytest creates fixtures;
+# otherwise tests compare the lexical and resolved spellings of one file.
+temp_root=${TMPDIR:-${TEMP:-${TMP:-}}}
+if [ -n "$temp_root" ] && [ -d "$temp_root" ]; then
+  canonical_temp_root=$(CDPATH= cd -P -- "$temp_root" 2>/dev/null && pwd -P) || canonical_temp_root=
+  if [ -n "$canonical_temp_root" ]; then
+    export TMPDIR="$canonical_temp_root"
+  fi
+fi
+
 case "${1:-}" in
   "" | --fast) ;;
   *)
