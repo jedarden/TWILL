@@ -20,14 +20,18 @@ inside the envelope), while the human surface prints tables to stdout and
 errors and warnings to stderr.
 """
 
+import io
 import json
 import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime, timedelta
 from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -35,7 +39,9 @@ CLI = ROOT / "twill"
 FIXTURE = ROOT / "tests" / "fixtures" / "transcripts" / "claude" / "clean.jsonl"
 sys.path.insert(0, str(ROOT))
 
+import twill_app  # noqa: E402
 import twill_schema  # noqa: E402
+from twill_artifacts import PublicationResult  # noqa: E402
 from twill_config import TwillConfig  # noqa: E402
 from twill_explainer import (  # noqa: E402
     LessonDraft,
@@ -66,6 +72,7 @@ CONFIG_LOADING_VERBS = (
     ("apply", ("apply", "L-00000001", "--layer", "environment", "--bead", "twill-x")),
     ("unapply", ("unapply", "L-00000001")),
     ("dismiss", ("dismiss", "D-01:command-not-found:x", "--reason", "audited")),
+    ("publish", ("publish",)),
 )
 
 #: The verbs main() runs behind the state lock: the mutating set, plus the
@@ -84,6 +91,7 @@ LOCK_TAKING_VERBS = (
     ("dismiss", ("dismiss", "D-01:command-not-found:x", "--reason", "audited", "--json",)),
     ("doctor --rebuild", ("doctor", "--rebuild", "--json",)),
     ("doctor --rescan-redaction", ("doctor", "--rescan-redaction", "--json",)),
+    ("publish", ("publish", "--json",)),
 )
 
 #: Read verbs over primed state: one success envelope each, with a data key
@@ -123,7 +131,9 @@ USAGE_CASES = (
     (("detect", "--json", "--window", "12h"), "whole number of days"),
     (("unapply", "--json"), "the following arguments are required: ID"),
     (("lessons", "--json", "--state", "bogus"), "invalid choice"),
+    (("measure", "--json", "--nope"), "unrecognized arguments: --nope"),
     (("prune", "--json", "--older-than", "nope"), "invalid duration"),
+    (("publish", "--json", "--nope"), "unrecognized arguments: --nope"),
     (("doctor", "--json", "--settle", "nope"), "invalid duration"),
     (("status", "--json", "--nope"), "unrecognized arguments: --nope"),
 )
@@ -175,6 +185,20 @@ class ConformanceTestCase(unittest.TestCase):
             valid_config_text(home) if config_text == "valid" else config_text,
         )
         return home
+
+    def run_main(self, home, *args):
+        """Run one command in-process when its external boundary is mocked."""
+
+        stdout = io.StringIO()
+        stderr = io.StringIO()
+        with mock.patch.dict(os.environ, {"HOME": str(home)}, clear=False):
+            with redirect_stdout(stdout), redirect_stderr(stderr):
+                code = twill_app.main(args)
+        return SimpleNamespace(
+            returncode=code,
+            stdout=stdout.getvalue(),
+            stderr=stderr.getvalue(),
+        )
 
     def assert_success_envelope(self, result):
         """Exit 0, one success envelope on stdout, stderr empty (§14)."""
@@ -292,6 +316,39 @@ class SuccessEnvelopeTests(ConformanceTestCase):
         self.assertLessEqual(
             set(("sessions", "events", "observations", "performance")),
             set(envelope["data"]),
+        )
+
+    def test_publish_success_envelope(self):
+        home = self.make_home()
+        published = PublicationResult(
+            commit="a" * 40,
+            branch="main",
+            changed_paths=("manifest.json", "digests/2025-W01.txt"),
+            created_commit=True,
+            pushed=True,
+        )
+        with mock.patch.object(
+            twill_app.twill_publisher,
+            "publish_snapshot",
+            return_value=published,
+        ):
+            result = self.run_main(
+                home,
+                "publish",
+                "--json",
+                "--state-dir",
+                str(Path(home) / "state"),
+            )
+        # The publisher's git transport is exercised by
+        # test_artifact_publisher; this assertion isolates the public CLI
+        # envelope from child-process policy while running the real handler.
+        envelope = self.assert_success_envelope(result)
+        self.assertEqual(envelope["data"]["branch"], "main")
+        self.assertTrue(envelope["data"]["created_commit"])
+        self.assertTrue(envelope["data"]["pushed"])
+        self.assertEqual(
+            set(envelope["data"]["changed_paths"]),
+            {"manifest.json", "digests/2025-W01.txt"},
         )
 
     def test_every_read_verb_emits_one_success_envelope(self):
