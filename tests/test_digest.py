@@ -268,9 +268,22 @@ class DigestDiffTests(DigestStateCase):
     def test_production_report_command_reproduces_exact_text(self):
         seed_failure(self.connection, "sqlite3", 2, IN_WEEK)
         self.connection.commit()
-        report = twill_digest.build_digest(self.state, SUBJECT)
+        artifacts = self.root / "artifacts"
+        isolated_home = self.root / "isolated-home"
+        config = isolated_home / ".config" / "twill" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text(f'artifacts_root = "{artifacts}"\n')
+        report = twill_digest.build_digest(
+            self.state,
+            SUBJECT,
+            artifacts_root=artifacts,
+        )
         text = twill_digest.render_text(report)
-        environment = {**os.environ, "PATH": f"{ROOT}{os.pathsep}{os.environ['PATH']}"}
+        environment = {
+            **os.environ,
+            "HOME": str(isolated_home),
+            "PATH": f"{ROOT}{os.pathsep}{os.environ['PATH']}",
+        }
         reproduced = subprocess.run(
             report.command,
             shell=True,
@@ -428,7 +441,16 @@ class DigestDiffTests(DigestStateCase):
     def test_credential_shaped_state_path_uses_an_environment_reference(self):
         token = "ghp_" + "1234567890abcdefghijklmnop"
         secret_state = self.root / token / "state"
-        report = twill_digest.build_digest(secret_state, SUBJECT)
+        artifacts = self.root / "artifacts"
+        isolated_home = self.root / "isolated-home"
+        config = isolated_home / ".config" / "twill" / "config.toml"
+        config.parent.mkdir(parents=True)
+        config.write_text(f'artifacts_root = "{artifacts}"\n')
+        report = twill_digest.build_digest(
+            secret_state,
+            SUBJECT,
+            artifacts_root=artifacts,
+        )
         text = twill_digest.render_text(report)
         data = json.dumps(twill_digest.render_data(report))
         self.assertIn("TWILL_STATE_DIR:?", report.command)
@@ -436,6 +458,7 @@ class DigestDiffTests(DigestStateCase):
         self.assertNotIn(token, data)
         environment = {
             **os.environ,
+            "HOME": str(isolated_home),
             "PATH": f"{ROOT}{os.pathsep}{os.environ['PATH']}",
             "TWILL_STATE_DIR": str(secret_state),
         }
