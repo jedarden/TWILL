@@ -374,13 +374,41 @@ def _is_candidate(cluster: object) -> bool:
     return True
 
 
+def cluster_prompt_id(cluster: object, *, content_fences: Iterable[str] = ()) -> str:
+    """Return a bounded model-facing identity without collapsing distinct raw keys.
+
+    Keep existing safe IDs compatible. When sanitizing would change an identity,
+    hash the complete raw pair instead of using its lossy display representation.
+    The original cluster remains authoritative for evidence and database updates.
+    """
+
+    detector_id = str(_get(cluster, "detector_id", ""))
+    key = str(_get(cluster, "key", ""))
+    identity = f"{detector_id}:{key}"
+    redactor = Redactor(content_fences)
+    return _cluster_prompt_id(detector_id, key, identity, redactor)
+
+
+def _cluster_prompt_id(
+    detector_id: str, key: str, identity: str, redactor: Redactor
+) -> str:
+    if _is_cluster_id(identity) and _redact_text(identity, redactor) == identity:
+        return identity
+    canonical = json.dumps([detector_id, key], ensure_ascii=True, separators=(",", ":"))
+    return f"cluster:sha256:{hashlib.sha256(canonical.encode('utf-8')).hexdigest()}"
+
+
 def _metadata(item: object, selected: int, redactor: Redactor) -> dict[str, object]:
     cluster = item.cluster
-    detector_id = _redact_text(_get(cluster, "detector_id", ""), redactor)
-    key = _redact_text(_get(cluster, "key", ""), redactor)
-    cluster_id = f"{detector_id}:{key}"
+    raw_detector_id = str(_get(cluster, "detector_id", ""))
+    raw_key = str(_get(cluster, "key", ""))
+    detector_id = _redact_text(raw_detector_id, redactor)
+    key = _redact_text(raw_key, redactor)
+    cluster_id = _cluster_prompt_id(
+        raw_detector_id, raw_key, f"{raw_detector_id}:{raw_key}", redactor
+    )
     return {
-        "cluster_id": _redact_text(cluster_id, redactor),
+        "cluster_id": cluster_id,
         "detector_id": detector_id,
         "key": key,
         "sessions": _count(_get(cluster, "sessions", 0)),
@@ -451,8 +479,8 @@ def _normalise_items(
         cluster, raw_evidence = _item_parts(source_item)
         if not _is_candidate(cluster):
             continue
-        detector_id = _redact_text(_get(cluster, "detector_id", ""), redactor)
-        key = _redact_text(_get(cluster, "key", ""), redactor)
+        detector_id = _get(cluster, "detector_id", "")
+        key = _get(cluster, "key", "")
         identity = (detector_id, key)
         if identity in seen_clusters:
             continue
@@ -1020,12 +1048,7 @@ def _writer_items(source: object, redactor: Redactor) -> tuple[_NormalizedItem, 
                 continue
             seen_evidence.add(evidence_identity)
             evidence.append(normalized)
-        metadata = _metadata(
-            _NormalizedItem(cluster, tuple(evidence)),
-            0,
-            redactor,
-        )
-        identity = (str(metadata["detector_id"]), str(metadata["key"]))
+        identity = (str(_get(cluster, "detector_id", "")), str(_get(cluster, "key", "")))
         if identity in seen_clusters:
             _invalid_lesson_write("source", "must not contain duplicate clusters")
         seen_clusters.add(identity)
@@ -1107,6 +1130,8 @@ def _prepare_lessons(
     item_by_id: dict[str, _NormalizedItem] = {}
     for item in items:
         cluster_id = str(_metadata(item, 0, safe_redactor)["cluster_id"])
+        if cluster_id in item_by_id:
+            _invalid_lesson_write("source", "must not contain colliding cluster ids")
         item_by_id[cluster_id] = item
     prepared: list[_PreparedLesson] = []
     seen_drafts: set[str] = set()
@@ -1506,16 +1531,28 @@ def load_candidate_prompt_clusters(
     connection: sqlite3.Connection,
     top_k: int = 10,
 ) -> tuple[PromptCluster, ...]:
-    """Load candidate clusters with their bounded database evidence."""
+    """Load only candidates with usable bounded evidence for model explanation.
+
+    Unsupported, ambiguous, and empty-evidence clusters remain untouched in the
+    ranker's lane; metadata alone cannot support a draft lesson.
+    """
 
     candidates = load_candidate_clusters(connection, top_k)
-    return tuple(
-        PromptCluster(candidate, _load_evidence(connection, candidate))
-        for candidate in candidates
-    )
+    redactor = Redactor()
+    eligible: list[PromptCluster] = []
+    for candidate in candidates:
+        evidence = tuple(
+            safe
+            for excerpt in _load_evidence(connection, candidate)
+            if (safe := _safe_excerpt_record(excerpt, redactor)) is not None
+        )
+        if evidence:
+            eligible.append(PromptCluster(candidate, evidence))
+    return tuple(eligible)
 
 
 __all__ = [
+    "cluster_prompt_id",
     "CLUSTER_BEGIN",
     "ClaudeInvocationError",
     "CLUSTER_DATA_BEGIN",

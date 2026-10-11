@@ -21,8 +21,12 @@ import twill_app  # noqa: E402
 import twill_explainer  # noqa: E402
 
 
-EVENT_AT = datetime(2026, 9, 27, 12, tzinfo=timezone.utc)
-WEEK = "2026-W39"
+# Keep the end-to-end CLI measurement inside its real trailing-seven-day
+# window, including when this suite runs months after the fixture was added.
+EVENT_AT = (datetime.now(timezone.utc) - timedelta(days=2)).replace(
+    hour=12, minute=0, second=0, microsecond=0
+)
+WEEK = f"{EVENT_AT.isocalendar().year}-W{EVENT_AT.isocalendar().week:02d}"
 PROGRAM = "raw-retention-missing-tool"
 RAW_MARKER = "raw-jsonl-record-marker-7f2d"
 RAW_PAYLOAD = "unbounded-raw-payload-" + ("x" * 8192)
@@ -138,52 +142,6 @@ class RawTranscriptRetentionEndToEndTests(unittest.TestCase):
         self.assertEqual(code, 0, stdout.getvalue())
         return json.loads(stdout.getvalue())
 
-    def seed_detector_contract_rows(self) -> None:
-        """Seed Phase 2's normalized D-01 rows after real ingest.
-
-        The current ingest slice persists the generic D-00 observation stream;
-        detector-specific columns are the normalized contract used by the
-        versioned registry.  This mirrors the existing Scenario 1 lifecycle
-        test without ever inserting transcript records or raw payloads.
-        """
-
-        connection = sqlite3.connect(self.state / "twill.db")
-        try:
-            session_ids = [
-                row[0]
-                for row in connection.execute(
-                    "SELECT session_id FROM session ORDER BY session_id"
-                )
-            ]
-            self.assertEqual(session_ids, ["raw-retention-1", "raw-retention-2"])
-            excerpt = (
-                f"{PROGRAM}: command not found\nRedaction-Fence: {FENCED_VALUE}"
-            )
-            safe_excerpt = twill_app.redact(excerpt, [FENCED_VALUE])
-            normalized = twill_app.signature(safe_excerpt)
-            connection.executemany(
-                "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
-                "program, command, signature, sig_hash, excerpt, cwd) "
-                "VALUES (?, ?, ?, 'run_failed', ?, ?, ?, ?, ?, ?)",
-                [
-                    (
-                        session_id,
-                        EVENT_AT.isoformat(),
-                        EVENT_AT.isoformat(),
-                        PROGRAM,
-                        f"{PROGRAM} --version",
-                        normalized,
-                        twill_app.h12(normalized),
-                        safe_excerpt,
-                        "/workspace/raw-retention",
-                    )
-                    for session_id in session_ids
-                ],
-            )
-            connection.commit()
-        finally:
-            connection.close()
-
     def durable_files(self) -> tuple[Path, ...]:
         roots = (self.state, self.artifacts)
         return tuple(
@@ -249,8 +207,6 @@ class RawTranscriptRetentionEndToEndTests(unittest.TestCase):
         self.assertEqual(ingest.returncode, 0, ingest.stderr)
         self.assertEqual(json.loads(ingest.stdout)["data"]["sessions"], 2)
         self.assert_no_raw_record_retained()
-
-        self.seed_detector_contract_rows()
 
         detect = self.run_cli(
             "detect", "--detector", "D-01", "--window", "3650d", "--json"

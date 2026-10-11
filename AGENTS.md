@@ -38,6 +38,20 @@ close-and-recreate, never a note.
 locked decision in a bead description — if you hit a fork the plan has not made, add it to §16 Open
 Questions. A bead is work; an unresolved decision never is.
 
+## Preserve the transcript-to-lesson evidence path
+
+Ingestion integration tests must feed real transcript shapes through the CLI and assert detector
+observations and evidence from that run. Do not seed normalized observations to demonstrate that
+ingestion works; doing so previously hid a disconnected reader-to-detector path.
+
+Use recorded executor status to classify command outcomes. Help text and examples printed by a
+command are data and may mention failing exit codes even when the command succeeds.
+
+Use the shared `cluster_prompt_id` for model-facing IDs and retain the original cluster identity
+for evidence and backtests. Only evidence-backed clusters may enter explanation; unsupported or
+ambiguous findings remain available for review. Keep lesson limits on decoded fields and body
+lines, since JSON escaping can expand serialized front matter.
+
 ## Inherited prohibitions that bite here
 
 - No `.github/workflows/*` — CI is an Argo WorkflowTemplate in `iad-ci`.

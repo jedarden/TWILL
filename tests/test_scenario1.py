@@ -1,6 +1,5 @@
 """Scenario 1: recurring friction becomes a measured fix (plan §5/§10.1)."""
 
-import hashlib
 import io
 import json
 import os
@@ -21,7 +20,6 @@ import twill_explainer  # noqa: E402
 import twill_lessons  # noqa: E402
 import twill_measure  # noqa: E402
 import twill_schema  # noqa: E402
-from twill_reader import ClaudeCodeLineParser, KIND_RUN  # noqa: E402
 
 
 PROGRAM = "foo"
@@ -153,52 +151,10 @@ class Scenario1LifecycleTests(unittest.TestCase):
             paths.append(path)
         return tuple(paths)
 
-    def seed_normalized_detector_rows(self, paths: tuple[Path, ...]) -> None:
-        rows = []
-        for path in paths:
-            parser = ClaudeCodeLineParser()
-            events = []
-            for source_line, line in enumerate(
-                path.read_text(encoding="utf-8").splitlines(), start=1
-            ):
-                events.extend(parser.parse_line(line, source_line))
-            events.extend(parser.finish())
-            self.assertTrue(events, path)
-            self.assertTrue(all(event.kind == KIND_RUN for event in events))
-            for event in events:
-                self.assertIsNotNone(event.error_excerpt)
-                assert event.error_excerpt is not None
-                rows.append(
-                    (
-                        event.session_id,
-                        event.timestamp,
-                        event.timestamp,
-                        PROGRAM,
-                        event.command,
-                        event.error_excerpt,
-                        hashlib.sha256(event.error_excerpt.encode()).hexdigest()[:12],
-                        event.error_excerpt,
-                        event.cwd,
-                    )
-                )
-
-        connection = twill_schema.connect(self.state)
-        try:
-            connection.executemany(
-                "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
-                "program, command, signature, sig_hash, excerpt, cwd) "
-                "VALUES (?, ?, ?, 'run_failed', ?, ?, ?, ?, ?, ?)",
-                rows,
-            )
-            connection.commit()
-        finally:
-            connection.close()
-
     def drive_to_draft(self, *, flat_series: bool) -> str:
-        paths = self.write_sessions(flat_series=flat_series)
+        self.write_sessions(flat_series=flat_series)
         ingest = self.run_cli("ingest", "--settle", "0", "--limit", "100", "--json")
         self.assertEqual(ingest.returncode, 0, ingest.stderr)
-        self.seed_normalized_detector_rows(paths)
 
         detected = self.run_json_cli(
             "detect", "--detector", "D-01", "--window", "3650d"

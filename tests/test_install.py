@@ -94,6 +94,7 @@ class InstallTests(unittest.TestCase):
         self.assertIn("Type=oneshot", service)
         self.assertIn("MemoryMax=2G", service)
         self.assertIn("CPUQuota=100%", service)
+        self.assertIn("ExecStart=/usr/bin/env %h/.local/bin/twill ingest --limit 120", service)
         self.assertLess(
             service.index("ExecStart=/usr/bin/env %h/.local/bin/twill ingest"),
             service.index("ExecStart=/usr/bin/env %h/.local/bin/twill detect"),
@@ -144,7 +145,7 @@ class InstallTests(unittest.TestCase):
             for service_name, expected_commands in service_commands.items():
                 service = (self.user_units() / service_name).read_text()
                 installed_commands = tuple(
-                    line.rsplit(" ", 1)[1]
+                    line.split()[2]
                     for line in service.splitlines()
                     if line.startswith("ExecStart=")
                 )

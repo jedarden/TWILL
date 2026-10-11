@@ -13,7 +13,9 @@ MemoryMax=2G
 CPUQuota=100%
 # Keep the installed path explicit while letting systemd-analyze verify the
 # unit even on a checkout where the user's symlink has not been installed.
-ExecStart=/usr/bin/env %h/.local/bin/twill ingest
+# Plan §12 expects 60–120 newly settled sessions per hour. Bound each batch
+# at 120 changed sessions; idle cursors do not consume the limit.
+ExecStart=/usr/bin/env %h/.local/bin/twill ingest --limit 120
 ExecStart=/usr/bin/env %h/.local/bin/twill detect
 StandardOutput=journal
 StandardError=journal

@@ -95,6 +95,27 @@ class ArtifactContractTests(unittest.TestCase):
 
         self.assertEqual(read_manifest(self.artifacts, repo_root=ROOT)["schema"], CONTRACT_SCHEMA)
 
+    def test_lesson_limits_apply_to_decoded_fields_and_body(self):
+        lesson = self.artifacts / "lessons/L-0123abcd.md"
+        original = lesson.read_text(encoding="utf-8")
+        # Escaping a valid 240-character key exceeds 240 serialized bytes.
+        key = 'say "yes".' * 24
+        self.assertEqual(len(key), 240)
+        text = original.replace('key: "command-not-found:test"', f"key: {json.dumps(key)}")
+        lesson.write_text(text, encoding="utf-8")
+        write_manifest(self.artifacts, repo_root=ROOT)
+        read_manifest(self.artifacts, repo_root=ROOT)
+
+        for invalid in (
+            text.replace(json.dumps(key), json.dumps(key + "x")),
+            text + "x" * 241 + "\n",
+        ):
+            with self.subTest(overlong_field="key: " + json.dumps(key + "x") in invalid):
+                lesson.write_text(invalid, encoding="utf-8")
+                write_manifest(self.artifacts, repo_root=ROOT)
+                with self.assertRaises(ArtifactContractError):
+                    read_manifest(self.artifacts, repo_root=ROOT)
+
     def test_unknown_contract_version_is_not_silently_consumed(self):
         write_manifest(self.artifacts, repo_root=ROOT)
         path = self.artifacts / "manifest.json"

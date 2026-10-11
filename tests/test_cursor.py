@@ -16,6 +16,7 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime, timezone
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -25,6 +26,7 @@ sys.path.insert(0, str(ROOT))
 
 import twill_cursor  # noqa: E402
 from twill_app import Store  # noqa: E402
+import twill_explainer  # noqa: E402
 
 
 def claude_line(session_id: str, text: str, index: int) -> str:
@@ -811,6 +813,248 @@ class CursorCliTests(unittest.TestCase):
             text=True,
             capture_output=True,
         )
+
+    def test_limited_runs_advance_past_idle_files_and_preserve_error_alarms(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            source = root / "source"
+            source.mkdir()
+            pending = source / "newest.jsonl"
+            invalid = source / "middle.jsonl"
+            clean = source / "oldest.jsonl"
+            completion = claude_line("bounded-pending", "completed tail", 1) + "\n"
+            pending.write_text(
+                claude_line("bounded-pending", "first turn", 0) + "\n"
+                + completion[:20]
+            )
+            invalid.write_text(
+                claude_line("bounded-invalid", "first turn", 0) + "\ninvalid JSON\n"
+            )
+            clean.write_text(claude_line("bounded-clean", "first turn", 0) + "\n")
+            for path, mtime in ((pending, 300), (invalid, 200), (clean, 100)):
+                os.utime(path, (mtime, mtime))
+
+            def ingest(*extra):
+                result = self.run_cli(
+                    "ingest", "--source", str(source), "--settle", "0",
+                    "--limit", "1", "--state-dir", str(state), "--json", *extra,
+                )
+                self.assertEqual(result.returncode, 0, result.stderr)
+                return json.loads(result.stdout)["data"]
+
+            self.assertEqual([ingest()["sessions"] for _ in range(4)], [1, 1, 1, 0])
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                rows = connection.execute(
+                    "SELECT session_id, parse_errors, parse_error_runs FROM cursor "
+                    "ORDER BY session_id"
+                ).fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(rows, [
+                ("bounded-clean", 0, 0),
+                ("bounded-invalid", 1, 3),
+                ("bounded-pending", 1, 4),
+            ])
+
+            with pending.open("a") as handle:
+                handle.write(completion[20:])
+            resumed = ingest()
+            self.assertEqual(resumed["sessions"], 1)
+            self.assertEqual(resumed["events"], 1)
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                row = connection.execute(
+                    "SELECT last_offset, parse_errors, parse_error_runs FROM cursor "
+                    "WHERE session_id = 'bounded-pending'"
+                ).fetchone()
+            finally:
+                connection.close()
+            self.assertEqual(row, (pending.stat().st_size, 0, 0))
+            explicit = ingest("--file", str(pending))
+            self.assertEqual(explicit["sessions"], 1)
+            self.assertEqual(explicit["events"], 0)
+
+    def test_bounded_selection_detects_equal_size_rewrite_with_restored_mtime(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            path = root / "session.jsonl"
+            before = claude_line("bounded-rewrite", "before", 0) + "\n"
+            after = claude_line("bounded-rewrite", "after!", 0) + "\n"
+            path.write_text(before)
+            args = (
+                "ingest", "--source", str(root), "--settle", "0",
+                "--limit", "1", "--state-dir", str(state), "--json",
+            )
+            first = self.run_cli(*args)
+            self.assertEqual(first.returncode, 0, first.stderr)
+            original = path.stat()
+            path.write_text(after)
+            os.utime(path, ns=(original.st_atime_ns, original.st_mtime_ns))
+            rewritten = self.run_cli(*args)
+            self.assertEqual(rewritten.returncode, 0, rewritten.stderr)
+            self.assertEqual(json.loads(rewritten.stdout)["data"]["sessions"], 1)
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                texts = connection.execute("SELECT text FROM transcript_event").fetchall()
+            finally:
+                connection.close()
+            self.assertEqual(texts, [("after!",)])
+
+    def test_cli_readers_feed_real_detectors_across_append_and_rewrite(self):
+        token = "ghp_" + "X" * 36
+        command = f"missing-demo --token {token}"
+        now = datetime.now(timezone.utc).isoformat()
+        for source_kind in ("claude", "codex"):
+            with self.subTest(source=source_kind), tempfile.TemporaryDirectory() as directory:
+                root = Path(directory)
+                state = root / "state"
+                source = root / f".{source_kind}" / "sessions"
+                source.mkdir(parents=True)
+
+                def records(session_id, *, failed=True):
+                    if source_kind == "claude":
+                        base = [{
+                            "type": "assistant", "sessionId": session_id,
+                            "timestamp": now, "cwd": "/workspace/demo",
+                            "message": {"content": [{
+                                "type": "tool_use", "name": "Bash", "id": "call-1",
+                                "input": {"command": command},
+                            }]},
+                        }]
+                        result = {
+                            "type": "user", "sessionId": session_id, "timestamp": now,
+                            "message": {"content": [{
+                                "type": "tool_result", "tool_use_id": "call-1",
+                                "is_error": failed,
+                                "content": (
+                                    f"Exit code 127\nmissing-demo: command not found\n{token}"
+                                    if failed else "completed without a recorded exit code"
+                                ),
+                            }]},
+                        }
+                    else:
+                        base = [
+                            {"type": "session_meta", "timestamp": now,
+                             "payload": {"session_id": session_id, "cwd": "/workspace/demo"}},
+                            {"type": "response_item", "timestamp": now, "payload": {
+                                "type": "function_call", "name": "exec_command",
+                                "call_id": "call-1", "arguments": json.dumps({"cmd": command}),
+                            }},
+                        ]
+                        result = {"type": "response_item", "timestamp": now, "payload": {
+                            "type": "function_call_output", "call_id": "call-1",
+                            "output": (
+                                f"Process exited with code 127\nmissing-demo: command not found\n{token}"
+                                if failed else "Process exited with code 0\ncompleted"
+                            ),
+                        }}
+                    return "".join(json.dumps(row) + "\n" for row in base), json.dumps(result) + "\n"
+
+                def ingest(path):
+                    result = self.run_cli(
+                        "ingest", "--file", str(path), "--settle", "0",
+                        "--state-dir", str(state), "--json",
+                    )
+                    self.assertEqual(result.returncode, 0, result.stderr)
+
+                first = source / "first.jsonl"
+                base, failed_result = records("normalized-first")
+                first.write_text(base)
+                ingest(first)
+                connection = sqlite3.connect(state / "twill.db")
+                self.assertEqual(connection.execute(
+                    "SELECT kind FROM observation"
+                ).fetchall(), [("run",)])
+                connection.close()
+                with first.open("a") as handle:
+                    handle.write(failed_result)
+                ingest(first)
+                second = source / "second.jsonl"
+                second.write_text("".join(records("normalized-second")))
+                ingest(second)
+                connection = sqlite3.connect(state / "twill.db")
+                rows = connection.execute(
+                    "SELECT session_id, kind, program, command, tool FROM observation "
+                    "ORDER BY session_id"
+                ).fetchall()
+                self.assertEqual(len(rows), 2)
+                self.assertTrue(all(row[1:3] == ("run_failed", "missing-demo") for row in rows))
+                self.assertTrue(all("<redacted:" in row[3] for row in rows))
+                self.assertTrue(all(row[4] in {"Bash", "exec_command"} for row in rows))
+                before = connection.execute("SELECT * FROM observation ORDER BY obs_id").fetchall()
+                connection.close()
+                ingest(first)
+                connection = sqlite3.connect(state / "twill.db")
+                self.assertEqual(connection.execute(
+                    "SELECT * FROM observation ORDER BY obs_id"
+                ).fetchall(), before)
+                connection.close()
+                self.assertNotIn(token.encode(), (state / "twill.db").read_bytes())
+                detected = self.run_cli(
+                    "detect", "--detector", "D-01", "--state-dir", str(state), "--json"
+                )
+                self.assertEqual(detected.returncode, 0, detected.stderr)
+                self.assertEqual(json.loads(detected.stdout)["data"]["detectors"][0]["clusters"], 1)
+
+                first.write_text("".join(records("normalized-first", failed=False)))
+                ingest(first)
+                connection = sqlite3.connect(state / "twill.db")
+                self.assertEqual(connection.execute(
+                    "SELECT kind FROM observation WHERE session_id = 'normalized-first'"
+                ).fetchall(), [("run" if source_kind == "claude" else "run_succeeded",)])
+                self.assertEqual(connection.execute(
+                    "SELECT count(*) FROM observation WHERE kind = 'run_failed'"
+                ).fetchone()[0], 1)
+                connection.close()
+
+    def test_capped_signature_keeps_ranked_explain_evidence(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            state = root / "state"
+            source = root / ".claude" / "projects" / "capped"
+            source.mkdir(parents=True)
+            now = datetime.now(timezone.utc).isoformat()
+            # The cap cuts exactly after the first space. Ranking strips its
+            # key; persisted signatures must use the same canonical spelling.
+            error = "x" * 239 + " tail beyond the signature cap"
+            for index in range(2):
+                session_id = f"capped-{index}"
+                rows = [
+                    {"type": "assistant", "sessionId": session_id, "timestamp": now,
+                     "message": {"content": [{
+                         "type": "tool_use", "id": "call", "name": "Bash",
+                         "input": {"command": "demo"},
+                     }]}},
+                    {"type": "user", "sessionId": session_id, "timestamp": now,
+                     "message": {"content": [{
+                         "type": "tool_result", "tool_use_id": "call", "is_error": True,
+                         "content": f"Exit code 1\n{error}",
+                     }]}},
+                ]
+                (source / f"{index}.jsonl").write_text(
+                    "".join(json.dumps(row) + "\n" for row in rows)
+                )
+            for args in (
+                ("ingest", "--source", str(source), "--settle", "0", "--limit", "2"),
+                ("detect", "--detector", "D-02"),
+                ("rank",),
+            ):
+                result = self.run_cli(*args, "--state-dir", str(state), "--json")
+                self.assertEqual(result.returncode, 0, result.stderr)
+            connection = sqlite3.connect(state / "twill.db")
+            try:
+                candidates = twill_explainer.load_candidate_prompt_clusters(connection)
+                self.assertEqual(len(candidates), 1)
+                self.assertEqual(candidates[0].cluster.key, "x" * 239)
+                self.assertEqual(
+                    {item.session_id for item in candidates[0].excerpts},
+                    {"capped-0", "capped-1"},
+                )
+            finally:
+                connection.close()
 
     def test_cli_run_flags_a_vanished_transcript(self):
         with tempfile.TemporaryDirectory() as directory:

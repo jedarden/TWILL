@@ -90,6 +90,12 @@ timer runs every Monday at 08:00 local time and its oneshot service runs rank,
 explain, and digest in order. Each service remains a single oneshot activation,
 so overlapping timer firings are not started.
 
+The hourly ingest processes up to 120 changed settled sessions before detect.
+Unchanged cursors do not consume that limit, so repeated bounded runs advance
+through the backlog. The interactive default remains one changed session;
+`--file` always rechecks the named settled file. Existing time and memory
+budgets still apply to each batch.
+
 ## Tests
 
 ```sh

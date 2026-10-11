@@ -18,6 +18,7 @@ import hashlib
 import json
 import os
 import re
+import shlex
 import sqlite3
 import sys
 from dataclasses import dataclass, field
@@ -45,8 +46,11 @@ import twill_router
 import twill_schema
 import twill_cursor
 import twill_doctor
-from codex_reader import CodexRolloutLineParser, CodexRolloutReader, TokenUsage
-from twill_reader import ClaudeCodeLineParser, MessageUsage
+from codex_reader import (
+    CodexRolloutLineParser, CodexRolloutReader, TokenUsage,
+    NormalizedEvent as CodexEvent,
+)
+from twill_reader import ClaudeCodeLineParser, MessageUsage, NormalizedEvent as ClaudeEvent
 from twill_config import (
     CONFIG_PATH,
     ConfigError,
@@ -291,6 +295,10 @@ class SessionData:
     # counted by their declared type, new span only — a resumed codex parse
     # never re-counts the replayed prefix.  Empty for hand-built sessions.
     record_type_counts: Mapping[str, int] = field(default_factory=dict)
+    # Full-file normalized events come from the existing usage replay. Keeping
+    # the set complete lets a result appended later replace an unknown run
+    # without inventing durable IDs for stateful parser emissions.
+    normalized_events: tuple[ClaudeEvent | CodexEvent, ...] = ()
 
     @property
     def usage_records(self) -> tuple[MessageUsage, ...]:
@@ -507,7 +515,7 @@ def _parse_codex_scan(
         )
         for event in normalized_events
     )
-    usage, usage_rows = _extract_usage(
+    usage, usage_rows, normalized_events = _extract_usage(
         path, source_kind, session_id, scan.new_offset
     )
     return SessionData(
@@ -518,6 +526,7 @@ def _parse_codex_scan(
         usage=usage,
         usage_rows=usage_rows,
         record_type_counts=record_type_counts,
+        normalized_events=normalized_events,
     ), invalid_lines
 
 
@@ -614,7 +623,7 @@ def parse_scan(
                 )
             )
             event_index += 1
-    usage, usage_rows = _extract_usage(
+    usage, usage_rows, normalized_events = _extract_usage(
         path, source_kind, session_id, scan.new_offset
     )
     return SessionData(
@@ -625,6 +634,7 @@ def parse_scan(
         usage=usage,
         usage_rows=usage_rows,
         record_type_counts=record_type_counts,
+        normalized_events=normalized_events,
     ), invalid_lines
 
 
@@ -640,7 +650,7 @@ def extract_usage(
 ) -> SessionUsage | None:
     kind = source_kind or _source_kind(path)
     end_offset = twill_cursor.scan_lines(path, 0).new_offset
-    usage, _ = _extract_usage(path, kind, path.stem, end_offset)
+    usage, _, _ = _extract_usage(path, kind, path.stem, end_offset)
     return usage
 
 
@@ -796,15 +806,20 @@ def _message_usage_summary(
 
 def _extract_claude_usage(
     path: Path, fallback_session_id: str, end_offset: int | None = None
-) -> tuple[SessionUsage | None, tuple[MessageUsage, ...]]:
+) -> tuple[SessionUsage | None, tuple[MessageUsage, ...], tuple[ClaudeEvent, ...]]:
     parser = ClaudeCodeLineParser()
+    normalized_events = []
     consumed = 0
     with path.open("rb") as handle:
         for source_line, raw_line in enumerate(handle, start=1):
             if end_offset is not None and consumed + len(raw_line) > end_offset:
                 break
             consumed += len(raw_line)
-            parser.parse_line(raw_line.decode("utf-8", errors="replace"), source_line)
+            normalized_events.extend(
+                parser.parse_line(raw_line.decode("utf-8", errors="replace"), source_line)
+            )
+    normalized_events.extend(parser.finish())
+    events = tuple(normalized_events)
     rows = parser.usage
     if not rows and parser.cost_state_counters:
         rows = (
@@ -818,7 +833,7 @@ def _extract_claude_usage(
     if wall_seconds is None:
         wall_seconds = _usage_wall_seconds(parser.first_timestamp, parser.last_timestamp)
     if not rows and parser.total_cost_usd is None and not parser.has_cost_state:
-        return None, ()
+        return None, (), events
     session_id = parser.session_id or fallback_session_id
     summary = _message_usage_summary(
         session_id,
@@ -827,7 +842,7 @@ def _extract_claude_usage(
         cost_usd=parser.total_cost_usd,
         wall_seconds=wall_seconds,
     )
-    return summary, rows
+    return summary, rows, events
 
 
 def _codex_usage_row(
@@ -850,12 +865,13 @@ def _codex_usage_row(
 
 def _extract_codex_usage(
     path: Path, fallback_session_id: str, end_offset: int | None = None
-) -> tuple[SessionUsage | None, tuple[MessageUsage, ...]]:
+) -> tuple[SessionUsage | None, tuple[MessageUsage, ...], tuple[CodexEvent, ...]]:
     reader = CodexRolloutReader()
-    reader.parse(path, end_offset=end_offset)
+    parsed = reader.parse(path, end_offset=end_offset)
+    events = (*parsed.events, *reader.finish())
     max_rows = reader.usage_max
     if not max_rows and reader.cost_usd is None:
-        return None, ()
+        return None, (), events
     if max_rows:
         row = max_rows[0]
         usage_rows = (_codex_usage_row(row, cost_usd=reader.cost_usd),)
@@ -878,7 +894,7 @@ def _extract_codex_usage(
         wall_seconds=_usage_wall_seconds(reader.first_timestamp, reader.last_timestamp),
         messages=max(1, reader.message_count),
     )
-    return summary, usage_rows
+    return summary, usage_rows, events
 
 
 def _looks_like_codex(path: Path, end_offset: int | None = None) -> bool:
@@ -917,7 +933,9 @@ def _extract_usage(
     source_kind: str,
     fallback_session_id: str,
     end_offset: int | None = None,
-) -> tuple[SessionUsage | None, tuple[MessageUsage, ...]]:
+) -> tuple[
+    SessionUsage | None, tuple[MessageUsage, ...], tuple[ClaudeEvent | CodexEvent, ...]
+]:
     if source_kind == "codex" or (
         source_kind == "jsonl" and _looks_like_codex(path, end_offset)
     ):
@@ -1088,8 +1106,9 @@ class Store:
         to a stale ``session_id`` is deleted first, so a rewritten file can
         never leave its previous identity's observations behind.  Without it
         (EC-02 resume) the stored base rows stay and only the new span's
-        events are appended; observations are still re-derived, from the full
-        stored event set.  A crash either lands both halves or neither
+        events are appended; observations are re-derived from the readers'
+        full normalized set, or the stored generic events for unsupported
+        shapes. A crash either lands both halves or neither
         (plan §6.2 step 6).  Returns the session's observation count.
         """
         key = _session_key(session.path)
@@ -1154,13 +1173,18 @@ class Store:
                         self.redactor.redact_excerpt(event.cwd),
                     ),
                 )
-            observation_count = self._run_detector(
-                conn,
-                key,
-                stored_session_id,
-                self.retention_seconds,
-                stored_launch_dir,
-            )
+            if session.normalized_events:
+                observation_count = self._persist_normalized_observations(
+                    conn, session, stored_session_id, stored_launch_dir
+                )
+            else:
+                observation_count = self._run_detector(
+                    conn,
+                    key,
+                    stored_session_id,
+                    self.retention_seconds,
+                    stored_launch_dir,
+                )
             twill_rulecorpus.ingest_rule_reads(conn, manage_transaction=False)
             if cursor_update is not None:
                 twill_cursor.upsert_cursor(
@@ -1181,6 +1205,45 @@ class Store:
 
         observation_count = self._persist(session, replace=True)
         return len(session.events), observation_count
+
+    def skip_unchanged_path(self, path: Path) -> bool:
+        """Keep idle cursors out of a bounded batch without hiding errors.
+
+        Compare the identity prefix even when stat metadata matches, so an
+        equal-size rewrite still reparses. A changed mtime merits a recheck
+        (including a repaired pending tail), but never forces a reparse.
+        Unchanged error cursors retain their consecutive-run alarm without
+        rescanning the file or consuming a session from the batch limit.
+        Explicit --file requests bypass this scheduling optimization.
+        """
+        stored_path = self.redactor.redact_text(str(path))
+        row = twill_cursor.load_cursor(self.connection, stored_path)
+        if row is None:
+            return False
+        facts = twill_cursor.file_facts(path)
+        plan = twill_cursor.plan_ingest(row, path, facts)
+        if (
+            plan.action != twill_cursor.ACTION_RESUME
+            or facts.size != row.size
+            or facts.mtime_ns != row.mtime_ns
+        ):
+            return False
+        if row.parse_errors:
+            # A pending tail alone counts as one error on each idle pass;
+            # at EOF the last consuming pass's errors remain sticky.
+            parse_errors = 1 if row.last_offset < row.size else row.parse_errors
+            with self.connection:
+                self.connection.execute(
+                    "UPDATE cursor SET parse_errors = ?, parse_error_runs = ?, "
+                    "last_indexed_at = ? WHERE path = ?",
+                    (
+                        parse_errors,
+                        _next_parse_error_runs(row, parse_errors),
+                        datetime.now(timezone.utc).isoformat(),
+                        stored_path,
+                    ),
+                )
+        return True
 
     def ingest_path(self, path: Path) -> dict[str, object]:
         """Ingest one transcript file under cursor bookkeeping (§6.2 steps 3-6).
@@ -1266,6 +1329,82 @@ class Store:
         ).fetchone()
         return int(row[0]) if row else 0
 
+    def _persist_normalized_observations(
+        self,
+        conn: sqlite3.Connection,
+        session: SessionData,
+        session_id: str,
+        launch_dir: str,
+    ) -> int:
+        """Persist the readers' complete detector-facing set atomically.
+
+        The usage replay already restores pending calls across cursor spans.
+        Replacing observations from that complete set means an appended tool
+        result updates its earlier unknown run exactly once. Generic bounded
+        transcript events remain available independently of detector evidence.
+        """
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=self.retention_seconds)
+            if self.retention_seconds is not None else None
+        )
+        fallback_times = {event.source_line: event.timestamp for event in session.events}
+        count = 0
+        for event in sorted(
+            session.normalized_events,
+            key=lambda item: (item.source_line, item.event_index),
+        ):
+            timestamp = event.timestamp or fallback_times.get(event.source_line)
+            ts_utc, ts_local = _timestamp_pair(
+                timestamp or datetime.now(timezone.utc).isoformat()
+            )
+            if cutoff is not None and _parse_timestamp(ts_utc) < cutoff:
+                continue
+            if count >= MAX_OBSERVATIONS_PER_SESSION:
+                break
+            kind = event.kind
+            if kind == "run":
+                if event.exit_code is None:
+                    kind = "run"
+                elif event.exit_code == 0:
+                    kind = "run_succeeded"
+                else:
+                    kind = "run_failed"
+            # Normalize the full redacted error, then bound every persisted
+            # field. The command alone cannot identify a missing binary or a
+            # recurring error; failed runs carry the parser's error excerpt.
+            evidence = self.redactor.redact_text(event.error_excerpt or event.text)
+            normalized = signature(evidence)[:MAX_EXCERPT_LENGTH].strip()
+            command = self.redactor.redact_excerpt(event.command) if event.command else None
+            program = None
+            if event.command:
+                missing = re.search(r"(?:^|[\s:])([^\s:]+): command not found\b", evidence)
+                if missing:
+                    program = missing.group(1)
+                else:
+                    try:
+                        words = shlex.split(self.redactor.redact_text(event.command))
+                    except ValueError:
+                        words = []
+                    program = next((word for word in words if "=" not in word), None)
+                if program:
+                    program = self.redactor.redact_excerpt(Path(program).name)
+            conn.execute(
+                "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
+                "program, command, signature, sig_hash, tool, path, excerpt, launch_dir, cwd) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_id, ts_utc, ts_local,
+                    self.redactor.redact_text(kind), program, command,
+                    normalized, h12(normalized),
+                    self.redactor.redact_excerpt(event.tool_name) if event.tool_name else None,
+                    self.redactor.redact_excerpt(event.file_path) if event.file_path else None,
+                    self.redactor.redact_excerpt(evidence), launch_dir,
+                    self.redactor.redact_excerpt(event.cwd),
+                ),
+            )
+            count += 1
+        return count
+
     @staticmethod
     def _run_detector(
         conn: sqlite3.Connection,
@@ -1283,9 +1422,9 @@ class Store:
         adjacency-based detectors rely on.
         """
 
-        # The v1 observation table carries no detector_id (cluster and
-        # measurement attribute detectors); D-00@1 events are recognisable by
-        # their kind until Phase 2 replaces this detector.
+        # Unsupported/generic transcript shapes retain the walking skeleton's
+        # diagnostic observations. Supported reader events use the normalized
+        # persistence path, with the fields the SQL detectors actually query.
         query = (
             "SELECT ts_utc, ts_local, kind, text, signature, cwd "
             "FROM transcript_event WHERE session_key = ? AND trim(text) <> ''"
@@ -1480,9 +1619,13 @@ def ingest_command(
                 "wait for the transcript settle window or use --settle 0 for a controlled fixture",
             )
         processed = []
-        for path in files[: args.limit]:
+        for path in files:
+            if args.file is None and store.skip_unchanged_path(path):
+                continue
             item = store.ingest_path(path)
             processed.append(item)
+            if len(processed) >= args.limit:
+                break
     finally:
         store.close()
 
@@ -2009,6 +2152,12 @@ def explain_command(args: argparse.Namespace) -> int:
                 sys.stdout.write(prompt)
             return EXIT_SUCCESS
 
+        expected_cluster_ids = tuple(
+            twill_explainer.cluster_prompt_id(
+                candidate.cluster, content_fences=config.content_fences
+            )
+            for candidate in candidates
+        )
         if not twill_explainer.reserve_explain_invocation(connection):
             emit_success(
                 {
@@ -2023,10 +2172,6 @@ def explain_command(args: argparse.Namespace) -> int:
 
         model = args.model or config.model
         output = twill_explainer.invoke_claude(prompt, model=model)
-        expected_cluster_ids = tuple(
-            f"{candidate.cluster.detector_id}:{candidate.cluster.key}"
-            for candidate in candidates
-        )
         drafts = twill_explainer.validate_explain_output(
             output,
             expected_cluster_ids=expected_cluster_ids,

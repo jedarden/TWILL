@@ -311,7 +311,7 @@ class CoveredRecurrenceEndToEndTests(unittest.TestCase):
     def seed_failure(self, program: str, count: int = 2) -> None:
         self.connection.executemany(
             "INSERT INTO observation(session_id, ts_utc, ts_local, kind, program, "
-            "signature, sig_hash) VALUES (?, ?, ?, 'run_failed', ?, ?, ?)",
+            "signature, sig_hash, excerpt) VALUES (?, ?, ?, 'run_failed', ?, ?, ?, ?)",
             [
                 (
                     f"{program}-{index}",
@@ -320,6 +320,7 @@ class CoveredRecurrenceEndToEndTests(unittest.TestCase):
                     program,
                     "command not found",
                     f"{program}-{index}",
+                    f"{program}: command not found",
                 )
                 for index in range(count)
             ],

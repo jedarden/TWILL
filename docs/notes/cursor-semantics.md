@@ -30,6 +30,25 @@ Consequence: `parse_errors` reads as "unusable lines in the most recent pass
 that actually read bytes", not a lifetime total. A later clean append clears
 it; an idle run leaves it untouched.
 
+Bounded source ingestion checks cursor identity and stat metadata before
+spending a `--limit` slot. Unchanged files are skipped, including unchanged
+pending tails and error-only files; their error streak still advances when
+encountered, so a corrupt newest file cannot block the rest of the backlog.
+A pending tail retains one error on an idle pass, and a consumed invalid line
+retains the previous error count. Changed files still follow the normal
+parse/resume/reparse path. `--file` bypasses this optimization and always
+rechecks the named settled file.
+
+Detector observations come from the Claude and Codex readers' full normalized
+event set, retained during the existing usage replay through the last complete
+line. Replaying that set when an append arrives replaces a pending unknown
+run with its later result without duplicate failures. Unknown exits remain
+`run`; only explicit zero exits become `run_succeeded`, and explicit nonzero
+exits become `run_failed`. Commands, tools, paths, and normalized error
+signatures are redacted before persistence, within the same transaction as
+the cursor. Generic bounded transcript events remain separate; their
+`session_activity` observations are a fallback for unsupported shapes.
+
 ## Identity comparison re-hashes the stored span, not the current prefix
 
 The stored `identity_sha` covered `min(4096, size_at_the_time)` bytes. A file
@@ -41,8 +60,10 @@ file — the exact span the stored digest covered — which answers precisely
 "did any byte I already hashed change". Growth is an append; only a changed
 prefix is a rewrite.
 
-`mtime_ns` is recorded but never decides anything: an append bumps it just as
+`mtime_ns` never decides parse versus reparse: an append bumps it just as
 a rewrite does, so keying reparse on mtime would reparse every growing file.
+A changed mtime does prevent skipping a cursor during bounded selection,
+allowing a pending tail repaired in place to be rechecked.
 
 ## What a vanished file does and does not change
 

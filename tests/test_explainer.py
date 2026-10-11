@@ -86,6 +86,80 @@ class ExplainerTestCase(unittest.TestCase):
     ):
         return twill_explainer.LessonDraft(cluster_id=cluster_id, summary=summary)
 
+    def test_multiline_long_and_redacted_cluster_ids_roundtrip_to_exact_evidence(self):
+        keys = (
+            "daemon recovery\ncontext",
+            "daemon recovery context",
+            "help " + "x" * 240 + " first",
+            "help " + "x" * 240 + " second",
+            "synthetic-fence-one",
+            "synthetic-fence-two",
+        )
+        fences = ("synthetic-fence-one", "synthetic-fence-two")
+        config = TwillConfig(artifacts_root=self.root / "artifacts", content_fences=fences)
+        candidates = tuple(
+            self.candidate(key, detector_id="D-06", session_ids=(f"evidence-{index}",))
+            for index, key in enumerate(keys)
+        )
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        for key in keys:
+            self.seed_cluster_row(connection, detector_id="D-06", key=key)
+        connection.commit()
+
+        prompt = twill_explainer.build_prompt(candidates, content_fences=fences)
+        metadata = [
+            json.loads(line.removeprefix("CLUSTER_DATA "))
+            for line in prompt.splitlines()
+            if line.startswith("CLUSTER_DATA ")
+        ]
+        identities = tuple(item["cluster_id"] for item in metadata)
+        self.assertEqual(len(identities), len(keys))
+        self.assertEqual(len(set(identities)), len(keys))
+        self.assertEqual(identities[1], "D-06:daemon recovery context")
+        for candidate, identity in zip(candidates, identities):
+            self.assertEqual(
+                identity,
+                twill_explainer.cluster_prompt_id(candidate.cluster, content_fences=fences),
+            )
+            self.assertTrue(identity.isprintable())
+            self.assertLessEqual(len(identity), twill_explainer.MAX_IDENTIFIER_LENGTH)
+        for fence in fences:
+            self.assertNotIn(fence, prompt)
+
+        response = json.dumps({
+            "lessons": [
+                {"cluster_id": identity, "summary": self.draft().summary}
+                for identity in reversed(identities)
+            ]
+        })
+        drafts = twill_explainer.validate_explain_output(
+            response, expected_cluster_ids=identities
+        )
+        with mock.patch.object(
+            twill_explainer,
+            "compute_lesson_backtest",
+            return_value=twill_explainer.LessonBacktest(180, 0, None, 0),
+        ) as backtest:
+            paths = twill_explainer.write_lesson_files(
+                drafts, candidates, config, connection=connection
+            )
+        self.assertEqual(
+            [call.args[:3] for call in backtest.call_args_list],
+            [(connection, "D-06", key) for key in reversed(keys)],
+        )
+        for path, index in zip(paths, reversed(range(len(keys)))):
+            self.assertEqual(load_lesson(path).evidence["session_ids"], [f"evidence-{index}"])
+        self.assertEqual(
+            connection.execute("SELECT count(*) FROM cluster WHERE state = 'drafted'")
+            .fetchone()[0],
+            len(keys),
+        )
+        with self.assertRaises(ValidationError):
+            twill_explainer.validate_explain_output(
+                response, expected_cluster_ids=identities[:-1]
+            )
+
     def seed_cluster_row(
         self,
         connection,
@@ -1561,6 +1635,10 @@ class ExplainerTestCase(unittest.TestCase):
         )
 
         self.assertNotIn(twill_explainer.EXCERPT_BEGIN, prompt)
+        self.seed_cluster_row(connection, detector_id="D-02", key=signature[:240])
+        connection.commit()
+        self.assertEqual(twill_explainer.load_candidate_prompt_clusters(connection), ())
+        self.assertEqual(len(twill_explainer.load_candidate_clusters(connection)), 1)
 
     def test_unknown_detector_is_metadata_only(self):
         state_dir = self.root / "state"
@@ -1594,6 +1672,46 @@ class ExplainerTestCase(unittest.TestCase):
         self.assertEqual([row.key for row in rows], ["open"])
         self.assertIsNone(rows[0].covered_by)
         self.assertEqual(rows[0].state, "open")
+
+    def test_prompt_candidate_loader_excludes_unsupported_missing_and_blank_evidence(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        identities = (
+            ("D-01", "command-not-found:valid-tool"),
+            ("D-01", "command-not-found:missing-tool"),
+            ("D-01", "command-not-found:blank-tool"),
+            ("D-06", "unsupported correction"),
+        )
+        for detector, key in identities:
+            self.seed_cluster_row(connection, detector_id=detector, key=key)
+        for session, program in (("valid-session", "valid-tool"), ("blank-session", "blank-tool")):
+            self.seed_observation(
+                connection,
+                session,
+                datetime(2026, 9, 5, tzinfo=timezone.utc),
+                program=program,
+            )
+        connection.execute(
+            "UPDATE observation SET excerpt = '' WHERE session_id = 'blank-session'"
+        )
+        connection.commit()
+        ranked = twill_explainer.load_candidate_clusters(connection)
+
+        candidates = twill_explainer.load_candidate_prompt_clusters(connection)
+
+        self.assertEqual(len(candidates), 1)
+        valid = next(row for row in ranked if row.key == identities[0][1])
+        self.assertEqual(candidates[0].cluster, valid)
+        self.assertEqual(candidates[0].excerpts[0].session_id, "valid-session")
+        self.assertEqual(
+            twill_explainer.cluster_prompt_id(candidates[0].cluster),
+            "D-01:command-not-found:valid-tool",
+        )
+        self.assertEqual(twill_explainer.load_candidate_clusters(connection), ranked)
+        self.assertEqual(
+            connection.execute("SELECT count(*) FROM cluster WHERE state = 'open'").fetchone()[0],
+            len(identities),
+        )
 
 
 if __name__ == "__main__":

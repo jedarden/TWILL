@@ -59,11 +59,9 @@ _REJECTION_SENTINELS = (
 )
 
 _EXIT_CODE_PATTERNS = (
-    re.compile(r"(?im)\bProcess exited with code\s*[:=]?\s*(-?\d+)"),
-    re.compile(r"(?im)\bCommand exited with code\s*[:=]?\s*(-?\d+)"),
-    re.compile(r"(?im)\bExit code\s*[:=]?\s*(-?\d+)"),
-    re.compile(r"(?im)\bexit code\s*[:=]?\s*(-?\d+)"),
-    re.compile(r"(?im)\breturned non[- ]zero exit status\s+(-?\d+)"),
+    re.compile(r"(?im)^[ \t]*Process exited with code\s*[:=]?\s*(-?\d+)[ \t]*$"),
+    re.compile(r"(?im)^[ \t]*Command exited with code\s*[:=]?\s*(-?\d+)[ \t]*$"),
+    re.compile(r"(?im)^[ \t]*Exit code\s*[:=]?\s*(-?\d+)[ \t]*$"),
 )
 
 _EXEC_NAMES = frozenset({"exec", "exec_command", "shell", "bash", "run"})
@@ -473,7 +471,7 @@ class CodexRolloutLineParser:
             ]
 
         if pending is not None and pending.kind == KIND_RUN:
-            exit_code, error_excerpt = _split_exit_code(text)
+            exit_code, error_excerpt = _execution_status(payload.get("output"), text)
             if exit_code is None and _looks_like_error(text):
                 error_excerpt = text or None
             return [
@@ -820,9 +818,55 @@ def _call_kind_and_command(name: str, raw_input: object) -> tuple[str, str | Non
     return "tool", None
 
 
+def _structured_execution_results(value: object) -> list[tuple[int | None, str]]:
+    """Read executor envelopes without searching the command's stdout for status.
+
+    Code-mode calls can return several text blocks containing exec_command
+    JSON envelopes. Each block is a separate result; a running session has no
+    terminal status. Never descend into an envelope's output, which is data
+    printed by the command and may itself contain JSON or exit-code examples.
+    """
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except (TypeError, json.JSONDecodeError):
+            return []
+    if isinstance(value, list):
+        return [result for item in value for result in _structured_execution_results(item)]
+    if not isinstance(value, dict):
+        return []
+    if "output" in value and any(
+        key in value for key in ("wall_time_seconds", "chunk_id", "original_token_count")
+    ):
+        code = value.get("exit_code")
+        if isinstance(code, int) and not isinstance(code, bool):
+            return [(code, _text_from_value(value["output"]))]
+        if "session_id" in value:
+            return [(None, _text_from_value(value["output"]))]
+    if value.get("type") == "text":
+        return _structured_execution_results(value.get("text"))
+    if isinstance(value.get("content"), list):
+        return _structured_execution_results(value["content"])
+    return []
+
+
+def _execution_status(value: object, text: str) -> tuple[int | None, str | None]:
+    results = _structured_execution_results(value)
+    if not results:
+        return _split_exit_code(text)
+    failures = [(code, output) for code, output in results if code not in (None, 0)]
+    if failures:
+        return failures[0][0], "\n".join(output for _, output in failures).strip() or None
+    if any(code is None for code, _ in results):
+        return None, None
+    return 0, None
+
+
 def _split_exit_code(text: str) -> tuple[int | None, str | None]:
+    # A wrapper's Output section is command data, never execution metadata.
+    metadata = re.split(r"(?im)^[ \t]*(?:Final )?Output:[ \t]*", text, maxsplit=1)[0]
     for pattern in _EXIT_CODE_PATTERNS:
-        match = pattern.search(text)
+        match = pattern.search(metadata)
         if match is None:
             continue
         exit_code = int(match.group(1))

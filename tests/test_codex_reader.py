@@ -28,6 +28,54 @@ def record(record_type, payload, *, timestamp="2026-09-22T13:00:00Z"):
 
 
 class CodexReaderTests(unittest.TestCase):
+    def parse_exec_result(self, output):
+        parser = CodexRolloutLineParser()
+        parser.parse_line(record("response_item", {
+            "type": "custom_tool_call", "name": "exec",
+            "call_id": "status-call", "input": "example --help",
+        }), 1)
+        return parser.parse_line(record("response_item", {
+            "type": "custom_tool_call_output", "call_id": "status-call",
+            "output": output,
+        }), 2)[0]
+
+    def test_executor_status_wins_over_exit_codes_printed_in_help(self):
+        event = self.parse_exec_result([{
+            "type": "text", "text": json.dumps({
+                "chunk_id": "example", "wall_time_seconds": 0.1,
+                "exit_code": 0,
+                "output": "Conflicts exit with code 4.\nExit code 127\nexample: command not found",
+            }),
+        }])
+        self.assertEqual(event.exit_code, 0)
+        self.assertIsNone(event.error_excerpt)
+
+    def test_executor_batch_preserves_a_failure_among_successful_results(self):
+        output = [{"type": "text", "text": json.dumps({
+            "chunk_id": "example", "wall_time_seconds": 0.1,
+            "exit_code": code, "output": text,
+        })} for code, text in [(127, "missing-tool: command not found"), (0, "help text")]]
+        event = self.parse_exec_result(output)
+        self.assertEqual(event.exit_code, 127)
+        self.assertEqual(event.error_excerpt, "missing-tool: command not found")
+
+    def test_running_executor_envelope_keeps_status_unknown(self):
+        event = self.parse_exec_result([{
+            "type": "text", "text": json.dumps({
+                "chunk_id": "example", "wall_time_seconds": 0.1,
+                "session_id": 42, "output": "Documentation mentions exit code 4",
+            }),
+        }])
+        self.assertIsNone(event.exit_code)
+
+    def test_exit_code_prose_and_stdout_are_not_execution_metadata(self):
+        for output in (
+            "Invalid transitions exit with code 4 without changing fields.",
+            "Output:\nExit code 127\nAn example printed by a successful command.",
+        ):
+            with self.subTest(output=output):
+                self.assertIsNone(self.parse_exec_result(output).exit_code)
+
     def test_user_response_item_is_not_duplicated_by_event_message(self):
         parser = CodexRolloutLineParser()
         self.assertEqual(

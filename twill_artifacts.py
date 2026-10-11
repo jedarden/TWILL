@@ -269,7 +269,13 @@ def _validate_lesson(path: Path, *, repo_root: Path | None) -> object:
         record = load_lesson(path, repo_root=repo_root)
     except Exception as exc:
         raise ArtifactContractError(f"invalid lesson content: {path.name}") from exc
-    _validate_lines(_read_text(path, label=f"lesson {path.name}"), label=f"lesson {path.name}")
+    # The lesson parser bounds decoded front-matter values. JSON quoting and
+    # multi-value evidence mappings can make their serialized lines longer
+    # without exceeding any field's limit. Body lines retain the line bound.
+    _validate_redaction(
+        _read_text(path, label=f"lesson {path.name}"), label=f"lesson {path.name}"
+    )
+    _validate_lines(record.body, label=f"lesson {path.name} body")
     return record
 
 
