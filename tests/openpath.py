@@ -288,7 +288,8 @@ def check_import(module: object, filename: object = None, *unused: object) -> No
     raise ImportViolation(
         f"forbidden third-party import: {name!r}; TWILL core may import only "
         "the standard library or modules from this repository (the local "
-        "claude CLI remains the sole sanctioned network-capable child)"
+        "claude CLI and read-only icg catalog command are the only sanctioned "
+        "external children)"
     )
 
 
@@ -328,11 +329,13 @@ def _check_subprocess(
 ) -> None:
     if _is_allowed_explain_child(executable, command):
         return
+    if _is_allowed_catalog_child(executable, command):
+        return
     if allow_test_harness and _called_from_test_harness():
         return
     raise SubprocessViolation(
         "forbidden production child process; only the local claude -p "
-        "Explain invocation is permitted"
+        "Explain invocation and icg catalog --json export are permitted"
     )
 
 
@@ -344,6 +347,16 @@ def _is_allowed_explain_child(executable: object, command: object) -> bool:
         return False
     tokens = tuple(_subprocess_text(token) for token in command)
     return len(tokens) >= 2 and tokens[0] == "claude" and tokens[1] == "-p"
+
+
+def _is_allowed_catalog_child(executable: object, command: object) -> bool:
+    """Whether an audit event describes ICG's read-only catalog export."""
+
+    executable_text = _subprocess_text(executable)
+    if executable_text != "icg" or not isinstance(command, (list, tuple)):
+        return False
+    tokens = tuple(_subprocess_text(token) for token in command)
+    return len(tokens) == 3 and tokens == ("icg", "catalog", "--json")
 
 
 def _subprocess_text(value: object) -> str | None:

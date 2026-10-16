@@ -28,6 +28,7 @@ from time import perf_counter
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import twill_detectors
+import twill_catalog
 import twill_brief
 import twill_digest
 import twill_explainer
@@ -1914,6 +1915,7 @@ def detect_command(args: argparse.Namespace) -> int:
     started = perf_counter()
     connection = twill_schema.connect(state_dir)
     try:
+        catalog_result, catalog_observation = twill_catalog.load_and_record(connection)
         report = twill_detectors.run_detectors(
             connection, window_days=days, only=args.detector
         )
@@ -1970,6 +1972,9 @@ def detect_command(args: argparse.Namespace) -> int:
         )
 
     warnings: list[str] = []
+    catalog_data = catalog_result.as_dict()
+    if catalog_observation is not None:
+        catalog_data["observation"] = catalog_observation.as_dict()
     record_stage(
         state_dir,
         "detect",
@@ -1996,6 +2001,7 @@ def detect_command(args: argparse.Namespace) -> int:
                 }
                 for outcome in report.outcomes
             ],
+            "catalog": catalog_data,
             "performance": performance,
         },
         json_mode=args.json,

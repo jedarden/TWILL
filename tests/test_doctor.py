@@ -950,13 +950,13 @@ class OptionalInputLivenessTests(unittest.TestCase):
     def optional_inputs(self, report):
         return next(check for check in report.checks if check.name == "optional_inputs")
 
-    def test_no_external_reader_is_registered_yet_and_doctor_stays_healthy(self):
+    def test_icg_catalog_reader_is_absent_without_degrading_doctor(self):
         check = self.optional_inputs(self.report())
         self.assertEqual(check.status, twill_doctor.HEALTHY)
-        self.assertEqual(check.details["registered"], 0)
+        self.assertEqual(check.details["registered"], 1)
         self.assertEqual(check.details["live"], 0)
-        self.assertEqual(check.details["absent"], 0)
-        self.assertEqual(check.details["inputs"], {})
+        self.assertEqual(check.details["absent"], 1)
+        self.assertEqual(check.details["absent_inputs"], ["icg_catalog"])
 
     def test_registry_reports_live_and_absent_inputs_without_degrading(self):
         registry = twill_reader.build_reader_registry(

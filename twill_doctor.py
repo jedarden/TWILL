@@ -21,6 +21,7 @@ from typing import Any
 from urllib.parse import quote
 
 import twill_detectors
+import twill_catalog
 import twill_digest
 import twill_reader
 import twill_rulecorpus
@@ -1786,9 +1787,12 @@ def run_doctor(
     effective_registry = (
         twill_detectors.REGISTRY if registry is None else tuple(registry)
     )
-    effective_reader_registry = twill_reader.build_reader_registry(
-        *(twill_reader.READER_REGISTRY if reader_registry is None else reader_registry)
-    )
+    if reader_registry is None:
+        reader_registry = (
+            twill_catalog.register_reader(),
+            *twill_reader.READER_REGISTRY,
+        )
+    effective_reader_registry = twill_reader.build_reader_registry(*reader_registry)
 
     connection: sqlite3.Connection | None
     open_error: str | None

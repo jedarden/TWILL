@@ -103,6 +103,14 @@ class NetworkAuditTests(unittest.TestCase):
             )
         )
 
+    def test_icg_catalog_export_is_the_other_allowlisted_child(self):
+        self.assertIsNone(
+            openpath.audit_hook(
+                "subprocess.Popen",
+                ("icg", ["icg", "catalog", "--json"], None, None),
+            )
+        )
+
     def test_other_child_processes_are_rejected(self):
         with self.assertRaises(openpath.SubprocessViolation):
             openpath.check_subprocess("git", ["git", "status"])
