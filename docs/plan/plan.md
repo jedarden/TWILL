@@ -281,7 +281,13 @@ each lives outside TWILL's two trees, which TWILL may not write to (§3):
   events that must never happen and enforces it at the `PreToolUse` boundary. TWILL reads the
   exported catalog and runs one detector against it (`D-10`, gate gap): an event on that list that
   nevertheless executed is a hole in the gate, and is reported as such rather than as a new lesson.
-  Export format is Open Question 8.
+  Export format: **settled** — Open Question 8 is resolved (2026-10-16). ICG renders the catalog
+  with `icg catalog --json`: one versioned `icg-catalog/v2` JSON document — `format`,
+  `catalog_digest` (SHA-256 over the sorted event set; the drift signal), `pack_source`, and
+  `never`/`always` arrays whose entries are keyed by (`pack`, `id`), the same attribution a denial
+  record carries. The contract is pinned by ICG's `docs/notes/event-catalog-json-api.md`; any shape
+  change bumps `format` in the same commit. TWILL keys on `format`, stores the last-seen digest,
+  and never parses rule packs.
 
 All three are strictly optional: every detector degrades to transcript-only parsing when its input
 is absent, and `doctor` reports which inputs are live rather than failing without them.
@@ -290,7 +296,8 @@ is absent, and `doctor` reports which inputs are live rather than failing withou
 dependency graph.** At *runtime*, every reader degrades: an absent input is reported by `doctor`,
 never a failed run. At *build* time, a reader cannot be written before its input's format is
 settled — a parser for an undecided shape is not work, it is a guess. So each optional input's
-reader waits on the question that fixes its format (Open Questions 1, 7 and 8), and the detectors
+reader waits on the question that fixes its format — Open Question 1 is the only one still open
+(7 and 8 are resolved: the receipt and catalog formats are pinned in §6.5) — and the detectors
 behind those readers inherit that wait.
 
 **Two detectors additionally cannot degrade even once built: `D-04` and `D-10`.** Denials exist
@@ -1046,10 +1053,17 @@ triage-only summarization while routing stays manual.
 7. **Resolved 2026-09-28:** `utilities/friction-receipt` owns and installs the `SessionEnd` hook;
    it writes versioned receipts to `${XDG_STATE_HOME:-$HOME/.local/state}/twill/friction-receipts/`.
    TWILL owns only the read path, and the producer's format is pinned above.
-8. **In what form does ICG export its always/never catalog** for `D-10` to read — a versioned JSON
-   file in the ICG repo, a `icg catalog --json` command, or the rule packs parsed directly? Owner:
-   operator, with ICG. Resolve by: Phase 2. Impact if wrong: TWILL ends up parsing rule packs it
-   does not own, which breaks the moment ICG refactors them.
+8. **Resolved 2026-10-16:** the `icg catalog --json` command — the second candidate shape. ICG
+   (bead `irrevers-94a42e7f`, closed) renders one versioned document, contract pinned by ICG's
+   `docs/notes/event-catalog-json-api.md`: literal `format` (`icg-catalog/v2` today), a
+   `catalog_digest` SHA-256 over the sorted event set as the drift signal, `pack_source`, and
+   `never`/`always` entries keyed by (`pack`, `id`) — the same attribution a denial record
+   carries, so D-10 needs no translation table. A shape change bumps `format` in the same commit,
+   so the reader selects on `format` rather than assuming a version. That matters on this host:
+   the installed `icg` release (0.1.63) predates the v2 bump and currently renders
+   `icg-catalog/v1`; availability is not in question, but the reader must not hard-code v2 and
+   must degrade on an unparseable or future format it does not recognize. Rule packs are never
+   parsed here.
 
 ## 17. Revision History
 
