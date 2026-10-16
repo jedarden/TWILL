@@ -56,8 +56,9 @@ successfully` 10,930 times into every worker prompt.
   produces is injected into a prompt, a rules file, or a system context by TWILL itself — that is
   the Reflect failure mode, and it is what §2's no-auto-edit rule exists to prevent.
 - **No fleet-wide collection in v1.** codinghome only (`~/.claude/projects`, `~/.codex/sessions`).
-  lab, bench, and agent-sandbox come in Phase 7 through TWILL's own pull, never through the
-  archive's `mirror/`.
+  lab, bench, and agent-sandbox come in Phase 7 by host-local distillation reporting up through the
+  private artifacts repository (§7.3, Open Question 4), never through the archive's `mirror/`, and
+  never by copying transcripts off the host that produced them.
 - **Not a dashboard.** The deliverable is a markdown digest and a CLI. A web surface can be built
   later on the same store if the digest proves worth reading.
 - **This repository never holds a distilled artifact.** TWILL is public; what it produces is not.
@@ -858,11 +859,16 @@ the digest names its own zero-output state loudly if no lesson reached `applied`
 **Does NOT include:** other hosts, retrieval surface.
 
 ### Phase 7: Other hosts
-**Delivers:** TWILL's own pull of lab/bench/agent-sandbox transcripts into its state dir (never via
-the archive's `mirror/`), host column populated, per-host coverage in `doctor`.
-**Completion criteria:** a cross-host detector reports a signature seen on ≥ 2 hosts; pull failures
-degrade to "stale host", never to a failed run.
-**Does NOT include:** anything pushing to those hosts.
+**Delivers:** host-local reporting — Open Question 4 is resolved (2026-10-16): a TWILL on each host
+reads only that host's transcripts, and what reaches codinghome is the bounded, redacted artifact
+stream over the private artifacts repository (§7.3; never via the archive's `mirror/`), never
+transcript text. TWILL gains no network path and no credential for reaching another host (§3, §11).
+The host column is populated from what each host publishes, with per-host coverage in `doctor`.
+**Completion criteria:** a cross-host detector reports a signature seen on ≥ 2 hosts; a silent host
+degrades to "stale host", never to a failed run.
+**Does NOT include:** anything pushing to those hosts, and no transfer of transcript text in either
+direction. The contract for what a host publishes upstream is specified in `docs/notes/` before
+implementation, the way §7.3 pinned the artifacts interchange.
 
 ### Phase 8: Cluster-hosted recall service
 **Delivers:** the read-only service of §6.6 — a Deployment with an internal poll loop that pulls the
@@ -1068,9 +1074,18 @@ triage-only summarization while routing stays manual.
    to export in and the gate stays shut. It is mirrored by WARP's `warp-257ee85e`, which closes
    only on N-T09's release. Exporting sooner would repeat the Reflect failure (an unsupervised
    writer degrading every prompt) with extra steps.
-4. **How are other hosts' transcripts pulled in Phase 7** — SSH pull by TWILL, or a host-local TWILL
-   per box reporting up? Owner: operator. Resolve by: Phase 7. Impact if wrong: plaintext copies of
-   other hosts' transcripts land on codinghome, which is exactly the exposure §7.2 is trying to bound.
+4. **Resolved 2026-10-16:** a host-local TWILL per box, reporting up — the SSH-pull candidate is
+   foreclosed by requirements the plan has already locked rather than by a new preference: §2 (TWILL
+   copies, retains and backs up nothing, so a pull would make it a transcript archive for other
+   hosts' sessions), §3 (no network calls beyond the local `claude` CLI, no credential store access —
+   reaching another host needs both), §6.6 (operator decision, 2026-09-21: transcripts are local and
+   must not be copied anywhere) and §11 (TWILL holds no credentials, by design). A pull would also
+   import other hosts' transcript text into codinghome's derived DB — the exact exposure §7.2 bounds,
+   since a queryable index of transcript text is designed to be surfaced into future prompts. What
+   crosses hosts is the bounded, redacted artifact stream over the §7.3 private-repository transport
+   (the same transport the recall service reads), and a host with no live reporter is "stale", never
+   a failure. The upstream record contract is specified in `docs/notes/` before any Phase 7
+   implementation.
 5. **Is 180-day observation retention enough** to see annual or quarterly patterns, given the DB-size
    budget? Owner: operator. Resolve by: Phase 6. Impact if wrong: seasonal recurrences look like new
    findings every cycle.
@@ -1099,3 +1114,4 @@ triage-only summarization while routing stays manual.
 | 2026-09-19 | Initial draft from brief; name, independence, and raw-transcript input decided in session. | plan-author |
 | 2026-09-19 | Adopted 9 of 10 `plan-idea-gen` finalists into the phases that own them (backtest P4, change-point + waste + rule-earnings P3, guard generator P5, reproduction-first digest + dead-man's switch P2, usage/shape extraction P1, `twill brief` P6, receipts as an optional input §6.5). The always/never event catalog was routed to **ICG** instead of being adopted here; `D-10` consumes it. Open Questions 7–8 added. | plan-idea-gen (bead twill-502355a3) |
 | 2026-09-24 | Locked the ordered seven-layer routing precedence, the conservative generic-error fallback, and the per-lesson `routing.reason` contract. | opencode (bead twill-dd6383a5) |
+| 2026-10-16 | Open Question 4 resolved: other hosts are covered by host-local TWILL reporting up through the §7.3 artifacts transport, never by pulling transcripts; §2's fleet-wide line and Phase 7's delivery reworded to match. | gate audit (bead twill-05a4374a) |
