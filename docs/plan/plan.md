@@ -341,7 +341,10 @@ poll loop, a pinned semver image and a secret, cloning from `git.ardenone.com`):
   "what is known about this error signature". NEEDLE queries it on a failure, the way its retry
   prompts already query prior fixes; nothing polls on a timer, and nothing is injected by TWILL.
 - **The export stays WARP-compatible.** If WARP ever ships its recall surface (its F9), this service
-  is the thing that goes away, not a second store to reconcile.
+  is the thing that goes away, not a second store to reconcile. **That conditional has triggered
+  (2026-10-16):** WARP's recall surface is live (`warp-recall` and `warp-ingest` in iad-ci behind
+  the `warp-recall-vpn` IngressRoute), so the service this section describes is not built — see
+  §16, Open Question 3.
 
 ## 7. Data Model
 
@@ -872,7 +875,9 @@ image is a pinned semver tag from `containers/twill-serve/VERSION`; manifests ar
 the deployment commit is recorded on the owning bead; no `Job`/`CronJob`, no new Tailscale-exposed
 Service, no injection anywhere.
 **Does NOT include:** ranking or distillation in the cluster — the service serves what codinghome
-decided. Gated on Open Questions 3a (which cluster) and 3b (WARP ownership).
+decided. **Superseded 2026-10-16 before it started:** WARP's live recall surface triggered §6.6's
+subsumption conditional, so the service this phase describes is not built — what remains is lesson
+delivery toward NEEDLE's kernel, gated on NEEDLE N-T09's intake contract (§16, Open Question 3).
 
 ## 10. Testing Strategy & Quality Gates
 
@@ -1045,14 +1050,24 @@ triage-only summarization while routing stays manual.
    log; absence is the normal not-yet-live state, reported by `doctor`, never a failure.
 2. **Which model and what weekly budget for Explain?** Owner: operator. Resolve by: Phase 4.
    Impact if wrong: either cost creep or lessons too thin to accept.
-3. **~~Do accepted lessons feed WARP and/or NEEDLE's PromptBuilder~~** — the serving half is
-   **decided (2026-09-21)**: a cluster-hosted read-only service, git as transport, WARP-compatible
-   export, reactive queries from NEEDLE (§6.6). Two sub-forks remain: **(3a) which cluster** —
-   ardenone-cluster is proposed, on the strength of the `git-activity-exporter` precedent, Traefik
-   with existing auth middleware, and `needle-dashboard` already living there; and **(3b) does WARP
-   subsume the service** once its recall surface exists, or does this stay TWILL's? Owner: operator.
-   Resolve by: Phase 8 start. Impact if wrong: a second lesson store to reconcile, or a service on a
-   cluster that cannot reach the lessons repository.
+3. **~~Do accepted lessons feed WARP and/or NEEDLE's PromptBuilder~~** — **resolved 2026-10-16 by
+   evidence, in two steps.** The serving half was decided 2026-09-21 (§6.6); its subsumption
+   conditional has now triggered: WARP's F9 recall surface is live (`warp-recall` and `warp-ingest`
+   running in iad-ci namespace `warp`, exposed through the `warp-recall-vpn` IngressRoute; verified
+   2026-10-16), and §6.6 already fixed what that means — the TWILL cluster service is the thing
+   that goes away, not a second store to reconcile. Fork **3a is moot** (there is no TWILL service
+   to place on any cluster); fork **3b resolves to WARP subsumes serving**. That forces the
+   consumer: WARP's accepted trust-ladder contract (`docs/notes/lesson-trust-ladder.md`,
+   2026-09-24, implemented in `warp_context.trust`) and plan pin the writer — `lesson` events are
+   authored by NEEDLE's kernel, the promotion authority, and its `POST /v1/ingest` is not a
+   third-party lesson writer — so TWILL's lessons reach workers only through NEEDLE's kernel, and
+   WARP's `lesson` schema (kind `lesson` with immutable trust transitions) applies downstream of
+   that hop, not to TWILL directly. What remains is not an operator question but a tracked external
+   deliverable: **NEEDLE N-T09** (kernel memory module and prompt/context adapter — this gate's
+   "PromptBuilder") has not shipped and pins no lesson-intake schema yet, so there is no contract
+   to export in and the gate stays shut. It is mirrored by WARP's `warp-257ee85e`, which closes
+   only on N-T09's release. Exporting sooner would repeat the Reflect failure (an unsupervised
+   writer degrading every prompt) with extra steps.
 4. **How are other hosts' transcripts pulled in Phase 7** — SSH pull by TWILL, or a host-local TWILL
    per box reporting up? Owner: operator. Resolve by: Phase 7. Impact if wrong: plaintext copies of
    other hosts' transcripts land on codinghome, which is exactly the exposure §7.2 is trying to bound.
