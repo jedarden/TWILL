@@ -85,6 +85,10 @@ class ArtifactReaderTests(unittest.TestCase):
         (self.artifacts / "README.md").write_text(
             "consumer documentation\n", encoding="utf-8"
         )
+        unrelated = self.artifacts / "unrelated"
+        unrelated.mkdir()
+        (unrelated / "data.txt").write_text("not an artifact\n", encoding="utf-8")
+        (unrelated / "link").symlink_to("data.txt")
         manifest_path = self.artifacts / "manifest.json"
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
         manifest["future_metadata"] = {"retention_hint": "consumer-defined"}
@@ -101,18 +105,43 @@ class ArtifactReaderTests(unittest.TestCase):
             "manifest.json",
             "lessons/L-0123abcd.md",
             "README.md",
+            "unrelated/data.txt",
+            "unrelated/link",
         )
         self._run_git("commit", "-qm", "additive snapshot")
         commit = self._run_git("rev-parse", "HEAD")
 
         accepted = read_committed_manifest(self.artifacts, commit=commit, repo_root=ROOT)
         self.assertEqual(accepted["schema"], "twill-artifacts/v1")
+        self.assertEqual(accepted["producer"], "twill")
+        self.assertEqual(accepted["generated_at"], "2026-09-28T12:00:00Z")
+        self.assertEqual(set(accepted["paths"]), set(ARTIFACT_DIRS))
+        self.assertEqual(accepted["artifacts"][0]["path"], "lessons/L-0123abcd.md")
+        self.assertIn("future_metadata", accepted)
+        self.assertIn("future_pattern", accepted["paths"]["lessons"])
+        self.assertTrue(accepted["artifacts"][0]["future_field"])
         self.assertEqual(
             [record.id for record in read_committed_lessons(
                 self.artifacts, commit=commit, repo_root=ROOT
             )],
             ["L-0123abcd"],
         )
+
+    def test_committed_reader_rejects_lesson_path_without_md_suffix(self):
+        self._run_git("init", "-q", "-b", "main")
+        self._run_git("config", "user.name", "fixture")
+        self._run_git("config", "user.email", "fixture@example.test")
+        malformed = self.artifacts / "lessons/L-0123abcd"
+        self.lesson.rename(malformed)
+        manifest_path = self.artifacts / "manifest.json"
+        manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        manifest["artifacts"][0]["path"] = "lessons/L-0123abcd"
+        manifest_path.write_text(json.dumps(manifest) + "\n", encoding="utf-8")
+        self._run_git("add", "--", "manifest.json", "lessons/L-0123abcd")
+        self._run_git("commit", "-qm", "malformed lesson path")
+
+        with self.assertRaises(ArtifactContractError):
+            read_committed_manifest(self.artifacts, repo_root=ROOT)
 
     def test_committed_reader_uses_the_immutable_commit_not_the_worktree(self):
         self._run_git("init", "-q", "-b", "main")
@@ -141,6 +170,26 @@ class ArtifactReaderTests(unittest.TestCase):
             (
                 "missing required field",
                 lambda value: value.pop("producer"),
+            ),
+            (
+                "missing generated_at",
+                lambda value: value.pop("generated_at"),
+            ),
+            (
+                "missing paths",
+                lambda value: value.pop("paths"),
+            ),
+            (
+                "missing artifacts",
+                lambda value: value.pop("artifacts"),
+            ),
+            (
+                "missing path schema",
+                lambda value: value["paths"]["lessons"].pop("schema"),
+            ),
+            (
+                "missing entry hash",
+                lambda value: value["artifacts"][0].pop("sha256"),
             ),
             (
                 "malformed path",
@@ -186,13 +235,17 @@ class ArtifactReaderTests(unittest.TestCase):
             read_committed_manifest(self.artifacts, repo_root=ROOT)
 
     def test_retrieval_eligibility_includes_applied_and_terminal_layers(self):
+        self._run_git("init", "-q", "-b", "main")
+        self._run_git("config", "user.name", "fixture")
+        self._run_git("config", "user.email", "fixture@example.test")
         cases = (
             ("draft", None, False),
             ("accepted", None, True),
             ("applied:retrieval_only", "retrieval_only", True),
+            ("applied:environment", "environment", True),
             ("resolved", "retrieval_only", True),
-            ("escalated", "retrieval_only", True),
-            ("retired", "retrieval_only", True),
+            ("escalated", "environment", True),
+            ("retired", "environment", True),
         )
         for state, applied, eligible in cases:
             with self.subTest(state=state):
@@ -200,6 +253,11 @@ class ArtifactReaderTests(unittest.TestCase):
                 write_manifest(self.artifacts, repo_root=ROOT)
                 records = read_retrieval_lessons(self.artifacts, repo_root=ROOT)
                 self.assertEqual(bool(records), eligible)
+                commit = self._commit(f"lesson state {state}")
+                committed = read_committed_lessons(
+                    self.artifacts, commit=commit, repo_root=ROOT
+                )
+                self.assertEqual(bool(committed), eligible)
 
 
 if __name__ == "__main__":

@@ -178,7 +178,7 @@ def _schema_for(relative: Path) -> str:
     if len(relative.parts) != 2:
         raise ArtifactContractError(f"artifact path must be directly below its namespace: {relative}")
     namespace, name = relative.parts
-    if namespace == "lessons" and LESSON_ID_RE.fullmatch(name.removesuffix(".md")):
+    if namespace == "lessons" and name.endswith(".md") and LESSON_ID_RE.fullmatch(name[:-3]):
         return LESSON_SCHEMA
     if namespace == "digests" and _DIGEST_NAME_RE.fullmatch(name):
         return DIGEST_SCHEMA
@@ -795,7 +795,7 @@ def _assert_publishable_paths(paths: Sequence[str]) -> None:
 
 
 def _extract_archive(archive_path: Path, destination: Path) -> None:
-    """Extract a git archive while refusing links and traversal entries."""
+    """Extract the contract surface while refusing unsafe or linked entries."""
 
     destination.mkdir()
     with tarfile.open(archive_path, mode="r:") as archive:
@@ -803,12 +803,15 @@ def _extract_archive(archive_path: Path, destination: Path) -> None:
             relative = Path(member.name)
             target = (destination / relative).resolve()
             if (
-                relative.is_absolute()
+                not relative.parts
+                or relative.is_absolute()
                 or any(part in {"", ".", ".."} for part in relative.parts)
                 or target != destination.resolve()
                 and destination.resolve() not in target.parents
             ):
                 raise ArtifactPublicationError("git archive contains an unsafe path")
+            if member.name != MANIFEST_FILENAME and relative.parts[0] not in ARTIFACT_DIRS:
+                continue
             if member.issym() or member.islnk() or member.isdev():
                 raise ArtifactPublicationError("git archive contains a link or device")
             archive.extract(member, path=destination, filter="data")
