@@ -268,9 +268,16 @@ at a time and is the only step that leaves the machine.
 Three inputs make detection cheaper and more reliable, and **none of them is TWILL's to install** —
 each lives outside TWILL's two trees, which TWILL may not write to (§3):
 
-- **`org-rule-guard` denial log.** The hook appends `{ts, rule, tool, session_id}` on every deny.
-  Without it, denials are unmeasurable: counting them from transcript text is polluted because
-  CLAUDE.md's own statement of the rules is itself indexed. Ownership is Open Question 1.
+- **`org-rule-guard` denial log.** Ownership: **settled** — Open Question 1 is resolved
+  (2026-10-16): `utilities/org-rule-guard` owns and installs the hook and its log. The hook
+  appends one JSON line per deny — `{ts, rule_id, tool, cwd, session_id, fragment}`, `fragment`
+  being a redacted, whitespace-flattened, 80-character-truncated piece of what matched (the
+  credential rule logs its pattern name, never the match) — at
+  `${XDG_STATE_HOME:-~/.local/state}/org-rule-guard/denials.jsonl`, a bounded rolling window
+  (active file plus one `denials.jsonl.1` backup, 256 KiB cap each). The authoritative record
+  contract is pinned by that utility's `README.md`. Without it, denials are unmeasurable:
+  counting them from transcript text is polluted because CLAUDE.md's own statement of the rules
+  is itself indexed.
 - **Friction receipt.** The `utilities/friction-receipt` `SessionEnd` hook writes one small
   structured record per session under `${XDG_STATE_HOME:-$HOME/.local/state}/twill/friction-receipts/`.
   Each `<session_id>.json` is `twill-friction-receipt/v1` and contains only bounded, redacted
@@ -296,9 +303,9 @@ is absent, and `doctor` reports which inputs are live rather than failing withou
 dependency graph.** At *runtime*, every reader degrades: an absent input is reported by `doctor`,
 never a failed run. At *build* time, a reader cannot be written before its input's format is
 settled — a parser for an undecided shape is not work, it is a guess. So each optional input's
-reader waits on the question that fixes its format — Open Question 1 is the only one still open
-(7 and 8 are resolved: the receipt and catalog formats are pinned in §6.5) — and the detectors
-behind those readers inherit that wait.
+reader waits on the question that fixes its format — all three are resolved as of 2026-10-16
+(1, 7 and 8: the denial-log, receipt, and catalog formats are pinned in §6.5) — and the detectors
+behind those readers inherited that wait.
 
 **Two detectors additionally cannot degrade even once built: `D-04` and `D-10`.** Denials exist
 nowhere else — counting them from transcript text is polluted because CLAUDE.md's own statement of
@@ -1028,9 +1035,14 @@ triage-only summarization while routing stays manual.
 
 ## 16. Open Questions
 
-1. **Where does the `org-rule-guard` denial log live, and who owns it?** `~/.claude/hooks/` alongside
-   the hook, or the `utilities` repo where `agent-secrets` already lives. Owner: operator.
-   Resolve by: Phase 2. Impact if wrong: a second migration of the log path and a gap in `D-04` history.
+1. **Resolved 2026-10-16:** the `utilities` repo — the second candidate, where `agent-secrets`
+   already lives. `org-rule-guard` is extracted there (extraction 2026-09-05, log lifecycle
+   bounded 2026-09-27) as the owner and
+   installer of the hook, with the denial log pinned at
+   `${XDG_STATE_HOME:-~/.local/state}/org-rule-guard/denials.jsonl` and the six-field record
+   contract in its `README.md` (§6.5). TWILL owns only the read path. Hosts whose installed hook
+   predates the log — codinghome included, until the utility is upgraded there — simply present no
+   log; absence is the normal not-yet-live state, reported by `doctor`, never a failure.
 2. **Which model and what weekly budget for Explain?** Owner: operator. Resolve by: Phase 4.
    Impact if wrong: either cost creep or lessons too thin to accept.
 3. **~~Do accepted lessons feed WARP and/or NEEDLE's PromptBuilder~~** — the serving half is
