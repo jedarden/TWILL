@@ -1235,6 +1235,9 @@ class ExplainerTestCase(unittest.TestCase):
             twill_explainer.PromptCluster(
                 self.cluster("dismissed", state="dismissed"), (self.excerpt(4),)
             ),
+            twill_explainer.PromptCluster(
+                self.cluster("cross-host", detector_id="D-11"), (self.excerpt(5),)
+            ),
         ]
 
         prompt = twill_explainer.build_prompt(clusters)
@@ -1243,6 +1246,7 @@ class ExplainerTestCase(unittest.TestCase):
         self.assertNotIn("D-01:covered", prompt)
         self.assertNotIn("D-01:drafted", prompt)
         self.assertNotIn("D-01:dismissed", prompt)
+        self.assertNotIn("D-11:cross-host", prompt)
         self.assertEqual(prompt.count(twill_explainer.EXCERPT_BEGIN), 1)
 
     def test_hard_candidate_gates_override_inconsistent_markers(self):
@@ -1672,6 +1676,23 @@ class ExplainerTestCase(unittest.TestCase):
         self.assertEqual([row.key for row in rows], ["open"])
         self.assertIsNone(rows[0].covered_by)
         self.assertEqual(rows[0].state, "open")
+
+    def test_db_candidate_loader_excludes_cross_host_before_limit(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        self.seed_cluster_row(connection, detector_id="D-11", key="signature:abc")
+        self.seed_cluster_row(connection, detector_id="D-02", key="local-failure")
+        connection.execute(
+            "UPDATE cluster SET score = 5.0 WHERE detector_id = 'D-11'"
+        )
+        connection.commit()
+
+        candidates = twill_explainer.load_candidate_clusters(connection, top_k=1)
+
+        self.assertEqual(
+            [(row.detector_id, row.key) for row in candidates],
+            [("D-02", "local-failure")],
+        )
 
     def test_prompt_candidate_loader_excludes_unsupported_missing_and_blank_evidence(self):
         connection = twill_schema.connect(self.root / "state")

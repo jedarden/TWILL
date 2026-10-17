@@ -24,10 +24,8 @@ _SCORE_SESSION_WEIGHT = 4.0
 _SCORE_EVENT_WEIGHT = 1.0
 _SCORE_RECENCY_WEIGHT = 1.0
 _SECONDS_PER_DAY = 86400.0
-# These detectors report operational state for review; they do not propose
-# changes to agent behavior.  Keep the gate at the candidate source so a
-# D-10 gate gap cannot turn into a TWILL lesson (plan §6.5 and §8.5).
-NON_LESSON_DETECTORS = frozenset({"D-09", "D-10"})
+# These findings are report-only and cannot seed a TWILL lesson.
+NON_LESSON_DETECTORS = frozenset({"D-09", "D-10", "D-11"})
 
 
 @dataclass(frozen=True)

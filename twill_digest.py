@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Sequence
 
 import twill_detectors
+import twill_crosshost
 import twill_lessons
 import twill_measure
 import twill_rules
@@ -200,6 +201,7 @@ class Finding:
     trend_status: str | None = None
     trend_metric: str | None = None
     trend_excess: float | None = None
+    cross_host: dict[str, object] | None = None
 
 
 @dataclass(frozen=True)
@@ -503,11 +505,16 @@ def _read_window(
                 )
                 continue
             try:
+                # Local detectors replay only this week's observations from
+                # memory. D-11 reads accepted daily buckets on the source;
+                # its inclusive date predicate needs six days after Monday
+                # to cover exactly the seven dates of an ISO week.
+                cross_host = detector.detector_id == twill_crosshost.DETECTOR_ID
                 clusters = read_clusters(
-                    memory,
+                    source if cross_host else memory,
                     detector,
                     window_start_utc=start,
-                    window_days=7,
+                    window_days=6 if cross_host else 7,
                 )
                 if detector.session_hits_sql is not None:
                     hit_cursor = memory.execute(
@@ -632,6 +639,8 @@ def _covered_escalations(
         if current_result.status != STATUS_OK:
             continue
         detector_id = current_result.detector.detector_id
+        if detector_id == twill_crosshost.DETECTOR_ID:
+            continue
         previous_result = previous_by_detector.get(current_result.detector.full_id)
         for key, current in current_result.clusters.items():
             covered = coverage.get((detector_id, key))
@@ -793,6 +802,7 @@ def _finding_data(finding: Finding) -> dict[str, object]:
         "trend_status": finding.trend_status,
         "trend_metric": finding.trend_metric,
         "trend_excess": finding.trend_excess,
+        **({"cross_host": finding.cross_host} if finding.cross_host is not None else {}),
         **_finding_waste_data(finding),
     }
 
@@ -904,8 +914,35 @@ def build_digest(
     trend_report: twill_trend.TrendReport | None = None
     trend_error: str | None = None
     coverage: dict[tuple[str, str], tuple[str, str]] = {}
+    cross_host_current: dict[str, dict[str, object]] = {}
+    cross_host_previous: dict[str, dict[str, object]] = {}
+    cross_host_freshness_as_of: str | None = None
     try:
         source.execute("BEGIN")
+        if twill_crosshost.host_reports_imported(source):
+            if not any(
+                detector.detector_id == twill_crosshost.DETECTOR_ID
+                for detector in detectors
+            ):
+                detectors = twill_detectors.build_registry(
+                    *detectors, twill_crosshost.CROSS_HOST_SIGNATURE
+                )
+            freshness_time = datetime.now(timezone.utc)
+            cross_host_freshness_as_of = freshness_time.isoformat()
+            cross_host_current = {
+                str(item["key"]): item
+                for item in twill_crosshost.findings(
+                    source, window_start_utc=start, window_days=6,
+                    now=freshness_time,
+                )
+            }
+            cross_host_previous = {
+                str(item["key"]): item
+                for item in twill_crosshost.findings(
+                    source, window_start_utc=prior_start, window_days=6,
+                    now=freshness_time,
+                )
+            }
         observations = int(
             source.execute("SELECT count(*) FROM observation").fetchone()[0]
         )
@@ -1097,6 +1134,18 @@ def build_digest(
                 trend_excess=(
                     trend_finding.signal_excess if trend_finding is not None else None
                 ),
+                cross_host=(
+                    {
+                        "coverage": "accepted host reports only; fleet coverage not assessed",
+                        "freshness_as_of": cross_host_freshness_as_of,
+                        "current": cross_host_current.get(key) if current is not None else None,
+                        "previous": (
+                            cross_host_previous.get(key) if previous is not None else None
+                        ),
+                    }
+                    if detector == twill_crosshost.CROSS_HOST_SIGNATURE.full_id
+                    else None
+                ),
             )
         )
     findings_list.sort(key=lambda finding: _finding_sort_key(finding, verdict_rank))
@@ -1197,10 +1246,10 @@ def render_data(report: DigestReport) -> dict[str, object]:
     }
 
 
-def _count_text(count: tuple[int, int] | None) -> str:
+def _count_text(count: tuple[int, int] | None, *, unit: str = "sessions") -> str:
     if count is None:
-        return "? sessions/? events"
-    return f"{count[0]} sessions/{count[1]} events"
+        return f"? {unit}/? events"
+    return f"{count[0]} {unit}/{count[1]} events"
 
 
 def _waste_text(estimate: EstimatedWaste | None) -> str:
@@ -1336,11 +1385,32 @@ def render_text(report: DigestReport) -> str:
             )
             lines.append(
                 _line(
-                    f"  {_count_text(previous)}->{_count_text(current)}; "
+                    f"  {_count_text(previous, unit='hosts' if finding.cross_host else 'sessions')}"
+                    f"->{_count_text(current, unit='hosts' if finding.cross_host else 'sessions')}; "
                     f"{_waste_text(finding.estimated_waste)}",
                     report.command,
                 )
             )
+            if finding.cross_host is not None:
+                lines.append(
+                    _line(
+                        "  accepted host reports only; fleet coverage not assessed",
+                        report.command,
+                    )
+                )
+                for period in ("previous", "current"):
+                    evidence = finding.cross_host.get(period)
+                    if not isinstance(evidence, dict):
+                        continue
+                    for contributor in evidence["contributors"]:
+                        lines.append(
+                            _line(
+                                f"  {period} host {contributor['host_id']} "
+                                f"({contributor['freshness']}): "
+                                f"{', '.join(contributor['days'])}",
+                                report.command,
+                            )
+                        )
             if finding.trend_status is not None:
                 lines.append(
                     _line(f"  trend={finding.trend_status}", report.command)

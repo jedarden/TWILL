@@ -738,7 +738,7 @@ def _load_candidate_clusters(connection: sqlite3.Connection, top_k: int) -> tupl
         "SELECT detector_id, key, window_days, sessions, events, first_seen, "
         "last_seen, score, covered_by, state FROM cluster "
         "WHERE state = 'open' AND covered_by IS NULL "
-        "AND detector_id NOT IN ('D-09', 'D-10') "
+        "AND detector_id NOT IN ('D-09', 'D-10', 'D-11') "
         "ORDER BY score DESC, sessions DESC, events DESC, last_seen DESC, "
         "detector_id ASC, key ASC LIMIT ?",
         (top_k,),

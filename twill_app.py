@@ -30,6 +30,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import twill_detectors
 import twill_catalog
 import twill_brief
+import twill_crosshost
 import twill_digest
 import twill_explainer
 import twill_guards
@@ -1934,14 +1935,20 @@ def detect_command(args: argparse.Namespace) -> int:
     if args.detector:
         # Fail fast on a typo before the database is opened: a partial run
         # behind a usage error would be needlessly hard to reason about.
+        # D-11 belongs to that universe even though it joins the run only
+        # when imported host reports exist (twill_crosshost).
         try:
-            twill_detectors.select_detectors(registry, args.detector)
+            twill_detectors.select_detectors(
+                tuple(registry) + (twill_crosshost.CROSS_HOST_SIGNATURE,),
+                args.detector,
+            )
         except ValueError as exc:
             raise UsageError(str(exc)) from exc
 
     state_dir = _state_dir(args.state_dir)
     started = perf_counter()
     connection = twill_schema.connect(state_dir)
+    cross_host_signatures: list[dict[str, object]] = []
     try:
         catalog_result, catalog_observation = twill_catalog.load_and_record(connection)
         # D-10 cannot degrade (plan §6.5): without a catalog it can read it
@@ -1961,12 +1968,46 @@ def detect_command(args: argparse.Namespace) -> int:
                 )
             except (twill_catalog.CatalogError, sqlite3.Error) as exc:
                 gate_gap_skip = f"ICG catalog could not be evaluated: {exc}"
+        # Phase 7's cross-host detector runs only over imported fleet
+        # evidence (docs/notes/host-report-contract.md).  Until the first
+        # host report is accepted the input does not exist, and the honest
+        # report is "not run", never a zero-cluster claim over a corpus the
+        # database never held — so D-11 joins this run's registry only when
+        # the import is live.
+        crosshost_live = twill_crosshost.host_reports_imported(connection)
+        if (
+            args.detector
+            and not crosshost_live
+            and twill_crosshost.DETECTOR_ID in args.detector
+        ):
+            raise CliError(
+                EXIT_RUNTIME_ERROR,
+                f"{twill_crosshost.DETECTOR_ID} requested but no host report "
+                "has been imported into this state database",
+                "Phase 7's upstream importer has not accepted a report yet; "
+                "run 'twill doctor --json' for host coverage once it has",
+            )
+        if crosshost_live:
+            registry = tuple(registry) + (
+                twill_crosshost.CROSS_HOST_SIGNATURE,
+            )
         report = twill_detectors.run_detectors(
             connection,
             window_days=days,
             only=args.detector,
             skip={"D-10": gate_gap_skip} if gate_gap_skip else None,
+            registry=registry,
         )
+        if any(
+            outcome.detector_id == twill_crosshost.DETECTOR_ID
+            and outcome.status == twill_detectors.STATUS_OK
+            for outcome in report.outcomes
+        ):
+            cross_host_signatures = twill_crosshost.findings(
+                connection,
+                window_start_utc=report.window_start_utc,
+                window_days=report.window_days,
+            )
     finally:
         connection.close()
 
@@ -2066,6 +2107,7 @@ def detect_command(args: argparse.Namespace) -> int:
                 for outcome in report.outcomes
             ],
             "catalog": catalog_data,
+            "cross_host_signatures": cross_host_signatures,
             "performance": performance,
         },
         json_mode=args.json,
@@ -2084,6 +2126,17 @@ def detect_command(args: argparse.Namespace) -> int:
             print(f"{outcome.full_id}: skipped — {outcome.reason}")
             continue
         print(f"{outcome.full_id}: {outcome.clusters} cluster(s)")
+    for finding in cross_host_signatures:
+        print(
+            f"{twill_crosshost.DETECTOR_ID}: {finding['signature_sha256']} "
+            f"on {finding['hosts']} host(s), {finding['events']} event(s)"
+        )
+        for contributor in finding["contributors"]:
+            print(
+                f"  {contributor['host_id']}: "
+                f"{', '.join(contributor['days'])} "
+                f"({contributor['freshness']})"
+            )
     total_clusters = sum(outcome.clusters for outcome in report.outcomes)
     print(f"{len(report.outcomes)} detector(s) ran; {total_clusters} cluster(s)")
     if getattr(args, "time", False):

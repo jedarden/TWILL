@@ -248,6 +248,17 @@ class RankerTestCase(unittest.TestCase):
             "dismissed",
         )
 
+    def test_cross_host_signature_is_visible_but_not_a_lesson_candidate(self):
+        self.add_cluster("signature:abc", detector_id="D-11", sessions=2, events=5)
+        self.add_cluster("local-failure", detector_id="D-02", sessions=2, events=2)
+
+        ranking = self.rank(top_k=1).ranking
+
+        self.assertIn("signature:abc", [row.key for row in ranking.all_clusters])
+        self.assertEqual([row.key for row in ranking.clusters], ["local-failure"])
+        cross_host = next(row for row in ranking.all_clusters if row.detector_id == "D-11")
+        self.assertFalse(cross_host.new_lesson_candidate)
+
     def test_score_and_coverage_rollback_together(self):
         rules = self.root / "rules"
         rules.mkdir()

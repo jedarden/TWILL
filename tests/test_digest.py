@@ -19,6 +19,7 @@ sys.path.insert(0, str(ROOT))
 twill_digest = importlib.import_module("twill_digest")
 twill_schema = importlib.import_module("twill_schema")
 twill_detectors = importlib.import_module("twill_detectors")
+twill_crosshost = importlib.import_module("twill_crosshost")
 twill_contract = importlib.import_module("twill_contract")
 MISSING_BINARY = twill_detectors.MISSING_BINARY
 SUBJECT = (2026, 38)
@@ -757,6 +758,121 @@ class DigestDiffTests(DigestStateCase):
         text = twill_digest.render_text(report)
         self.assertIn("detector error: D-99@1", text)
         self.assertIn("detector failures: D-99@1", text)
+
+
+class CrossHostDigestTests(DigestStateCase):
+    def add_host_tables(self):
+        self.connection.execute(twill_crosshost.HOST_REPORT_DDL)
+        self.connection.execute(twill_crosshost.HOST_REPORT_BUCKET_DDL)
+
+    def add_report(self, host_id, generated_at):
+        stamp = generated_at.isoformat()
+        self.connection.execute(
+            "INSERT INTO host_report VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                host_id,
+                stamp,
+                stamp,
+                (generated_at.date() - timedelta(days=29)).isoformat(),
+                generated_at.date().isoformat(),
+                twill_crosshost.SIGNATURE_SCHEME,
+                "0" * 64,
+            ),
+        )
+
+    def add_bucket(self, host_id, day, signature, events):
+        stamp = f"{day}T12:00:00Z"
+        self.connection.execute(
+            "INSERT INTO host_report_bucket VALUES (?, ?, 'run_failed', ?, ?, 1, ?, ?, ?)",
+            (
+                host_id,
+                day,
+                twill_crosshost.SIGNATURE_SCHEME,
+                signature,
+                events,
+                stamp,
+                stamp,
+            ),
+        )
+
+    def test_digest_admits_d11_only_after_a_report_is_accepted(self):
+        self.assertEqual(self.build(registry=()).detectors, ())
+        self.add_host_tables()
+        self.assertEqual(self.build(registry=()).detectors, ())
+        self.add_report("host-a", datetime.now(timezone.utc))
+
+        report = self.build(registry=())
+
+        self.assertEqual(
+            [(item.full_id, item.current_clusters, item.previous_clusters)
+             for item in report.detectors],
+            [("D-11@1", 0, 0)],
+        )
+        self.assertEqual(report.findings, ())
+
+    def test_historical_d11_findings_show_host_dates_and_freshness(self):
+        self.add_host_tables()
+        now = datetime.now(timezone.utc).replace(microsecond=0)
+        self.add_report("host-a", now)
+        self.add_report("host-b", now - timedelta(days=4))
+        current_signature = hashlib.sha256(b"current error").hexdigest()
+        previous_signature = hashlib.sha256(b"previous error").hexdigest()
+        boundary_signature = hashlib.sha256(b"next week error").hexdigest()
+        self.add_bucket("host-a", "2026-09-16", current_signature, 3)
+        self.add_bucket("host-b", "2026-09-17", current_signature, 4)
+        self.add_bucket("host-a", "2026-09-09", previous_signature, 2)
+        self.add_bucket("host-b", "2026-09-10", previous_signature, 5)
+        self.add_bucket("host-a", "2026-09-21", boundary_signature, 7)
+        self.add_bucket("host-b", "2026-09-21", boundary_signature, 8)
+
+        report = self.build(registry=())
+        by_key = {finding.key: finding for finding in report.findings}
+
+        self.assertEqual(
+            [(item.full_id, item.current_clusters, item.previous_clusters)
+             for item in report.detectors],
+            [("D-11@1", 1, 1)],
+        )
+        self.assertEqual(set(by_key), {
+            twill_crosshost.KEY_PREFIX + current_signature,
+            twill_crosshost.KEY_PREFIX + previous_signature,
+        })
+        self.assertEqual(by_key[twill_crosshost.KEY_PREFIX + current_signature].verdict, "new")
+        self.assertEqual(by_key[twill_crosshost.KEY_PREFIX + previous_signature].verdict, "gone")
+
+        data = twill_digest.render_data(report)
+        current = next(
+            item for item in data["findings"]
+            if item["key"] == twill_crosshost.KEY_PREFIX + current_signature
+        )
+        previous = next(
+            item for item in data["findings"]
+            if item["key"] == twill_crosshost.KEY_PREFIX + previous_signature
+        )
+        self.assertEqual(current["sessions"], 2)
+        self.assertEqual(current["events"], 7)
+        self.assertIsNone(current["cross_host"]["previous"])
+        self.assertEqual(
+            current["cross_host"]["current"]["contributors"],
+            [
+                {"host_id": "host-a", "days": ["2026-09-16"], "freshness": "current"},
+                {"host_id": "host-b", "days": ["2026-09-17"], "freshness": "stale_host"},
+            ],
+        )
+        self.assertEqual(
+            [item["days"] for item in previous["cross_host"]["previous"]["contributors"]],
+            [["2026-09-09"], ["2026-09-10"]],
+        )
+        self.assertIsNone(previous["cross_host"]["current"])
+        self.assertIn("fleet coverage not assessed", current["cross_host"]["coverage"])
+
+        text = twill_digest.render_text(report)
+        self.assertIn("2 hosts/7 events", text)
+        self.assertIn("current host host-a (current): 2026-09-16", text)
+        self.assertIn("current host host-b (stale_host): 2026-09-17", text)
+        self.assertIn("previous host host-a (current): 2026-09-09", text)
+        self.assertIn("accepted host reports only; fleet coverage not assessed", text)
+        self.assertNotIn(boundary_signature, text)
 
 
 class DigestCliTests(DigestStateCase):

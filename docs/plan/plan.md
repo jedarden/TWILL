@@ -878,6 +878,24 @@ degrades to "stale host", never to a failed run.
 **Does NOT include:** anything pushing to those hosts, and no transfer of transcript text in either
 direction.
 
+**D-11@1 decision (2026-10-17):** a systemic signature is one `signature_sha256` (within
+`twill-normalized-signature-sha256/v1`) for which ≥ 2 distinct hosts hold accepted evidence in the
+detect window. The detector counts distinct hosts, never summed session counts (a session spanning
+two dates already double-counts in the daily sums), so the runner's `sessions` column carries the
+distinct-host count for D-11 and `events` the summed capped counts as the volume signal. D-11 reads
+the importer's `host_report_bucket` rows (`twill_crosshost` holds the contract-pinned storage shape)
+and composes into `twill detect`'s registry only while at least one accepted host report exists —
+until the importer lands it stays out of `REGISTRY` and the doctor self-test fixture, so no existing
+database or replay sees a table it never migrated to. No session ids are invented from derived
+counts, so a D-11 cluster is digest/report evidence whose review happens on the reporting hosts,
+and it never seeds a lesson.
+The detector's day buckets overlap the requested UTC window by date; the edge day's capped event
+count cannot be split at an hour boundary. `twill detect` reports each systemic hash with its
+contributing host IDs, evidence dates, and accepted-report heartbeat freshness, including stale
+contributors. The finding never claims missing hosts had zero events or that fleet coverage is
+complete. D-11 is excluded from new-lesson ranking and Explain because aggregates supply no
+transcript excerpts or session identities.
+
 ### Phase 8: Cluster-hosted recall service
 **Delivers:** the read-only service of §6.6 — a Deployment with an internal poll loop that pulls the
 private lessons repository, rebuilds a disposable FTS projection, and answers two queries (by repo,
