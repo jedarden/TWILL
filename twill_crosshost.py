@@ -90,7 +90,11 @@ CROSS_HOST_SIGNATURE_WEEKLY_SQL = f"""
         AND r.signature_scheme = b.signature_scheme
       WHERE b.signature_scheme = '{SIGNATURE_SCHEME}'
         AND b.day >= date(:window_start_utc)
-        AND b.day < date(:window_end_utc)
+        AND (
+          b.day < date(:window_end_utc)
+          OR (b.day = date(:window_end_utc)
+              AND time(:window_end_utc) <> '00:00:00')
+        )
         AND b.events > 0
       GROUP BY b.signature_sha256
       HAVING count(DISTINCT b.host_id) >= 2
@@ -105,7 +109,11 @@ CROSS_HOST_SIGNATURE_WEEKLY_SQL = f"""
       AND r.signature_scheme = b.signature_scheme
     WHERE b.signature_scheme = '{SIGNATURE_SCHEME}'
       AND b.day >= date(:window_start_utc)
-      AND b.day < date(:window_end_utc)
+      AND (
+        b.day < date(:window_end_utc)
+        OR (b.day = date(:window_end_utc)
+            AND time(:window_end_utc) <> '00:00:00')
+      )
       AND b.events > 0
     GROUP BY b.signature_scheme, b.signature_sha256, strftime('%G-W%V', b.day)
     ORDER BY key ASC, week ASC

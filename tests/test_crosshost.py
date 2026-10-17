@@ -157,6 +157,23 @@ class CrossHostSignatureTests(unittest.TestCase):
         ).fetchall()
         self.assertEqual(weeks, [(1, 4), (1, 3)])
 
+    def test_weekly_series_includes_current_day_buckets(self):
+        self.add_tables()
+        self.add_report("host-a")
+        self.add_report("host-b")
+        self.add_bucket("host-a", days_old=0, events=3)
+        self.add_bucket("host-b", days_old=0, kind="tool_error", events=4)
+
+        report = self.run_detector()
+
+        self.assertEqual(report.exit_code, 0)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT sessions, events FROM cluster_week WHERE detector_id = 'D-11'"
+            ).fetchall(),
+            [(2, 7)],
+        )
+
     def test_detect_cli_lists_contributing_hosts_and_rejects_explicit_d11_without_input(self):
         args = argparse.Namespace(
             window=None, detector=["D-11"], state_dir=str(self.state_dir), json=True
