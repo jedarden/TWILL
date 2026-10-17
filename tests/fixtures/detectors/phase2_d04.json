@@ -1,0 +1,24 @@
+{
+  "now": "2026-10-16T12:00:00+00:00",
+  "window_days": 30,
+  "backup": [
+    {"ts": "2026-08-01T12:00:00Z", "rule_id": "mutating-kubectl", "tool": "Bash", "cwd": "/work/example", "session_id": "old-session", "fragment": "kubectl delete pod example"},
+    {"ts": "2026-10-12T12:00:00Z", "rule_id": "mutating-kubectl", "tool": "Bash", "cwd": "/work/example", "session_id": "session-a", "fragment": "kubectl delete pod example"},
+    {"ts": "2026-10-13T12:00:00Z", "rule_id": "mutating-kubectl", "tool": "Bash", "cwd": "/work/example", "session_id": "session-a", "fragment": "kubectl delete pod example"},
+    {"ts": "2026-10-13T13:00:00Z", "rule_id": "latest-image-tag", "tool": "Edit", "cwd": "/work/example", "session_id": "session-c", "fragment": "image: example:latest"}
+  ],
+  "active": [
+    {"ts": "2026-10-14T12:00:00Z", "rule_id": "mutating-kubectl", "tool": "Bash", "cwd": "/work/example", "session_id": "session-b", "fragment": "kubectl delete pod example"},
+    {"ts": "2026-10-14T13:00:00Z", "rule_id": "latest-image-tag", "tool": "Edit", "cwd": "/work/example", "session_id": "session-d", "fragment": "image: example:latest"},
+    {"ts": "2026-10-15T12:00:00Z", "rule_id": "one-session-only", "tool": "Bash", "cwd": "/work/example", "session_id": "session-e", "fragment": "example command"},
+    {"ts": "2026-10-15T13:00:00Z", "rule_id": "one-session-only", "tool": "Bash", "cwd": "/work/example", "session_id": "session-e", "fragment": "example command"}
+  ],
+  "expected": {
+    "evidence_rows": 8,
+    "clusters": 2,
+    "rows": {
+      "hook-denial:latest-image-tag": {"sessions": 2, "events": 2},
+      "hook-denial:mutating-kubectl": {"sessions": 2, "events": 3}
+    }
+  }
+}

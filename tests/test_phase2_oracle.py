@@ -20,6 +20,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 import twill_detectors  # noqa: E402
+import twill_denials  # noqa: E402
 import twill_digest  # noqa: E402
 import twill_schema  # noqa: E402
 from twill_reader import ClaudeCodeLineParser, KIND_RUN  # noqa: E402
@@ -34,6 +35,7 @@ PROBE_TIMESTAMP = "2026-09-19T12:00:00Z"
 DETECT_NOW = "2026-09-27T00:00:00+00:00"
 PROBE_WEEK = (2026, 38)
 UNGATED_FIXTURE = ROOT / "tests" / "fixtures" / "detectors" / "phase2_ungated.json"
+D04_FIXTURE = ROOT / "tests" / "fixtures" / "detectors" / "phase2_d04.json"
 
 
 def _claude_record(session_id, timestamp, content, *, record_type):
@@ -80,6 +82,47 @@ def _probe_lines(program, index):
 
 
 class Phase2RegressionOracleTests(unittest.TestCase):
+    def test_d04_denial_log_fixture_has_known_counts(self):
+        fixture = json.loads(D04_FIXTURE.read_text())
+
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            log = root / twill_denials.LOG_NAME
+            for path, records in (
+                (log.with_name(log.name + ".1"), fixture["backup"]),
+                (log, fixture["active"]),
+            ):
+                path.write_text("".join(json.dumps(row) + "\n" for row in records))
+
+            connection = twill_schema.connect(root / "state")
+            try:
+                evidence = twill_denials.materialize_denials(connection, log)
+                report = twill_detectors.run_detectors(
+                    connection,
+                    window_days=fixture["window_days"],
+                    registry=(twill_detectors.HOOK_DENIAL,),
+                    now=fixture["now"],
+                )
+
+                expected = fixture["expected"]
+                self.assertEqual(evidence, expected["evidence_rows"])
+                self.assertEqual(report.exit_code, 0)
+                self.assertEqual(
+                    [(outcome.full_id, outcome.status, outcome.clusters)
+                     for outcome in report.outcomes],
+                    [("D-04@1", "ok", expected["clusters"])],
+                )
+                actual = {
+                    key: {"sessions": sessions, "events": events}
+                    for key, sessions, events in connection.execute(
+                        "SELECT key, sessions, events FROM cluster "
+                        "WHERE detector_id = 'D-04' ORDER BY key"
+                    )
+                }
+                self.assertEqual(actual, expected["rows"])
+            finally:
+                connection.close()
+
     def test_thirty_day_probe_counts_survive_parser_and_digest(self):
         parser = ClaudeCodeLineParser()
         events = []
