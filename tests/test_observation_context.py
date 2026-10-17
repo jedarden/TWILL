@@ -50,15 +50,15 @@ class ObservationContextTests(unittest.TestCase):
             + "\n"
         )
 
-        store = Store(self.root / "state")
+        store = Store(self.root / "state", host="lab")
         self.addCleanup(store.close)
         store.ingest(read_session(path))
 
         self.assertEqual(
             store.connection.execute(
-                "SELECT launch_dir, cwd FROM observation ORDER BY obs_id"
+                "SELECT launch_dir, cwd, host FROM observation ORDER BY obs_id"
             ).fetchall(),
-            [(str(path.parent), "/workspace/project")] * 2,
+            [(str(path.parent), "/workspace/project", "lab")] * 2,
         )
 
     def test_codex_observations_use_session_metadata_cwd(self):
@@ -93,15 +93,15 @@ class ObservationContextTests(unittest.TestCase):
         ]
         path.write_text("".join(json.dumps(record) + "\n" for record in records))
 
-        store = Store(self.root / "state")
+        store = Store(self.root / "state", host="bench")
         self.addCleanup(store.close)
         store.ingest(read_session(path))
 
         self.assertEqual(
             store.connection.execute(
-                "SELECT launch_dir, cwd FROM observation"
+                "SELECT launch_dir, cwd, host FROM observation"
             ).fetchall(),
-            [(str(path.parent), "/workspace/codex-project")],
+            [(str(path.parent), "/workspace/codex-project", "bench")],
         )
 
 

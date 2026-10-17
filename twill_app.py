@@ -76,6 +76,7 @@ from twill_status import read_status, record_stage
 
 MAX_EXCERPT_LENGTH = 240
 MAX_OBSERVATIONS_PER_SESSION = 1000
+DEFAULT_HOST = "codinghome"
 SIGNATURE_INPUT_LIMIT = 400
 SIGNATURE_HASH_LENGTH = 12
 MUTATING_VERBS = frozenset(
@@ -982,17 +983,40 @@ def _next_parse_error_runs(
     return previous + 1 if parse_errors > 0 else 0
 
 
+def _local_host() -> str:
+    """Return the configured process-local identity for parsed observations.
+
+    Hostname lookup APIs can open network-backed NSS sources, which violates
+    TWILL's local-only boundary.  The service manager/container supplies
+    ``HOSTNAME``; ``TWILL_HOST`` is an explicit stable override for reporters
+    whose published identity differs from that process value.
+    """
+
+    return os.environ.get("TWILL_HOST") or os.environ.get("HOSTNAME") or DEFAULT_HOST
+
+
+def _validate_host(host: str) -> str:
+    """Reject an empty host identity before it can create NULL provenance."""
+
+    normalized = host.strip()
+    if not normalized:
+        raise ValueError("host must not be empty")
+    return normalized
+
+
 class Store:
     def __init__(
         self,
         state_dir: Path,
         *,
         read_only: bool = False,
+        host: str | None = None,
         content_fences: Sequence[str] = (),
         retention_seconds: float | None = None,
     ):
         self.state_dir = state_dir
         self.db_path = twill_schema.state_db_path(state_dir)
+        self.host = _validate_host(host if host is not None else _local_host())
         self.redactor = Redactor(content_fences)
         if retention_seconds is not None:
             twill_prune.validate_retention(retention_seconds)
@@ -1176,7 +1200,7 @@ class Store:
                 )
             if session.normalized_events:
                 observation_count = self._persist_normalized_observations(
-                    conn, session, stored_session_id, stored_launch_dir
+                    conn, session, stored_session_id, stored_launch_dir, self.host
                 )
             else:
                 observation_count = self._run_detector(
@@ -1185,6 +1209,7 @@ class Store:
                     stored_session_id,
                     self.retention_seconds,
                     stored_launch_dir,
+                    self.host,
                 )
             twill_rulecorpus.ingest_rule_reads(conn, manage_transaction=False)
             if cursor_update is not None:
@@ -1336,6 +1361,7 @@ class Store:
         session: SessionData,
         session_id: str,
         launch_dir: str,
+        host: str,
     ) -> int:
         """Persist the readers' complete detector-facing set atomically.
 
@@ -1391,8 +1417,8 @@ class Store:
                     program = self.redactor.redact_excerpt(Path(program).name)
             conn.execute(
                 "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
-                "program, command, signature, sig_hash, tool, path, excerpt, launch_dir, cwd) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "program, command, signature, sig_hash, tool, path, excerpt, launch_dir, cwd, host) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id, ts_utc, ts_local,
                     self.redactor.redact_text(kind), program, command,
@@ -1400,7 +1426,7 @@ class Store:
                     self.redactor.redact_excerpt(event.tool_name) if event.tool_name else None,
                     self.redactor.redact_excerpt(event.file_path) if event.file_path else None,
                     self.redactor.redact_excerpt(evidence), launch_dir,
-                    self.redactor.redact_excerpt(event.cwd),
+                    self.redactor.redact_excerpt(event.cwd), host,
                 ),
             )
             count += 1
@@ -1413,6 +1439,7 @@ class Store:
         session_id: str,
         retention_seconds: float | None = None,
         launch_dir: str | None = None,
+        host: str = DEFAULT_HOST,
     ) -> int:
         """D-00@1: turn bounded session events into observations.
 
@@ -1449,8 +1476,8 @@ class Store:
             stored_path = redact_text(text) if observation_kind == "file_read" else None
             conn.execute(
                 "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
-                "signature, sig_hash, excerpt, launch_dir, cwd, path) "
-                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                "signature, sig_hash, excerpt, launch_dir, cwd, path, host) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
                     session_id,
                     ts_utc,
@@ -1462,6 +1489,7 @@ class Store:
                     launch_dir,
                     cwd,
                     stored_path,
+                    host,
                 ),
             )
         row = conn.execute(
