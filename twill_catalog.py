@@ -507,11 +507,10 @@ def load_and_record(
     return result, observation
 
 
-# The observation kinds that prove a command executed: the gate sits at the
-# PreToolUse boundary, so any of these — succeeded, failed, or result-unknown —
-# means the call got past it.  Denials and rejections never produce these
-# kinds, so a matching row cannot double-count a stopped attempt.
-GATE_GAP_KINDS = ("run", "run_succeeded", "run_failed")
+# Only rows with a recorded executor outcome prove a command got past the
+# PreToolUse gate. A plain ``run`` may be an invocation whose result never
+# arrived, so treating it as a gap would accuse a gate that may have held.
+GATE_GAP_KINDS = ("run_succeeded", "run_failed")
 
 
 def gate_gap_coverage(catalog: Catalog) -> tuple[int, int]:

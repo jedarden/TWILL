@@ -1509,7 +1509,7 @@ GATE_GAP_SQL = """
     FROM gate_gap AS g
     JOIN observation AS o ON o.obs_id = g.obs_id
     WHERE o.ts_utc >= :window_start_utc
-      AND o.kind IN ('run', 'run_succeeded', 'run_failed')
+      AND o.kind IN ('run_succeeded', 'run_failed')
       AND o.command IS NOT NULL AND trim(o.command) <> ''
     GROUP BY g.pack, g.id
     ORDER BY sessions DESC, last_seen DESC, key ASC

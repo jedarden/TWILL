@@ -163,6 +163,12 @@ class GateGapMatcherTests(unittest.TestCase):
         seed_observation(
             self.connection,
             session_id="s1",
+            kind="run",
+            command="git push --force origin unknown-result",
+        )
+        seed_observation(
+            self.connection,
+            session_id="s1",
             kind="tool_error",
             command="git push --force via another tool",
         )
@@ -434,6 +440,18 @@ class GateGapDetectorTests(unittest.TestCase):
             "VALUES ('git', 'git-force-push', ?, 'digest-a')",
             (not_run,),
         )
+        unknown_result = seed_observation(
+            self.connection,
+            session_id="s1",
+            kind="run",
+            command="git push --force origin maybe",
+            days_ago=1.0,
+        )
+        self.connection.execute(
+            "INSERT INTO gate_gap(pack, id, obs_id, catalog_digest) "
+            "VALUES ('git', 'git-force-push', ?, 'digest-a')",
+            (unknown_result,),
+        )
         empty_command = seed_observation(
             self.connection,
             session_id="s1",
@@ -459,11 +477,11 @@ class GateGapDetectorTests(unittest.TestCase):
         self.assertEqual(len(rows), 1)
         self.assertEqual(rows[0][2], 1)
         self.assertEqual(rows[0][3], 1)
-        # All four evidence rows remain in the table; SQL drops the stale,
-        # non-executed, and empty-command observations from cluster counts.
+        # All five evidence rows remain in the table; SQL drops the stale,
+        # unknown-result, non-executed, and empty-command observations.
         self.assertEqual(
             self.connection.execute("SELECT count(*) FROM gate_gap").fetchone()[0],
-            4,
+            5,
         )
 
     def test_refresh_deletes_stale_open_clusters_but_keeps_review_state(self):
