@@ -42,6 +42,7 @@ from twill_config import TwillConfig  # noqa: E402
 from twill_contract import EXIT_SUCCESS  # noqa: E402
 
 NOW = datetime(2026, 10, 16, 12, 0, 0, tzinfo=timezone.utc)
+D10_FIXTURE = ROOT / "tests" / "fixtures" / "detectors" / "phase2_d10.json"
 
 
 def never(**overrides):
@@ -351,6 +352,51 @@ class GateGapDetectorTests(unittest.TestCase):
         self.addCleanup(self._temporary.cleanup)
         self.connection = twill_schema.connect(Path(self._temporary.name) / "state")
         self.addCleanup(self.connection.close)
+
+    def test_fixture_has_known_evidence_and_cluster_counts(self):
+        fixture = json.loads(D10_FIXTURE.read_text())
+        catalog = twill_catalog.parse_catalog(fixture["catalog"])
+        self.connection.executemany(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, command) "
+            "VALUES (?, ?, ?, ?, ?)",
+            [
+                (
+                    row["session_id"],
+                    row["ts_utc"],
+                    row["ts_utc"],
+                    row["kind"],
+                    row["command"],
+                )
+                for row in fixture["observations"]
+            ],
+        )
+        self.connection.commit()
+
+        written = twill_catalog.materialize_gate_gaps(
+            self.connection,
+            catalog,
+            window_days=fixture["window_days"],
+            now=datetime.fromisoformat(fixture["now"]),
+        )
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=fixture["window_days"],
+            registry=(twill_detectors.GATE_GAP,),
+            now=fixture["now"],
+        )
+
+        expected = fixture["expected"]
+        self.assertEqual(written, expected["evidence_rows"])
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(report.outcomes[0].clusters, expected["clusters"])
+        actual = {
+            key: {"sessions": sessions, "events": events}
+            for key, sessions, events in self.connection.execute(
+                "SELECT key, sessions, events FROM cluster "
+                "WHERE detector_id = 'D-10' ORDER BY key"
+            )
+        }
+        self.assertEqual(actual, expected["rows"])
 
     def _seed_gap(self, *, pack, event_id, session_id, command, days_ago=1.0):
         obs_id = seed_observation(

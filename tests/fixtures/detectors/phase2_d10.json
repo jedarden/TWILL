@@ -1,0 +1,78 @@
+{
+  "now": "2026-10-16T12:00:00+00:00",
+  "window_days": 30,
+  "catalog": {
+    "format": "icg-catalog/v2",
+    "catalog_digest": "8f0aa49b06b40c94328ee9a9a1f630d17256f23d3ef9298b2d8966ce1f4f8d90",
+    "icg_version": "0.2.0-fixture",
+    "pack_source": {
+      "origin": "installed",
+      "root": "/etc/icg/packs",
+      "trusted_ref": null
+    },
+    "never": [
+      {
+        "id": "git-force-push",
+        "pack": "git",
+        "severity": "High",
+        "tier": "tier1",
+        "action": "deny",
+        "destructive": true,
+        "enabled": true,
+        "check": "command_regex",
+        "match": {"regex": "^git\\s+push\\s+--force\\b"},
+        "explanation": "force pushes must not execute",
+        "sanctioned_alternative": {"reason": "use a regular push"}
+      }
+    ],
+    "always": []
+  },
+  "observations": [
+    {
+      "session_id": "gap-session-a",
+      "ts_utc": "2026-10-15T12:00:00+00:00",
+      "kind": "run_succeeded",
+      "command": "git push --force origin main"
+    },
+    {
+      "session_id": "gap-session-b",
+      "ts_utc": "2026-10-14T12:00:00+00:00",
+      "kind": "run_failed",
+      "command": "git push --force origin other"
+    },
+    {
+      "session_id": "unknown-result",
+      "ts_utc": "2026-10-13T12:00:00+00:00",
+      "kind": "run",
+      "command": "git push --force origin unknown"
+    },
+    {
+      "session_id": "not-executed",
+      "ts_utc": "2026-10-12T12:00:00+00:00",
+      "kind": "tool_error",
+      "command": "git push --force through another tool"
+    },
+    {
+      "session_id": "outside-window",
+      "ts_utc": "2026-08-01T12:00:00+00:00",
+      "kind": "run_succeeded",
+      "command": "git push --force origin old"
+    },
+    {
+      "session_id": "unrelated",
+      "ts_utc": "2026-10-11T12:00:00+00:00",
+      "kind": "run_succeeded",
+      "command": "git status"
+    }
+  ],
+  "expected": {
+    "evidence_rows": 2,
+    "clusters": 1,
+    "rows": {
+      "gate-gap:git:git-force-push": {
+        "sessions": 2,
+        "events": 2
+      }
+    }
+  }
+}
