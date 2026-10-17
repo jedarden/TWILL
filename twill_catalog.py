@@ -523,12 +523,41 @@ def gate_gap_coverage(catalog: Catalog) -> tuple[int, int]:
     that every ICG rule held.
     """
 
-    checks = [
-        event.check for event in catalog.never
+    ambiguous_packs = {
+        event.pack for event in catalog.always
+        if event.check != "command_regex"
+    }
+    candidates = [
+        event for event in catalog.never
         if event.enabled is True and event.action == "deny"
     ]
-    supported = checks.count("command_regex")
-    return supported, len(checks) - supported
+    supported = sum(
+        event.check == "command_regex" and event.pack not in ambiguous_packs
+        for event in candidates
+    )
+    return supported, len(candidates) - supported
+
+
+def _gate_gap_allow_matchers(
+    catalog: Catalog,
+) -> tuple[dict[str, list[re.Pattern[str]]], set[str]]:
+    """Compile same-pack exceptions; hide packs with opaque allow checks."""
+
+    matchers: dict[str, list[re.Pattern[str]]] = {}
+    ambiguous_packs: set[str] = set()
+    for event in catalog.always:
+        if event.check != "command_regex":
+            ambiguous_packs.add(event.pack)
+            continue
+        try:
+            compiled = re.compile(event.matching["regex"])
+        except re.error as exc:
+            raise CatalogError(
+                f"always event {event.pack}/{event.id} carries a regex TWILL "
+                f"cannot evaluate: {exc}"
+            ) from exc
+        matchers.setdefault(event.pack, []).append(compiled)
+    return matchers, ambiguous_packs
 
 
 def _gate_gap_matchers(catalog: Catalog) -> list[tuple[CatalogEvent, re.Pattern[str]]]:
@@ -577,7 +606,10 @@ def materialize_gate_gaps(
     """Refresh D-10's evidence table from a valid catalog and the corpus.
 
     One row lands per executed observation inside the trailing window whose
-    command matched a deny-channel ``command_regex`` never event.  The whole
+    command matched a deny-channel ``command_regex`` never event and no
+    same-pack always exception. A pack with an opaque always check is omitted
+    conservatively because the transcript cannot prove its exception failed.
+    The whole
     table is replaced in one transaction, so evidence is always attributed to
     exactly the catalog passed in — never a blend of two digests.  Returns
     the number of matches written.
@@ -590,6 +622,7 @@ def materialize_gate_gaps(
     reference = now if now is not None else datetime.now(timezone.utc)
     window_start = (reference - timedelta(days=window_days)).isoformat()
     matchers = _gate_gap_matchers(catalog)
+    allow_matchers, ambiguous_packs = _gate_gap_allow_matchers(catalog)
     placeholders = ", ".join("?" for _ in GATE_GAP_KINDS)
     rows = connection.execute(
         f"""
@@ -604,7 +637,13 @@ def materialize_gate_gaps(
     ).fetchall()
     evidence: list[tuple[str, str, int]] = []
     for obs_id, command in rows:
+        allowed_packs = {
+            pack for pack, patterns in allow_matchers.items()
+            if any(pattern.search(command) for pattern in patterns)
+        }
         for event, compiled in matchers:
+            if event.pack in allowed_packs or event.pack in ambiguous_packs:
+                continue
             if compiled.search(command):
                 evidence.append((event.pack, event.id, int(obs_id)))
     with connection:

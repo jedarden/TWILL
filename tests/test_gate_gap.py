@@ -64,14 +64,15 @@ def never(**overrides):
     return event
 
 
-def catalog_of(*events):
+def catalog_of(*events, always=()):
     """Parse a catalog document carrying exactly these never events."""
 
     ordered = sorted(events, key=lambda event: (event["pack"], event["id"]))
+    ordered_always = sorted(always, key=lambda event: (event["pack"], event["id"]))
     content = {
         "format": twill_catalog.CATALOG_FORMAT,
         "never": ordered,
-        "always": [],
+        "always": ordered_always,
     }
     digest = hashlib.sha256(
         json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()
@@ -87,7 +88,7 @@ def catalog_of(*events):
                 "trusted_ref": None,
             },
             "never": ordered,
-            "always": [],
+            "always": ordered_always,
         }
     )
 
@@ -229,6 +230,63 @@ class GateGapMatcherTests(unittest.TestCase):
             never(id="disabled", enabled=False),
         )
         self.assertEqual(twill_catalog.gate_gap_coverage(catalog), (1, 2))
+
+    def test_same_pack_always_exception_prevents_false_gap(self):
+        obs_id = seed_observation(
+            self.connection,
+            session_id="s1",
+            kind="run_succeeded",
+            command="git push --force origin main",
+        )
+        catalog = catalog_of(
+            never(),
+            never(pack="pack-b", id="never-two"),
+            always=(
+                {
+                    "id": "allow-main",
+                    "pack": "pack-a",
+                    "check": "command_regex",
+                    "match": {"regex": r"^git push --force origin main$"},
+                },
+            ),
+        )
+
+        written = twill_catalog.materialize_gate_gaps(
+            self.connection, catalog, window_days=30, now=NOW
+        )
+
+        self.assertEqual(written, 1)
+        self.assertEqual(
+            gate_gap_rows(self.connection),
+            [("pack-b", "never-two", obs_id, catalog.catalog_digest)],
+        )
+
+    def test_opaque_allow_check_suppresses_ambiguous_pack(self):
+        seed_observation(
+            self.connection,
+            session_id="s1",
+            kind="run_succeeded",
+            command="git push --force origin main",
+        )
+        catalog = catalog_of(
+            never(),
+            always=(
+                {
+                    "id": "opaque-allow",
+                    "pack": "pack-a",
+                    "check": "predicate",
+                    "match": {"predicate": "allow_known_case"},
+                },
+            ),
+        )
+
+        self.assertEqual(twill_catalog.gate_gap_coverage(catalog), (0, 1))
+        self.assertEqual(
+            twill_catalog.materialize_gate_gaps(
+                self.connection, catalog, window_days=30, now=NOW
+            ),
+            0,
+        )
 
     def test_unevaluable_regex_is_a_named_error(self):
         seed_observation(
