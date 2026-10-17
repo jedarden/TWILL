@@ -40,6 +40,7 @@ import twill_measure
 import twill_prune
 import twill_perf
 import twill_publisher
+import twill_receipts
 import twill_ranker
 import twill_review
 import twill_rulecorpus
@@ -50,10 +51,16 @@ import twill_schema
 import twill_cursor
 import twill_doctor
 from codex_reader import (
-    CodexRolloutLineParser, CodexRolloutReader, TokenUsage,
+    CodexRolloutLineParser,
+    CodexRolloutReader,
+    TokenUsage,
     NormalizedEvent as CodexEvent,
 )
-from twill_reader import ClaudeCodeLineParser, MessageUsage, NormalizedEvent as ClaudeEvent
+from twill_reader import (
+    ClaudeCodeLineParser,
+    MessageUsage,
+    NormalizedEvent as ClaudeEvent,
+)
 from twill_config import (
     CONFIG_PATH,
     ConfigError,
@@ -303,6 +310,10 @@ class SessionData:
     # the set complete lets a result appended later replace an unknown run
     # without inventing durable IDs for stateful parser emissions.
     normalized_events: tuple[ClaudeEvent | CodexEvent, ...] = ()
+    # A valid v1 SessionEnd receipt is optional.  It is read by session id and
+    # kept beside transcript-derived data so callers can use the richer
+    # summary without making receipt availability a prerequisite for ingest.
+    receipt: twill_receipts.FrictionReceipt | None = None
 
     @property
     def usage_records(self) -> tuple[MessageUsage, ...]:
@@ -412,6 +423,14 @@ def _session_id(record: dict[str, object], fallback: str) -> str:
     return fallback
 
 
+def _session_receipt(
+    session_id: str, receipt_dir: Path | None = None
+) -> twill_receipts.FrictionReceipt | None:
+    """Read one optional receipt; absence leaves transcript parsing intact."""
+
+    return twill_receipts.read_session_receipt(session_id, receipt_dir)
+
+
 def _timestamp(record: dict[str, object]) -> str:
     value = record.get("timestamp")
     if isinstance(value, str) and value:
@@ -466,6 +485,7 @@ def _parse_codex_scan(
     scan: twill_cursor.LineScan,
     fallback_session_id: str,
     source_kind: str,
+    receipt_dir: Path | None = None,
 ) -> tuple[SessionData, int]:
     parser = CodexRolloutLineParser()
     session_id = fallback_session_id
@@ -531,11 +551,15 @@ def _parse_codex_scan(
         usage_rows=usage_rows,
         record_type_counts=record_type_counts,
         normalized_events=normalized_events,
+        receipt=_session_receipt(session_id, receipt_dir),
     ), invalid_lines
 
 
 def parse_scan(
-    path: Path, scan: twill_cursor.LineScan, fallback_session_id: str
+    path: Path,
+    scan: twill_cursor.LineScan,
+    fallback_session_id: str,
+    receipt_dir: Path | None = None,
 ) -> tuple[SessionData, int]:
     """Parse one scanned region into normalized, still-unredacted events.
 
@@ -548,7 +572,9 @@ def parse_scan(
 
     source_kind = _source_kind(path)
     if source_kind == "codex":
-        return _parse_codex_scan(path, scan, fallback_session_id, source_kind)
+        return _parse_codex_scan(
+            path, scan, fallback_session_id, source_kind, receipt_dir
+        )
 
     events: list[TranscriptEvent] = []
     session_id = fallback_session_id
@@ -639,19 +665,20 @@ def parse_scan(
         usage_rows=usage_rows,
         record_type_counts=record_type_counts,
         normalized_events=normalized_events,
+        receipt=_session_receipt(session_id, receipt_dir),
     ), invalid_lines
 
 
-def read_session(path: Path) -> SessionData:
+def read_session(path: Path, receipt_dir: Path | None = None) -> SessionData:
     """Parse one whole JSONL session into normalized, still-unredacted events."""
 
-    session, _ = parse_scan(path, twill_cursor.scan_lines(path, 0), path.stem)
+    session, _ = parse_scan(
+        path, twill_cursor.scan_lines(path, 0), path.stem, receipt_dir
+    )
     return session
 
 
-def extract_usage(
-    path: Path, source_kind: str | None = None
-) -> SessionUsage | None:
+def extract_usage(path: Path, source_kind: str | None = None) -> SessionUsage | None:
     kind = source_kind or _source_kind(path)
     end_offset = twill_cursor.scan_lines(path, 0).new_offset
     usage, _, _ = _extract_usage(path, kind, path.stem, end_offset)
@@ -697,14 +724,18 @@ def _glob_roots(patterns: Sequence[str]) -> tuple[Path, ...]:
     return tuple(roots)
 
 
-def _source_roots(values: Sequence[str] | None, config: TwillConfig) -> tuple[Path, ...]:
+def _source_roots(
+    values: Sequence[str] | None, config: TwillConfig
+) -> tuple[Path, ...]:
     """Resolve transcript roots: CLI flag, then env override, then config."""
 
     if values:
         return tuple(Path(value).expanduser() for value in values)
     configured = os.environ.get("TWILL_SOURCE_ROOTS")
     if configured:
-        return tuple(Path(value).expanduser() for value in configured.split(os.pathsep) if value)
+        return tuple(
+            Path(value).expanduser() for value in configured.split(os.pathsep) if value
+        )
     return _glob_roots(config.source_globs)
 
 
@@ -820,7 +851,9 @@ def _extract_claude_usage(
                 break
             consumed += len(raw_line)
             normalized_events.extend(
-                parser.parse_line(raw_line.decode("utf-8", errors="replace"), source_line)
+                parser.parse_line(
+                    raw_line.decode("utf-8", errors="replace"), source_line
+                )
             )
     normalized_events.extend(parser.finish())
     events = tuple(normalized_events)
@@ -835,7 +868,9 @@ def _extract_claude_usage(
         )
     wall_seconds = parser.wall_seconds
     if wall_seconds is None:
-        wall_seconds = _usage_wall_seconds(parser.first_timestamp, parser.last_timestamp)
+        wall_seconds = _usage_wall_seconds(
+            parser.first_timestamp, parser.last_timestamp
+        )
     if not rows and parser.total_cost_usd is None and not parser.has_cost_state:
         return None, (), events
     session_id = parser.session_id or fallback_session_id
@@ -849,9 +884,7 @@ def _extract_claude_usage(
     return summary, rows, events
 
 
-def _codex_usage_row(
-    row: TokenUsage, *, cost_usd: float | None = None
-) -> MessageUsage:
+def _codex_usage_row(row: TokenUsage, *, cost_usd: float | None = None) -> MessageUsage:
     return MessageUsage(
         source_line=row.source_line,
         event_index=row.event_index,
@@ -1049,7 +1082,9 @@ class Store:
     ) -> None:
         if replace or stored_session_id not in stale_session_ids:
             for stale_id in dict.fromkeys((*stale_session_ids, stored_session_id)):
-                conn.execute("DELETE FROM session_usage WHERE session_id = ?", (stale_id,))
+                conn.execute(
+                    "DELETE FROM session_usage WHERE session_id = ?", (stale_id,)
+                )
         usage = _coerce_session_usage(session)
         if usage is None:
             return
@@ -1058,9 +1093,7 @@ class Store:
         output_tokens = max(0, int(usage.output_tokens))
         cache_read_tokens = max(0, int(usage.cache_read_tokens))
         wall_seconds = (
-            max(0, int(usage.wall_seconds))
-            if usage.wall_seconds is not None
-            else None
+            max(0, int(usage.wall_seconds)) if usage.wall_seconds is not None else None
         )
         cost_usd = float(usage.cost_usd) if usage.cost_usd is not None else None
         messages = max(0, int(usage.messages))
@@ -1156,7 +1189,9 @@ class Store:
                     conn.execute(
                         "DELETE FROM observation WHERE session_id = ?", (stale_id,)
                     )
-                conn.execute("DELETE FROM transcript_event WHERE session_key = ?", (key,))
+                conn.execute(
+                    "DELETE FROM transcript_event WHERE session_key = ?", (key,)
+                )
             else:
                 # Resume: the base events stay; observations are re-derived
                 # from the union below.
@@ -1374,9 +1409,12 @@ class Store:
         """
         cutoff = (
             datetime.now(timezone.utc) - timedelta(seconds=self.retention_seconds)
-            if self.retention_seconds is not None else None
+            if self.retention_seconds is not None
+            else None
         )
-        fallback_times = {event.source_line: event.timestamp for event in session.events}
+        fallback_times = {
+            event.source_line: event.timestamp for event in session.events
+        }
         count = 0
         for event in sorted(
             session.normalized_events,
@@ -1403,10 +1441,14 @@ class Store:
             # recurring error; failed runs carry the parser's error excerpt.
             evidence = self.redactor.redact_text(event.error_excerpt or event.text)
             normalized = signature(evidence)[:MAX_EXCERPT_LENGTH].strip()
-            command = self.redactor.redact_excerpt(event.command) if event.command else None
+            command = (
+                self.redactor.redact_excerpt(event.command) if event.command else None
+            )
             program = None
             if event.command:
-                missing = re.search(r"(?:^|[\s:])([^\s:]+): command not found\b", evidence)
+                missing = re.search(
+                    r"(?:^|[\s:])([^\s:]+): command not found\b", evidence
+                )
                 if missing:
                     program = missing.group(1)
                 else:
@@ -1422,13 +1464,24 @@ class Store:
                 "program, command, signature, sig_hash, tool, path, excerpt, launch_dir, cwd, host) "
                 "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
                 (
-                    session_id, ts_utc, ts_local,
-                    self.redactor.redact_text(kind), program, command,
-                    normalized, h12(normalized),
-                    self.redactor.redact_excerpt(event.tool_name) if event.tool_name else None,
-                    self.redactor.redact_excerpt(event.file_path) if event.file_path else None,
-                    self.redactor.redact_excerpt(evidence), launch_dir,
-                    self.redactor.redact_excerpt(event.cwd), host,
+                    session_id,
+                    ts_utc,
+                    ts_local,
+                    self.redactor.redact_text(kind),
+                    program,
+                    command,
+                    normalized,
+                    h12(normalized),
+                    self.redactor.redact_excerpt(event.tool_name)
+                    if event.tool_name
+                    else None,
+                    self.redactor.redact_excerpt(event.file_path)
+                    if event.file_path
+                    else None,
+                    self.redactor.redact_excerpt(evidence),
+                    launch_dir,
+                    self.redactor.redact_excerpt(event.cwd),
+                    host,
                 ),
             )
             count += 1
@@ -1474,7 +1527,9 @@ class Store:
                 stored_signature if stored_signature is not None else signature(text)
             )
             sig_hash = h12(normalized)
-            observation_kind = "file_read" if kind == "file_read" else "session_activity"
+            observation_kind = (
+                "file_read" if kind == "file_read" else "session_activity"
+            )
             stored_path = redact_text(text) if observation_kind == "file_read" else None
             conn.execute(
                 "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
@@ -1502,7 +1557,9 @@ class Store:
 
     def digest_rows(self, limit: int = 20) -> tuple[int, list[sqlite3.Row]]:
         self.connection.row_factory = sqlite3.Row
-        total = self.connection.execute("SELECT count(*) FROM observation").fetchone()[0]
+        total = self.connection.execute("SELECT count(*) FROM observation").fetchone()[
+            0
+        ]
         rows = self.connection.execute(
             "SELECT obs_id, session_id, 'D-00@1' AS detector_id, kind, excerpt, ts_utc "
             "FROM observation ORDER BY obs_id LIMIT ?",
@@ -1538,7 +1595,9 @@ def _candidate_paths(pattern: Path | str) -> Iterator[Path]:
 
 
 def settled_files(
-    roots: Sequence[Path | str], settle_seconds: float, explicit_file: Path | None = None
+    roots: Sequence[Path | str],
+    settle_seconds: float,
+    explicit_file: Path | None = None,
 ) -> list[Path]:
     """Expand sources and return transcript files old enough to parse.
 
@@ -1624,7 +1683,9 @@ def ingest_command(
             Path(args.file) if args.file else None,
         )
     except (OSError, ValueError) as exc:
-        raise CliError(EXIT_RUNTIME_ERROR, str(exc), "check the transcript path and try again") from exc
+        raise CliError(
+            EXIT_RUNTIME_ERROR, str(exc), "check the transcript path and try again"
+        ) from exc
     store = Store(
         state_dir,
         content_fences=config.content_fences,
@@ -1928,9 +1989,7 @@ def detect_command(args: argparse.Namespace) -> int:
     # detector runs, never mid-run.
     load_config()
     days = (
-        DEFAULT_DETECT_WINDOW_DAYS
-        if args.window is None
-        else _window_days(args.window)
+        DEFAULT_DETECT_WINDOW_DAYS if args.window is None else _window_days(args.window)
     )
     registry = twill_detectors.REGISTRY
     if args.detector:
@@ -1982,9 +2041,7 @@ def detect_command(args: argparse.Namespace) -> int:
             except FileNotFoundError:
                 denial_skip = "org-rule-guard denial log absent"
             except (OSError, sqlite3.Error) as exc:
-                denial_skip = (
-                    f"org-rule-guard denial log could not be read: {exc}"
-                )
+                denial_skip = f"org-rule-guard denial log could not be read: {exc}"
         # Phase 7's cross-host detector runs only over imported fleet
         # evidence (docs/notes/host-report-contract.md).  Until the first
         # host report is accepted the input does not exist, and the honest
@@ -2005,9 +2062,7 @@ def detect_command(args: argparse.Namespace) -> int:
                 "run 'twill doctor --json' for host coverage once it has",
             )
         if crosshost_live:
-            registry = tuple(registry) + (
-                twill_crosshost.CROSS_HOST_SIGNATURE,
-            )
+            registry = tuple(registry) + (twill_crosshost.CROSS_HOST_SIGNATURE,)
         skips = {"D-10": gate_gap_skip, "D-04": denial_skip}
         report = twill_detectors.run_detectors(
             connection,
@@ -2105,9 +2160,7 @@ def detect_command(args: argparse.Namespace) -> int:
         performance=performance,
     )
     if not report.outcomes:
-        warnings.append(
-            "no detectors registered; 'twill detect' had nothing to run"
-        )
+        warnings.append("no detectors registered; 'twill detect' had nothing to run")
     for outcome in report.outcomes:
         if outcome.status == twill_detectors.STATUS_SKIPPED and outcome.reason:
             warnings.append(f"{outcome.full_id} skipped: {outcome.reason}")
@@ -2208,9 +2261,7 @@ def rank_command(args: argparse.Namespace) -> int:
         "covered_clusters": [
             cluster.as_dict() for cluster in result.ranking.covered_clusters
         ],
-        "escalations": [
-            cluster.as_dict() for cluster in result.ranking.escalations
-        ],
+        "escalations": [cluster.as_dict() for cluster in result.ranking.escalations],
         "degraded_clusters": [
             cluster.as_dict() for cluster in result.ranking.degraded_clusters
         ],
@@ -2242,8 +2293,16 @@ def rank_command(args: argparse.Namespace) -> int:
             f"{cluster.sessions} session(s), {cluster.events} event(s)"
         )
         waste = cluster.estimated_waste
-        tokens = "unavailable" if waste is None or waste.tokens is None else f"{waste.tokens:,.2f}"
-        dollars = "unavailable" if waste is None or waste.waste_usd is None else f"{waste.waste_usd:.6f}"
+        tokens = (
+            "unavailable"
+            if waste is None or waste.tokens is None
+            else f"{waste.tokens:,.2f}"
+        )
+        dollars = (
+            "unavailable"
+            if waste is None or waste.waste_usd is None
+            else f"{waste.waste_usd:.6f}"
+        )
         print(f"  estimated tokens: {tokens}; estimated waste: {dollars} USD")
     if result.ranking.escalations:
         print("escalations:")
@@ -2350,7 +2409,11 @@ def rules_command(args: argparse.Namespace) -> int:
     """Render the read-only inverse view of rule coverage and decay."""
 
     unread_days = args.unread_days
-    if isinstance(unread_days, bool) or not isinstance(unread_days, int) or unread_days < 1:
+    if (
+        isinstance(unread_days, bool)
+        or not isinstance(unread_days, int)
+        or unread_days < 1
+    ):
         raise UsageError("--unread-days must be a positive integer")
     state_dir = _state_dir(args.state_dir)
     db_path = twill_schema.state_db_path(state_dir)
@@ -2444,9 +2507,7 @@ def measure_command(args: argparse.Namespace) -> int:
     if args.json:
         return EXIT_SUCCESS
     print("TWILL measure")
-    print(
-        f"window: {report.window_days} day(s) starting {report.window_start_utc}"
-    )
+    print(f"window: {report.window_days} day(s) starting {report.window_start_utc}")
     if not report.measurements:
         print("no eligible lessons")
     for item in report.measurements:
@@ -2567,10 +2628,7 @@ def prune_command(args: argparse.Namespace) -> int:
     if args.json:
         return EXIT_SUCCESS
     print("TWILL prune")
-    print(
-        f"retention: {report.retention_days} day(s), "
-        f"cutoff {report.cutoff_utc}"
-    )
+    print(f"retention: {report.retention_days} day(s), cutoff {report.cutoff_utc}")
     if report.pruned_observations == 0:
         print("no work; no observations were older than the retention window")
     else:
@@ -2600,10 +2658,7 @@ def _lesson_data(
 
 
 def _print_lesson(record: twill_lessons.LessonRecord, action: str) -> None:
-    print(
-        f"{action} {record.id}: state={record.state} "
-        f"detector={record.detector}"
-    )
+    print(f"{action} {record.id}: state={record.state} detector={record.detector}")
     if record.layer is not None:
         print(f"layer: {record.layer}")
         if twill_router.has_direct_change(record.layer):
@@ -2638,9 +2693,7 @@ def apply_command(args: argparse.Namespace) -> int:
             "--bead is not valid for a retrieval-only outcome",
             "omit --bead because no direct code or policy change is appropriate",
         )
-    template_layer = (
-        (args.guard_template or args.layer) if args.emit_guard else None
-    )
+    template_layer = (args.guard_template or args.layer) if args.emit_guard else None
     if template_layer is not None:
         if template_layer not in twill_guards.TEMPLATE_LAYERS:
             raise UsageError(
@@ -2760,9 +2813,7 @@ def lessons_command(args: argparse.Namespace) -> int:
         print("no lessons")
         return EXIT_SUCCESS
     for record in records:
-        print(
-            f"{record.id}\t{record.state}\t{record.detector}\t{record.key}"
-        )
+        print(f"{record.id}\t{record.state}\t{record.detector}\t{record.key}")
     return EXIT_SUCCESS
 
 
@@ -2840,13 +2891,12 @@ def status_command(args: argparse.Namespace) -> int:
         print("stage\tlast_success\tduration_seconds\tcounts")
         for name in sorted(stages):
             record = stages[name]
-            counts = ", ".join(
-                f"{key}={value}" for key, value in record["counts"].items()
-            ) or "-"
-            last_success = record["last_success"] or "never"
-            print(
-                f"{name}\t{last_success}\t{record['duration']:.6f}\t{counts}"
+            counts = (
+                ", ".join(f"{key}={value}" for key, value in record["counts"].items())
+                or "-"
             )
+            last_success = record["last_success"] or "never"
+            print(f"{name}\t{last_success}\t{record['duration']:.6f}\t{counts}")
     for warning in payload["warnings"]:
         print(f"warning: {redact_text(warning)}", file=sys.stderr)
     return EXIT_SUCCESS
@@ -2955,7 +3005,9 @@ def build_parser() -> argparse.ArgumentParser:
     ingest = subparsers.add_parser("ingest", help="read settled local JSONL sessions")
     ingest.add_argument("--limit", type=int, default=1)
     ingest.add_argument("--file", help="read one explicit JSONL session")
-    ingest.add_argument("--source", action="append", help="transcript root; may be repeated")
+    ingest.add_argument(
+        "--source", action="append", help="transcript root; may be repeated"
+    )
     ingest.add_argument(
         "--settle",
         type=_parse_duration,
@@ -2997,7 +3049,9 @@ def build_parser() -> argparse.ArgumentParser:
     rank = subparsers.add_parser(
         "rank", help="refresh rule coverage and list new-lesson candidates"
     )
-    rank.add_argument("--top", type=int, default=None, help="maximum uncovered clusters")
+    rank.add_argument(
+        "--top", type=int, default=None, help="maximum uncovered clusters"
+    )
     rank.add_argument("--state-dir")
     rank.add_argument("--json", action="store_true")
     rank.set_defaults(handler=rank_command)
@@ -3005,7 +3059,9 @@ def build_parser() -> argparse.ArgumentParser:
     explain = subparsers.add_parser(
         "explain", help="draft lessons from ranked recurring friction"
     )
-    explain.add_argument("--top", type=int, default=None, help="maximum clusters to explain")
+    explain.add_argument(
+        "--top", type=int, default=None, help="maximum clusters to explain"
+    )
     explain.add_argument(
         "--dry-run",
         action="store_true",
@@ -3152,7 +3208,9 @@ def build_parser() -> argparse.ArgumentParser:
         help="show accepted lessons and open clusters for a repo or launch directory",
     )
     brief.add_argument("target", metavar="REPO_OR_LAUNCH_DIR")
-    brief.add_argument("--top", type=int, default=None, help="maximum items per section")
+    brief.add_argument(
+        "--top", type=int, default=None, help="maximum items per section"
+    )
     brief.add_argument("--state-dir")
     brief.add_argument("--json", action="store_true")
     brief.set_defaults(handler=brief_command)
@@ -3162,9 +3220,7 @@ def build_parser() -> argparse.ArgumentParser:
     status.add_argument("--json", action="store_true")
     status.set_defaults(handler=status_command)
 
-    doctor = subparsers.add_parser(
-        "doctor", help="check Phase 1 pipeline health"
-    )
+    doctor = subparsers.add_parser("doctor", help="check Phase 1 pipeline health")
     recovery = doctor.add_mutually_exclusive_group()
     recovery.add_argument(
         "--rebuild",
@@ -3176,7 +3232,9 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="re-apply the current redactor to stored excerpts",
     )
-    doctor.add_argument("--source", action="append", help="transcript root; may be repeated")
+    doctor.add_argument(
+        "--source", action="append", help="transcript root; may be repeated"
+    )
     doctor.add_argument(
         "--settle",
         type=_parse_duration,

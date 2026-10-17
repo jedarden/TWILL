@@ -25,6 +25,7 @@ import twill_catalog
 import twill_denials
 import twill_digest
 import twill_reader
+import twill_receipts
 import twill_rulecorpus
 import twill_schema
 from twill_redactor import Redactor, redact_text
@@ -558,9 +559,7 @@ def _check_rule_corpus(
         try:
             current_sha = twill_rulecorpus.content_sha(rule_path.read_bytes())
         except OSError as exc:
-            unreadable_paths.append(
-                {"path": safe_path, "error": _exception_text(exc)}
-            )
+            unreadable_paths.append({"path": safe_path, "error": _exception_text(exc)})
             continue
         if current_sha != indexed_sha:
             hash_mismatches.append(
@@ -586,7 +585,12 @@ def _check_rule_corpus(
         "unreadable_paths": unreadable_paths,
         "unreadable_path_count": len(unreadable_paths),
     }
-    if not hash_mismatches and not vanished_paths and not stale_rows and not unreadable_paths:
+    if (
+        not hash_mismatches
+        and not vanished_paths
+        and not stale_rows
+        and not unreadable_paths
+    ):
         return _result("rule_corpus", HEALTHY, "rule corpus is fresh", details)
 
     issues: list[str] = []
@@ -695,7 +699,9 @@ def _check_timer_freshness(
             )
     details = {"stages": stage_details, "issues": issues}
     if not issues:
-        return _result("timer_freshness", HEALTHY, "all Phase 1 timers are fresh", details)
+        return _result(
+            "timer_freshness", HEALTHY, "all Phase 1 timers are fresh", details
+        )
     return _result(
         "timer_freshness",
         DEGRADED,
@@ -1033,7 +1039,9 @@ def _check_parse_shape_drift(
                 f"parse_shape row {row_index} has invalid histogram fields",
                 {"row": row_index},
             )
-        runs_by_source.setdefault(source, {}).setdefault(run_at, {})[record_type] = count
+        runs_by_source.setdefault(source, {}).setdefault(run_at, {})[record_type] = (
+            count
+        )
 
     details: dict[str, object] = {
         "current_runs": PARSE_DRIFT_CURRENT_RUNS,
@@ -1055,7 +1063,7 @@ def _check_parse_shape_drift(
         # run_at values are UTC isoformat strings from one writer, so
         # lexicographic order is chronological order.
         ordered_runs = sorted(runs_by_source[source])
-        history = ordered_runs[: -PARSE_DRIFT_CURRENT_RUNS]
+        history = ordered_runs[:-PARSE_DRIFT_CURRENT_RUNS]
         current = ordered_runs[len(history) :]
         entry: dict[str, object] = {
             "runs_seen": len(ordered_runs),
@@ -1065,7 +1073,7 @@ def _check_parse_shape_drift(
         if len(history) < PARSE_DRIFT_MIN_HISTORY_RUNS:
             entry["armed"] = False
             continue
-        window = history[-PARSE_DRIFT_HISTORY_RUNS :]
+        window = history[-PARSE_DRIFT_HISTORY_RUNS:]
         entry["armed"] = True
         entry["window_runs"] = len(window)
         current_counts: dict[str, int] = {}
@@ -1087,9 +1095,7 @@ def _check_parse_shape_drift(
             median = statistics.median_low(history_counts)
             current_count = current_counts.get(record_type, 0)
             if median > 0 and current_count == 0:
-                vanished.append(
-                    {"record_type": record_type, "median_per_run": median}
-                )
+                vanished.append({"record_type": record_type, "median_per_run": median})
             if current_count > 0 and max(history_counts) == 0:
                 new_types.append(
                     {"record_type": record_type, "current_count": current_count}
@@ -1795,9 +1801,7 @@ def _check_performance_budgets(state_dir: Path) -> CheckResult:
         details = dict(next(iter(measurements.values())))
     else:
         details = {
-            "measurements": {
-                name: dict(value) for name, value in measurements.items()
-            }
+            "measurements": {name: dict(value) for name, value in measurements.items()}
         }
     details["measured"] = True
     return _result(
@@ -1958,6 +1962,7 @@ def run_doctor(
         reader_registry = (
             twill_catalog.register_reader(),
             twill_denials.register_reader(),
+            twill_receipts.register_reader(),
             *twill_reader.READER_REGISTRY,
         )
     effective_reader_registry = twill_reader.build_reader_registry(*reader_registry)
