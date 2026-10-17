@@ -186,4 +186,5 @@ in the detector window, even if one host has since gone stale. It MUST show
 the contributing host ids, evidence dates, and freshness states, and MUST NOT
 claim that a stale or missing host had zero occurrences or that fleet
 coverage is complete. Recovery is a validated fresh report with contiguous
-current coverage; no operator action is inferred from silence.
+current coverage, never an inference from silence; no operator action is
+inferred from silence either.
