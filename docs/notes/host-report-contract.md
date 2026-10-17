@@ -22,9 +22,16 @@ the private artifacts repository. The file has schema
 `twill-host-report/v1`; the containing `manifest.json` has schema
 `twill-artifacts/v2`. A v2 manifest inventories every recognized file in
 the original four namespaces and in `hosts/`, with the existing byte count
-and SHA-256 rules. The original four artifact schemas and paths keep their
-v1 meanings. A v1 artifact reader MUST reject a v2 manifest; the first host
-report MUST NOT be published until the publisher and upstream consumer both
+and SHA-256 rules. Its `paths` map adds this entry:
+
+```json
+"hosts": {"pattern": "hosts/<host_id>/report.json", "schema": "twill-host-report/v1"}
+```
+
+Each report also appears once in `artifacts` with that schema, its relative
+path, byte count, and SHA-256. The original four artifact schemas and paths
+keep their v1 meanings. A v1 artifact reader MUST reject a v2 manifest; the
+first host report MUST NOT be published until the publisher and upstream consumer both
 validate v2. A v2 reader accepts additive unknown fields but rejects an
 unknown major version, an unrecognized path under `hosts/`, a duplicate or
 missing inventory entry, a symlink, or a hash/size mismatch. An incompatible
@@ -41,7 +48,9 @@ is retired before the new one contributes to fleet counts.
 ## Report body
 
 The UTF-8 JSON document has exactly one current snapshot per host. A valid
-v1 report has these required fields; timestamps are UTC RFC 3339 with `Z`:
+v1 report has exactly these top-level fields; timestamps are UTC RFC 3339
+with `Z`. Unknown top-level fields are rejected so an unreviewed payload
+cannot cross hosts under an additive field:
 
 | Field | Meaning |
 | --- | --- |

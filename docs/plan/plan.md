@@ -483,6 +483,13 @@ unrelated root files, but rejects unknown contract versions, malformed paths, sy
 inventories and hash mismatches. This is the compatibility boundary for Phase 8 and does not weaken
 the public-tree or secret-containment guards.
 
+Phase 7 extends this transport under the contract in
+`docs/notes/host-report-contract.md`: a `twill-artifacts/v2` manifest inventories
+one `twill-host-report/v1` snapshot per configured host in `hosts/`. The report
+contains only bounded daily aggregates of redacted normalized-signature hashes;
+the exact committed tree is the upstream import boundary. A v1 reader rejects
+the v2 manifest until both publisher and consumer validate the new schema.
+
 ## 8. Pre-Flight Safety
 
 ### 8.1 Edge Case Catalog
@@ -863,12 +870,13 @@ the digest names its own zero-output state loudly if no lesson reached `applied`
 reads only that host's transcripts, and what reaches codinghome is the bounded, redacted artifact
 stream over the private artifacts repository (§7.3; never via the archive's `mirror/`), never
 transcript text. TWILL gains no network path and no credential for reaching another host (§3, §11).
-The host column is populated from what each host publishes, with per-host coverage in `doctor`.
+The host column is populated locally on each reporting host. The bounded record schema,
+retention, attribution, and `doctor` stale-host rules are pinned in
+`docs/notes/host-report-contract.md` before reporter or importer implementation.
 **Completion criteria:** a cross-host detector reports a signature seen on ≥ 2 hosts; a silent host
 degrades to "stale host", never to a failed run.
 **Does NOT include:** anything pushing to those hosts, and no transfer of transcript text in either
-direction. The contract for what a host publishes upstream is specified in `docs/notes/` before
-implementation, the way §7.3 pinned the artifacts interchange.
+direction.
 
 ### Phase 8: Cluster-hosted recall service
 **Delivers:** the read-only service of §6.6 — a Deployment with an internal poll loop that pulls the
@@ -1084,8 +1092,8 @@ triage-only summarization while routing stays manual.
    since a queryable index of transcript text is designed to be surfaced into future prompts. What
    crosses hosts is the bounded, redacted artifact stream over the §7.3 private-repository transport
    (the same transport the recall service reads), and a host with no live reporter is "stale", never
-   a failure. The upstream record contract is specified in `docs/notes/` before any Phase 7
-   implementation.
+   a failure. The upstream record contract is specified in
+   `docs/notes/host-report-contract.md` before any Phase 7 implementation.
 5. **Is 180-day observation retention enough** to see annual or quarterly patterns, given the DB-size
    budget? Owner: operator. Resolve by: Phase 6. Impact if wrong: seasonal recurrences look like new
    findings every cycle.
