@@ -394,7 +394,7 @@ class MigrationRunnerTests(unittest.TestCase):
     """Plan §8.4: additive-only, version-stamped, downgrade-tolerant migrations.
 
     The shipped registry carries the additive tables later phases add on top
-    of the v1 baseline (currently version 6); the apply path beyond it is
+    of the v1 baseline (currently version 8); the apply path beyond it is
     exercised by registering the kind of migrations those phases will add.
     """
 
@@ -506,6 +506,15 @@ class MigrationRunnerTests(unittest.TestCase):
                 "SELECT * FROM detector_run ORDER BY detector_id, version"
             ).fetchall(),
         }
+
+    def test_runner_docstring_names_the_newest_shipped_migration(self):
+        # The "(currently version N)" in this class docstring drifted twice —
+        # migrations 7 and 8 landed without it — so pin the number to the
+        # registry: the next migration must move both together.
+        self.assertIn(
+            f"currently version {twill_schema.MIGRATIONS[-1].version}",
+            type(self).__doc__ or "",
+        )
 
     def test_every_supported_schema_version_upgrades_without_losing_rows(self):
         """Each historical stamp reaches HEAD, including detector-run steps."""
