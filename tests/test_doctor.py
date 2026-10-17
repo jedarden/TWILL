@@ -13,6 +13,7 @@ ROOT = Path(__file__).resolve().parents[1]
 CLI = ROOT / "twill"
 sys.path.insert(0, str(ROOT))
 
+import twill_crosshost  # noqa: E402
 import twill_detectors  # noqa: E402
 import twill_digest  # noqa: E402
 import twill_doctor  # noqa: E402
@@ -60,6 +61,7 @@ class DoctorChecksTests(unittest.TestCase):
                 "cursor_health",
                 "rule_corpus",
                 "dead_man_switch",
+                "host_coverage",
                 "parse_shape_drift",
                 "detector_self_test",
                 "optional_inputs",
@@ -208,6 +210,203 @@ class DoctorChecksTests(unittest.TestCase):
             disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
         )
         self.assertEqual(self.check(report, "dead_man_switch").status, twill_doctor.HEALTHY)
+
+    def seed_host_report(
+        self,
+        *,
+        host_id,
+        generated_at,
+        ingested_at,
+        window_start="2026-09-18",
+        window_end="2026-10-17",
+        buckets=(),
+    ):
+        """Accept one host report the way the Phase 7 importer would store it."""
+
+        connection = twill_schema.connect(self.state)
+        connection.execute(twill_crosshost.HOST_REPORT_DDL)
+        connection.execute(twill_crosshost.HOST_REPORT_BUCKET_DDL)
+        connection.execute(
+            "INSERT INTO host_report(host_id, generated_at, last_ingest_success_at, "
+            "window_start, window_end, signature_scheme, report_sha256) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?)",
+            (
+                host_id,
+                generated_at,
+                ingested_at,
+                window_start,
+                window_end,
+                twill_crosshost.SIGNATURE_SCHEME,
+                "0" * 64,
+            ),
+        )
+        for day, signature in buckets:
+            connection.execute(
+                "INSERT INTO host_report_bucket(host_id, day, kind, signature_scheme, "
+                "signature_sha256, sessions, events, first_seen, last_seen) "
+                "VALUES (?, ?, 'tool_error', ?, ?, 1, 2, ?, ?)",
+                (
+                    host_id,
+                    day,
+                    twill_crosshost.SIGNATURE_SCHEME,
+                    signature,
+                    f"{day}T09:00:00Z",
+                    f"{day}T10:00:00Z",
+                ),
+            )
+        connection.commit()
+        connection.close()
+
+    def coverage_report(self, now):
+        return twill_doctor.run_doctor(
+            self.state,
+            now=now,
+            disk_usage=lambda _: SimpleNamespace(free=twill_doctor.FREE_DISK_WARN_BYTES),
+        )
+
+    def test_host_coverage_is_healthy_before_any_host_reports(self):
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        report = self.coverage_report(now)
+        check = self.check(report, "host_coverage")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["hosts"], {})
+        self.assertIn("no accepted host reports", check.message)
+
+    def test_host_coverage_reports_a_current_empty_host_as_healthy(self):
+        # A host with zero observations can still be healthy: the verdict
+        # reads the accepted heartbeats, not the event rows (§ contract).
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.seed_host_report(
+            host_id="lab",
+            generated_at="2026-10-17T11:30:00Z",
+            ingested_at="2026-10-17T11:00:00Z",
+        )
+        check = self.check(self.coverage_report(now), "host_coverage")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["stale_hosts"], [])
+        self.assertEqual(
+            check.details["hosts"]["lab"],
+            {
+                "state": "current",
+                "reason": "accepted report is fresh",
+                "generated_at": "2026-10-17T11:30:00Z",
+                "last_ingest_success_at": "2026-10-17T11:00:00Z",
+                "last_covered_date": "2026-10-17",
+            },
+        )
+
+    def test_host_coverage_uses_report_heartbeats_not_event_timestamps(self):
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.seed_host_report(
+            host_id="lab",
+            generated_at="2026-10-17T11:30:00Z",
+            ingested_at="2026-10-17T11:00:00Z",
+            buckets=[("2026-10-07", "a" * 64)],
+        )
+        check = self.check(self.coverage_report(now), "host_coverage")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(check.details["hosts"]["lab"]["state"], "current")
+        # The declared window, not the newest bucket day, is the coverage end.
+        self.assertEqual(check.details["hosts"]["lab"]["last_covered_date"], "2026-10-17")
+
+    def test_host_coverage_degrades_on_a_stale_host_without_failing_the_run(self):
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.seed_host_report(
+            host_id="lab",
+            generated_at="2026-10-13T10:00:00Z",
+            ingested_at="2026-10-13T09:30:00Z",
+        )
+        report = self.coverage_report(now)
+        check = self.check(report, "host_coverage")
+        self.assertEqual(check.status, twill_doctor.DEGRADED)
+        self.assertEqual(check.details["stale_hosts"], ["lab"])
+        self.assertIn("lab", check.message)
+        # Phase 7: a silent host degrades to "stale host", never to a failed
+        # run — exit 1, not exit 2.
+        self.assertEqual(report.exit_code, twill_doctor.EXIT_DEGRADED)
+
+    def test_host_coverage_stale_boundary_is_strictly_older_than_72_hours(self):
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        boundary = "2026-10-14T12:00:00Z"  # exactly twill_crosshost.STALE_AFTER old
+        self.seed_host_report(host_id="lab", generated_at=boundary, ingested_at=boundary)
+        check = self.check(self.coverage_report(now), "host_coverage")
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+
+        connection = twill_schema.connect(self.state)
+        connection.execute(
+            "UPDATE host_report SET generated_at = ?, last_ingest_success_at = ? "
+            "WHERE host_id = 'lab'",
+            ("2026-10-14T11:59:59Z", "2026-10-14T11:59:59Z"),
+        )
+        connection.commit()
+        connection.close()
+        check = self.check(self.coverage_report(now), "host_coverage")
+        self.assertEqual(check.status, twill_doctor.DEGRADED)
+
+    def test_host_coverage_names_a_stale_ingest_heartbeat(self):
+        # A fresh report built on top of a host whose ingest last succeeded
+        # days ago is still a stale host: the heartbeat, not the publish time,
+        # proves the local pipeline ran.
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.seed_host_report(
+            host_id="lab",
+            generated_at="2026-10-17T11:30:00Z",
+            ingested_at="2026-10-14T05:00:00Z",
+        )
+        check = self.check(self.coverage_report(now), "host_coverage")
+        self.assertEqual(check.status, twill_doctor.DEGRADED)
+        self.assertEqual(
+            check.details["hosts"]["lab"]["reason"],
+            "last_ingest_success_at is older than 72 hours",
+        )
+
+    def test_host_coverage_treats_malformed_heartbeats_as_stale_not_broken(self):
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        self.seed_host_report(
+            host_id="lab", generated_at="not-a-timestamp", ingested_at="also-not"
+        )
+        check = self.check(self.coverage_report(now), "host_coverage")
+        self.assertEqual(check.status, twill_doctor.DEGRADED)
+        self.assertEqual(
+            check.details["hosts"]["lab"]["reason"],
+            "stored report timestamp is malformed",
+        )
+
+    def test_host_coverage_is_broken_when_report_rows_cannot_be_read(self):
+        now = datetime(2026, 10, 17, 12, 0, tzinfo=timezone.utc)
+        self.create_database()
+        connection = twill_schema.connect(self.state)
+        connection.execute(twill_crosshost.HOST_REPORT_DDL)
+        connection.execute(twill_crosshost.HOST_REPORT_BUCKET_DDL)
+        connection.execute(
+            "INSERT INTO host_report(host_id, generated_at, last_ingest_success_at, "
+            "window_start, window_end, signature_scheme, report_sha256) "
+            "VALUES ('lab', ?, ?, ?, ?, ?, ?)",
+            ("2026-10-17T11:30:00Z", "2026-10-17T11:00:00Z", "2026-09-18",
+             "2026-10-17", twill_crosshost.SIGNATURE_SCHEME, "0" * 64),
+        )
+        # Local corruption of the accepted-report shape keeps the existing
+        # BROKEN semantics for local state, unlike a stale remote host.
+        connection.execute("DROP TABLE host_report")
+        connection.execute(
+            "CREATE TABLE host_report(host_id TEXT, signature_scheme TEXT)"
+        )
+        connection.execute(
+            "INSERT INTO host_report(host_id, signature_scheme) VALUES (?, ?)",
+            ("lab", twill_crosshost.SIGNATURE_SCHEME),
+        )
+        connection.commit()
+        connection.close()
+        check = self.check(self.coverage_report(now), "host_coverage")
+        self.assertEqual(check.status, twill_doctor.BROKEN)
+        self.assertIn("cannot be read", check.message)
 
     def add_parse_shape(self, rows):
         connection = twill_schema.connect(self.state)

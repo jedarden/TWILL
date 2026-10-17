@@ -136,21 +136,31 @@ def _parse_timestamp(value: str) -> datetime:
     return parsed.astimezone(timezone.utc)
 
 
-def _freshness(
+def freshness(
     generated_at: str, last_ingest_success_at: str, now: datetime
-) -> str:
-    # The importer validates both timestamps.  A malformed stored value is
-    # conservatively stale, never a claim that the host is healthy.
+) -> tuple[str, str]:
+    """Contract freshness verdict for one accepted report: ``(state, reason)``.
+
+    The importer validates both timestamps before accepting them, but a
+    malformed stored value is conservatively stale — never a claim that the
+    host is healthy.  The reason names the specific failing signal so doctor
+    can report it verbatim.
+    """
+
     try:
         generated = _parse_timestamp(generated_at)
         ingested = _parse_timestamp(last_ingest_success_at)
     except ValueError:
-        return "stale_host"
-    if ingested > generated or generated > now + timedelta(minutes=5):
-        return "stale_host"
-    if now - generated > STALE_AFTER or now - ingested > STALE_AFTER:
-        return "stale_host"
-    return "current"
+        return ("stale_host", "stored report timestamp is malformed")
+    if ingested > generated:
+        return ("stale_host", "last_ingest_success_at is later than generated_at")
+    if generated > now + timedelta(minutes=5):
+        return ("stale_host", "generated_at is ahead of the local clock")
+    if now - generated > STALE_AFTER:
+        return ("stale_host", "generated_at is older than 72 hours")
+    if now - ingested > STALE_AFTER:
+        return ("stale_host", "last_ingest_success_at is older than 72 hours")
+    return ("current", "accepted report is fresh")
 
 
 def findings(
@@ -188,11 +198,12 @@ def findings(
         contributors: list[dict[str, object]] = []
         for host_id, day, generated_at, ingested_at in rows:
             if not contributors or contributors[-1]["host_id"] != host_id:
+                state, _reason = freshness(generated_at, ingested_at, current)
                 contributors.append(
                     {
                         "host_id": host_id,
                         "days": [],
-                        "freshness": _freshness(generated_at, ingested_at, current),
+                        "freshness": state,
                     }
                 )
             contributors[-1]["days"].append(day)
