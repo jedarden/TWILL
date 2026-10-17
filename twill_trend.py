@@ -38,6 +38,12 @@ MIN_TREND_HISTORY_WEEKS = 6
 EWMA_ALPHA = 0.3
 EWMA_BAND_SIGMAS = 2.0
 _REFERENCE_TABLES = ("observation", "rule_doc", "session_usage")
+# Detector evidence tables the weekly replay must carry into the filtered
+# copy alongside the corpus: D-10's cluster SQL joins the catalog reader's
+# gate_gap rows (§6.5) exactly as every other detector joins observation.
+# Its observation join scopes each replay to one week before the in-memory
+# copy, so a large historical evidence table does not multiply replay cost.
+_EVIDENCE_TABLES = ("gate_gap",)
 _WEEKLY_UPSERT = """
 INSERT INTO cluster_week(detector_id, key, week, sessions, events)
 VALUES (?, ?, ?, ?, ?)
@@ -115,6 +121,14 @@ def _copy_reference_table(
             "WHERE ts_utc >= ? AND ts_utc < ?",
             (start, end),
         )
+    elif table == "gate_gap" and start is not None and end is not None:
+        selected = ", ".join(f"g.{_quote_identifier(name)}" for name in names)
+        rows = source.execute(
+            f"SELECT {selected} FROM gate_gap AS g "
+            "JOIN observation AS o ON o.obs_id = g.obs_id "
+            "WHERE o.ts_utc >= ? AND o.ts_utc < ?",
+            (start, end),
+        )
     else:
         rows = source.execute(
             f"SELECT {quoted} FROM {_quote_identifier(table)}"
@@ -133,7 +147,7 @@ def _filtered_connection(
 ) -> sqlite3.Connection:
     target = sqlite3.connect(":memory:")
     try:
-        for table in _REFERENCE_TABLES:
+        for table in _REFERENCE_TABLES + _EVIDENCE_TABLES:
             _copy_reference_table(source, target, table, start=start, end=end)
         target.execute("PRAGMA query_only = ON")
         return target

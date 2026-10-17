@@ -81,6 +81,7 @@ SELFTEST_EXPECTED_CLUSTERS = {
     "D-07": 1,
     "D-08": 1,
     "D-09": 1,
+    "D-10": 1,
 }
 REQUIRED_TABLES = (
     "cluster",
@@ -357,6 +358,8 @@ def _check_database_schema(
             required_tables.append("detector_run")
         if expected >= 3:
             required_tables.append("cluster_session")
+        if expected >= 7:
+            required_tables.append("gate_gap")
         for table in required_tables:
             connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
     except Exception as exc:
@@ -1369,20 +1372,58 @@ def _seed_selftest_fixture(connection: sqlite3.Connection, now: datetime) -> Non
         path="/mirror/selftest.log",
         host="retired-host",
     )
+    # D-10 (gate gap): one executed command that matched a deny-channel ICG
+    # never event — the exact hole in the gate the detector exists to
+    # report. The single session keeps it clear
+    # of D-07's two-session rediscovery bar.
+    _seed_selftest_observation(
+        connection,
+        now=now,
+        session_id="selftest-g",
+        days_ago=1.0,
+        kind="run_succeeded",
+        command="git push --force origin main",
+    )
+    # Exercise the catalog-to-evidence path as well as the SQL detector;
+    # the fixture is local and deterministic, so doctor never invokes ICG.
+    fixture_catalog = twill_catalog.Catalog(
+        format=twill_catalog.CATALOG_FORMAT,
+        catalog_digest="selftest-catalog-digest",
+        icg_version="selftest",
+        pack_source={},
+        never=(
+            twill_catalog.CatalogEvent(
+                id="git-force-push",
+                pack="git",
+                check="command_regex",
+                matching={"regex": r"^git push --force"},
+                action="deny",
+                enabled=True,
+            ),
+        ),
+        always=(),
+    )
+    twill_catalog.materialize_gate_gaps(
+        connection, fixture_catalog, window_days=SELFTEST_WINDOW_DAYS, now=now
+    )
 
 
 def _selftest_fixture(now: datetime) -> sqlite3.Connection:
     """Build the in-memory fixture the self-test replays the registry over.
 
-    The schema is exactly what a fresh state database would carry, so a
-    detector whose SQL no longer matches the shipped tables or columns fails
-    here before a digest is built from it.  ``:memory:`` keeps the doctor
-    surface read-only: no file, no lock, no state-directory side effects.
+    The schema is exactly what a fresh state database would carry — the v1
+    baseline plus the post-v1 tables the corpus has grown (today, D-10's
+    ``gate_gap`` evidence) — so a detector whose SQL no longer matches the
+    shipped tables or columns fails here before a digest is built from it.
+    ``:memory:`` keeps the doctor surface read-only: no file, no lock, no
+    state-directory side effects.
     """
 
     connection = sqlite3.connect(":memory:")
     try:
         connection.executescript(twill_schema.V1_SCHEMA)
+        connection.execute(twill_schema.GATE_GAP_DDL)
+        connection.execute(twill_schema.GATE_GAP_OBS_INDEX_DDL)
         _seed_selftest_fixture(connection, now)
     except BaseException:
         connection.close()

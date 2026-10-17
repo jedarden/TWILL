@@ -247,6 +247,25 @@ def _apply_additive_columns(connection: sqlite3.Connection) -> None:
             connection.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
 
 
+# D-10's corpus input (plan §6.5): one row per executed observation that
+# matched an ICG never event, written by the catalog reader when ``twill
+# detect`` loads a valid catalog.  The table is replaced wholesale on every
+# successful catalog read, so it never holds evidence attributed to a catalog
+# older than the one the next detect run reasoned about.  Rows join
+# ``observation`` by ``obs_id``; prune-deleted observations therefore stop
+# counting without needing a cascade, and the digest column records which
+# catalog the match was computed against.
+GATE_GAP_DDL = (
+    "CREATE TABLE IF NOT EXISTS gate_gap("
+    "pack TEXT NOT NULL, id TEXT NOT NULL, obs_id INTEGER NOT NULL, "
+    "catalog_digest TEXT NOT NULL, "
+    "PRIMARY KEY(pack, id, obs_id))"
+)
+GATE_GAP_OBS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS gate_gap_obs_id_idx ON gate_gap(obs_id)"
+)
+
+
 # --- versioned migrations (plan §8.4) -------------------------------------
 
 SCHEMA_VERSION_KEY = "schema_version"
@@ -381,6 +400,7 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
                 "ALTER TABLE cluster ADD COLUMN dismissed_at TEXT",
             ),
         ),
+        Migration(7, "gate_gap_evidence", (GATE_GAP_DDL, GATE_GAP_OBS_INDEX_DDL)),
     )
 )
 

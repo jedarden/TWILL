@@ -24,6 +24,10 @@ _SCORE_SESSION_WEIGHT = 4.0
 _SCORE_EVENT_WEIGHT = 1.0
 _SCORE_RECENCY_WEIGHT = 1.0
 _SECONDS_PER_DAY = 86400.0
+# These detectors report operational state for review; they do not propose
+# changes to agent behavior.  Keep the gate at the candidate source so a
+# D-10 gate gap cannot turn into a TWILL lesson (plan §6.5 and §8.5).
+NON_LESSON_DETECTORS = frozenset({"D-09", "D-10"})
 
 
 @dataclass(frozen=True)
@@ -132,6 +136,7 @@ class RankedCluster:
             self.state == "open"
             and self.covered_by is None
             and self.sessions > 0
+            and self.detector_id not in NON_LESSON_DETECTORS
         )
 
     @property

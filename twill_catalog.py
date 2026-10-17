@@ -15,11 +15,12 @@ import json
 import re
 import subprocess
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import Callable, Mapping, Sequence
 
 
 CATALOG_FORMAT = "icg-catalog/v2"
+LEGACY_CATALOG_FORMAT = "icg-catalog/v1"
 CATALOG_COMMAND = ("icg", "catalog", "--json")
 READER_NAME = "icg_catalog"
 CATALOG_DIGEST_META_KEY = "icg_catalog_digest"
@@ -318,29 +319,37 @@ def canonical_digest(catalog: Catalog) -> str:
 def parse_catalog(value: object) -> Catalog:
     """Validate one ICG catalog document without reading rule packs."""
 
-    raw = _mapping(value, "catalog", frozenset(_TOP_LEVEL_KEYS))
-    catalog_format = _string(raw["format"], "catalog.format")
-    # The dispatch point is explicit: future formats are not guessed as v2.
-    if catalog_format != CATALOG_FORMAT:
+    if not isinstance(value, dict):
+        raise CatalogError("catalog must be an object")
+    catalog_format = _string(value.get("format"), "catalog.format")
+    # v1 is still emitted by installed ICG releases; v2 adds pack_source.
+    # Dispatch on format so a future shape is never guessed as either one.
+    if catalog_format not in (LEGACY_CATALOG_FORMAT, CATALOG_FORMAT):
         raise CatalogError(f"unsupported catalog format: {catalog_format}")
+    keys = _TOP_LEVEL_KEYS
+    if catalog_format == LEGACY_CATALOG_FORMAT:
+        keys = keys - {"pack_source"}
+    raw = _mapping(value, "catalog", frozenset(keys))
     digest = _string(raw["catalog_digest"], "catalog.catalog_digest")
     if not _DIGEST_RE.fullmatch(digest):
         raise CatalogError("catalog.catalog_digest must be lowercase SHA-256 hex")
     icg_version = _string(raw["icg_version"], "catalog.icg_version")
-    pack_source = _mapping(raw["pack_source"], "catalog.pack_source", _PACK_SOURCE_KEYS)
-    if _string(pack_source["origin"], "catalog.pack_source.origin") not in {
-        "explicit",
-        "installed",
-        "repository",
-    }:
-        raise CatalogError("catalog.pack_source.origin is unsupported")
-    if pack_source["root"] is not None and not isinstance(pack_source["root"], str):
-        raise CatalogError("catalog.pack_source.root must be a string or null")
-    if (
-        pack_source["trusted_ref"] is not None
-        and not isinstance(pack_source["trusted_ref"], str)
-    ):
-        raise CatalogError("catalog.pack_source.trusted_ref must be a string or null")
+    pack_source: Mapping[str, object] = {}
+    if catalog_format == CATALOG_FORMAT:
+        pack_source = _mapping(raw["pack_source"], "catalog.pack_source", _PACK_SOURCE_KEYS)
+        if _string(pack_source["origin"], "catalog.pack_source.origin") not in {
+            "explicit",
+            "installed",
+            "repository",
+        }:
+            raise CatalogError("catalog.pack_source.origin is unsupported")
+        if pack_source["root"] is not None and not isinstance(pack_source["root"], str):
+            raise CatalogError("catalog.pack_source.root must be a string or null")
+        if (
+            pack_source["trusted_ref"] is not None
+            and not isinstance(pack_source["trusted_ref"], str)
+        ):
+            raise CatalogError("catalog.pack_source.trusted_ref must be a string or null")
     never = _events(raw["never"], never=True)
     always = _events(raw["always"], never=False)
     expected = hashlib.sha256(_canonical_content(catalog_format, never, always)).hexdigest()
@@ -496,3 +505,116 @@ def load_and_record(
     result = read_catalog_status(command, runner=runner, timeout=timeout)
     observation = record_catalog(connection, result.catalog) if result.catalog else None
     return result, observation
+
+
+# The observation kinds that prove a command executed: the gate sits at the
+# PreToolUse boundary, so any of these — succeeded, failed, or result-unknown —
+# means the call got past it.  Denials and rejections never produce these
+# kinds, so a matching row cannot double-count a stopped attempt.
+GATE_GAP_KINDS = ("run", "run_succeeded", "run_failed")
+
+
+def gate_gap_coverage(catalog: Catalog) -> tuple[int, int]:
+    """Count enforced blocking events D-10 can and cannot inspect.
+
+    Transcript observations retain command text, but not the complete
+    content or engine state needed to replay content_regex and predicate
+    checks. Surface that limit so zero matches are not mistaken for proof
+    that every ICG rule held.
+    """
+
+    checks = [
+        event.check for event in catalog.never
+        if event.enabled is True and event.action == "deny"
+    ]
+    supported = checks.count("command_regex")
+    return supported, len(checks) - supported
+
+
+def _gate_gap_matchers(catalog: Catalog) -> list[tuple[CatalogEvent, re.Pattern[str]]]:
+    """Compile the never events D-10 can actually hold against execution.
+
+    Three narrowing rules, each pinned by the ICG contract: an event the
+    engine does not enforce (``enabled = false``) is cataloged visibility,
+    not a hole in the gate; an event the gate answers without blocking
+    (``additional_context``) executed by design; and ``updated_input``
+    rewrites the input before execution, while the transcript records the
+    invocation as the agent wrote it — so a rewritten force-push would read
+    as a gap.  ``content_regex`` subjects are not stored (excerpts are
+    post-redaction and bounded) and ``predicate`` logic is engine-side code
+    the catalog says a consumer cannot re-implement.
+    """
+
+    matchers: list[tuple[CatalogEvent, re.Pattern[str]]] = []
+    for event in catalog.never:
+        if event.action != "deny" or event.check != "command_regex":
+            continue
+        if event.enabled is not True:
+            continue
+        pattern = event.matching["regex"]
+        try:
+            # The packs' flavor is plain Rust regex — anchors, classes,
+            # inline flags — which Python's re accepts as-is; anything it
+            # cannot compile raises and names the event rather than
+            # silently matching nothing.
+            compiled = re.compile(pattern)
+        except re.error as exc:
+            raise CatalogError(
+                f"never event {event.pack}/{event.id} carries a regex TWILL "
+                f"cannot evaluate: {exc}"
+            ) from exc
+        matchers.append((event, compiled))
+    return matchers
+
+
+def materialize_gate_gaps(
+    connection: object,
+    catalog: Catalog,
+    *,
+    window_days: int,
+    now: datetime | None = None,
+) -> int:
+    """Refresh D-10's evidence table from a valid catalog and the corpus.
+
+    One row lands per executed observation inside the trailing window whose
+    command matched a deny-channel ``command_regex`` never event.  The whole
+    table is replaced in one transaction, so evidence is always attributed to
+    exactly the catalog passed in — never a blend of two digests.  Returns
+    the number of matches written.
+    """
+
+    if not isinstance(window_days, int) or isinstance(window_days, bool):
+        raise ValueError("window_days must be an integer")
+    if window_days < 1:
+        raise ValueError(f"window_days must be at least 1: {window_days}")
+    reference = now if now is not None else datetime.now(timezone.utc)
+    window_start = (reference - timedelta(days=window_days)).isoformat()
+    matchers = _gate_gap_matchers(catalog)
+    placeholders = ", ".join("?" for _ in GATE_GAP_KINDS)
+    rows = connection.execute(
+        f"""
+        SELECT obs_id, command FROM observation
+        WHERE ts_utc >= ?
+          AND kind IN ({placeholders})
+          AND command IS NOT NULL
+          AND trim(command) <> ''
+        ORDER BY obs_id
+        """,
+        (window_start, *GATE_GAP_KINDS),
+    ).fetchall()
+    evidence: list[tuple[str, str, int]] = []
+    for obs_id, command in rows:
+        for event, compiled in matchers:
+            if compiled.search(command):
+                evidence.append((event.pack, event.id, int(obs_id)))
+    with connection:
+        connection.execute("DELETE FROM gate_gap")
+        connection.executemany(
+            "INSERT INTO gate_gap(pack, id, obs_id, catalog_digest) "
+            "VALUES (?, ?, ?, ?)",
+            (
+                (pack, event_id, obs_id, catalog.catalog_digest)
+                for pack, event_id, obs_id in evidence
+            ),
+        )
+    return len(evidence)

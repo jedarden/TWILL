@@ -951,7 +951,12 @@ class OptionalInputLivenessTests(unittest.TestCase):
         return next(check for check in report.checks if check.name == "optional_inputs")
 
     def test_icg_catalog_reader_is_absent_without_degrading_doctor(self):
-        check = self.optional_inputs(self.report())
+        # The host may have a supported ICG catalog installed.  Exercise the
+        # absent-input contract with an explicit probe instead of PATH state.
+        registry = twill_reader.build_reader_registry(
+            twill_reader.ReaderRegistration("icg_catalog", lambda: False),
+        )
+        check = self.optional_inputs(self.report(registry))
         self.assertEqual(check.status, twill_doctor.HEALTHY)
         self.assertEqual(check.details["registered"], 1)
         self.assertEqual(check.details["live"], 0)

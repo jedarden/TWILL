@@ -235,7 +235,7 @@ class StatusCliTests(unittest.TestCase):
             result = self.run_cli("detect", "--json", "--state-dir", str(state))
             self.assertEqual(result.returncode, 0, result.stderr)
             record = read_status(state)["data"]["stages"]["detect"]
-            self.assertEqual(record["counts"]["detectors"], 8)
+            self.assertEqual(record["counts"]["detectors"], 9)
             self.assertEqual(record["counts"]["clusters"], 0)
             self.assertEqual(record["performance"]["misses"], [])
             self.assertEqual(

@@ -32,7 +32,7 @@ from twill_detectors import (
     read_clusters,
     validate_detector_semantics,
 )
-from twill_ranker import RankedCluster, RankReport
+from twill_ranker import NON_LESSON_DETECTORS, RankedCluster, RankReport
 from twill_redactor import MAX_EXCERPT_LENGTH, Redactor, redact_text
 from twill_router import RoutingRecommendation, recommend_routing
 
@@ -362,6 +362,8 @@ def _safe_excerpt_record(value: object, redactor: Redactor) -> PromptExcerpt | N
 
 
 def _is_candidate(cluster: object) -> bool:
+    if _get(cluster, "detector_id") in NON_LESSON_DETECTORS:
+        return False
     state = _get(cluster, "state")
     covered_by = _get(cluster, "covered_by")
     if state is not None and str(state) != "open":
@@ -736,6 +738,7 @@ def _load_candidate_clusters(connection: sqlite3.Connection, top_k: int) -> tupl
         "SELECT detector_id, key, window_days, sessions, events, first_seen, "
         "last_seen, score, covered_by, state FROM cluster "
         "WHERE state = 'open' AND covered_by IS NULL "
+        "AND detector_id NOT IN ('D-09', 'D-10') "
         "ORDER BY score DESC, sessions DESC, events DESC, last_seen DESC, "
         "detector_id ASC, key ASC LIMIT ?",
         (top_k,),
@@ -1290,6 +1293,11 @@ def _begin_cluster_state_writes(
     connection.execute("BEGIN IMMEDIATE")
     try:
         for lesson in prepared:
+            if lesson.detector_id in NON_LESSON_DETECTORS:
+                raise ValidationError(
+                    f"Lesson write cannot mark non-lesson detector {lesson.detector_id}",
+                    "review the finding in the detector report instead",
+                )
             row = connection.execute(
                 "SELECT state, covered_by FROM cluster WHERE detector_id = ? AND key = ?",
                 (lesson.detector_id, lesson.key),

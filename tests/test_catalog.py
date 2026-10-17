@@ -38,25 +38,28 @@ def always_event(event_id="safe-one", *, pack="pack-a"):
     }
 
 
-def document(*, never=None, always=None):
+def document(*, never=None, always=None, catalog_format=twill_catalog.CATALOG_FORMAT):
     never = list(never or [never_event()])
     always = list(always or [always_event()])
     content = {
-        "format": twill_catalog.CATALOG_FORMAT,
+        "format": catalog_format,
         "never": never,
         "always": always,
     }
     digest = hashlib.sha256(
         json.dumps(content, ensure_ascii=False, separators=(",", ":")).encode()
     ).hexdigest()
-    return {
-        "format": twill_catalog.CATALOG_FORMAT,
+    result = {
+        "format": catalog_format,
         "catalog_digest": digest,
         "icg_version": "0.2.0-test",
         "pack_source": {"origin": "installed", "root": "/etc/icg/packs", "trusted_ref": None},
         "never": never,
         "always": always,
     }
+    if catalog_format == twill_catalog.LEGACY_CATALOG_FORMAT:
+        del result["pack_source"]
+    return result
 
 
 class CatalogParserTests(unittest.TestCase):
@@ -66,6 +69,15 @@ class CatalogParserTests(unittest.TestCase):
         self.assertEqual(catalog.never[0].identity, ("pack-a", "never-one"))
         self.assertEqual(catalog.always[0].identity, ("pack-a", "safe-one"))
         self.assertEqual(catalog.digest, twill_catalog.canonical_digest(catalog))
+
+    def test_installed_v1_shape_is_accepted_without_a_pack_source(self):
+        value = document(catalog_format=twill_catalog.LEGACY_CATALOG_FORMAT)
+        catalog = twill_catalog.parse_catalog(value)
+        self.assertEqual(catalog.format, twill_catalog.LEGACY_CATALOG_FORMAT)
+        self.assertEqual(catalog.pack_source, {})
+        self.assertEqual(catalog.digest, twill_catalog.canonical_digest(catalog))
+        with self.assertRaisesRegex(twill_catalog.CatalogError, "fields do not match"):
+            twill_catalog.parse_catalog(value | {"pack_source": {}})
 
     def test_digest_is_recomputed_without_provenance_fields(self):
         value = document()

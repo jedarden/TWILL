@@ -2576,6 +2576,7 @@ class DetectCommandTests(unittest.TestCase):
                     "status": "ok",
                     "clusters": 1,
                     "error": None,
+                    "reason": None,
                 }
             ],
         )
@@ -2675,77 +2676,28 @@ class DetectCliTests(unittest.TestCase):
             result = self.run_cli("detect", "--json", "--state-dir", str(state))
             self.assertEqual(result.returncode, 0, result.stderr)
             envelope = json.loads(result.stdout)
+            outcomes = envelope["data"]["detectors"]
             self.assertEqual(
-                envelope["data"]["detectors"],
-                [
-                    {
-                        "detector_id": "D-01",
-                        "version": 1,
-                        "full_id": "D-01@1",
-                        "status": "ok",
-                        "clusters": 0,
-                        "error": None,
-                    },
-                    {
-                        "detector_id": "D-02",
-                        "version": 1,
-                        "full_id": "D-02@1",
-                        "status": "ok",
-                        "clusters": 0,
-                        "error": None,
-                    },
-                    {
-                        "detector_id": "D-03",
-                        "version": 1,
-                        "full_id": "D-03@1",
-                        "status": "ok",
-                        "clusters": 0,
-                        "error": None,
-                    },
-                    {
-                        "detector_id": "D-05",
-                        "version": 1,
-                        "full_id": "D-05@1",
-                        "status": "ok",
-                        "clusters": 0,
-                        "error": None,
-                    },
-                    {
-                        "detector_id": "D-06",
-                        "version": 1,
-                        "full_id": "D-06@1",
-                        "status": "ok",
-                        "clusters": 0,
-                        "error": None,
-                    },
-                    {
-                        "detector_id": "D-07",
-                        "version": 1,
-                        "full_id": "D-07@1",
-                        "status": "ok",
-                        "clusters": 0,
-                        "error": None,
-                    },
-                    {
-                        "detector_id": "D-08",
-                        "version": 1,
-                        "full_id": "D-08@1",
-                        "status": "ok",
-                        "clusters": 0,
-                        "error": None,
-                    },
-                    {
-                        "detector_id": "D-09",
-                        "version": 1,
-                        "full_id": "D-09@1",
-                        "status": "ok",
-                        "clusters": 0,
-                        "error": None,
-                    },
-                ],
+                [item["detector_id"] for item in outcomes],
+                ["D-01", "D-02", "D-03", "D-05", "D-06", "D-07", "D-08", "D-09", "D-10"],
             )
+            for item in outcomes:
+                self.assertEqual(
+                    set(item),
+                    {"detector_id", "version", "full_id", "status", "clusters", "error", "reason"},
+                )
+                self.assertEqual(item["version"], 1)
+                self.assertEqual(item["full_id"], f"{item['detector_id']}@1")
+                self.assertEqual(item["clusters"], 0)
+                self.assertIsNone(item["error"])
+            self.assertTrue(all(item["status"] == "ok" for item in outcomes[:-1]))
+            self.assertIn(outcomes[-1]["status"], {"ok", "skipped"})
+            if outcomes[-1]["status"] == "skipped":
+                self.assertTrue(outcomes[-1]["reason"])
+            else:
+                self.assertIsNone(outcomes[-1]["reason"])
             self.assertEqual(envelope["data"]["window_days"], 30)
-            self.assertEqual(envelope["warnings"], [])
+            self.assertTrue(all("D-10" in warning for warning in envelope["warnings"]))
             self.assertEqual(result.stderr, "")
 
             human = self.run_cli("detect", "--state-dir", str(state))
@@ -2757,6 +2709,7 @@ class DetectCliTests(unittest.TestCase):
             self.assertIn("D-06@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-07@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-09@1: 0 cluster(s)", human.stdout)
+            self.assertIn("D-10@1:", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):
         with tempfile.TemporaryDirectory() as directory:

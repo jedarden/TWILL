@@ -92,6 +92,11 @@ SQL_PARAMETERS = ("window_start_utc", "window_days")
 STATUS_OK = "ok"
 STATUS_ERROR = "error"
 STATUS_REFUSED = "refused"
+# A detector that did not run because the external input it cannot degrade
+# without (§6.5: D-04's denial log, D-10's ICG catalog) was unavailable.  Not
+# a failure: the run reports it with its reason and exits zero, while doctor
+# reports the input itself as not live.
+STATUS_SKIPPED = "skipped"
 
 # A detector query is a single statement that must read: anything that is not
 # a SELECT (or a WITH ... SELECT, the only shape SQLite CTEs take) is refused
@@ -1495,6 +1500,30 @@ UNREAD_RULE_DOC = Detector(
 )
 
 
+GATE_GAP_SQL = """
+    SELECT 'gate-gap:' || g.pack || ':' || g.id AS key,
+           count(DISTINCT o.session_id) AS sessions,
+           count(*) AS events,
+           min(o.ts_utc) AS first_seen,
+           max(o.ts_utc) AS last_seen
+    FROM gate_gap AS g
+    JOIN observation AS o ON o.obs_id = g.obs_id
+    WHERE o.ts_utc >= :window_start_utc
+      AND o.kind IN ('run', 'run_succeeded', 'run_failed')
+      AND o.command IS NOT NULL AND trim(o.command) <> ''
+    GROUP BY g.pack, g.id
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+GATE_GAP = Detector(
+    "D-10",
+    1,
+    "ICG never events that executed anyway — a hole in the gate, reported "
+    "per catalog (pack, id) attribution rather than as a lesson",
+    GATE_GAP_SQL,
+)
+
+
 # The shipped catalog.  Phase 2's detector beads (D-01 missing binary, D-02
 # recurring error signature, ... D-10 ICG gate gap) append their entries here;
 # an entry leaves this tuple when its successor version lands.
@@ -1507,6 +1536,7 @@ REGISTRY: tuple[Detector, ...] = build_registry(
     REDISCOVERY,
     STALE_RULE,
     UNREAD_RULE_DOC,
+    GATE_GAP,
 )
 
 
@@ -1519,6 +1549,7 @@ class DetectorOutcome:
     status: str
     clusters: int = 0
     error: str | None = None
+    reason: str | None = None
 
     @property
     def full_id(self) -> str:
@@ -1544,7 +1575,12 @@ class DetectorRunReport:
 
     @property
     def failed(self) -> tuple[DetectorOutcome, ...]:
-        return tuple(o for o in self.outcomes if o.status != STATUS_OK)
+        # A skipped detector did not fail (§6.5): its input was absent, which
+        # doctor reports, so the run still exits zero for the detectors that
+        # did run.
+        return tuple(
+            o for o in self.outcomes if o.status not in (STATUS_OK, STATUS_SKIPPED)
+        )
 
     @property
     def exit_code(self) -> int:
@@ -2210,6 +2246,7 @@ def run_detectors(
     registry: Sequence[Detector] | None = None,
     only: Sequence[str] | None = None,
     window_days_by_detector: Mapping[str, int] | None = None,
+    skip: Mapping[str, str] | None = None,
     now: str | datetime | None = None,
 ) -> DetectorRunReport:
     """Run the registry with per-detector isolation; never raises per-detector.
@@ -2217,7 +2254,12 @@ def run_detectors(
     Returns a report whatever happened: a detector that errors or breaks its
     contract is rolled back, recorded and reported while the rest still run
     (§8.2); a detector whose semantics drifted under the same version is
-    refused outright (EC-12).  The caller decides the exit code from
+    refused outright (EC-12).  ``skip`` names detectors whose non-degradable
+    external input (§6.5) is unavailable, mapping the base id to the reason;
+    each becomes a skipped outcome — reported, never a failure — and its
+    existing clusters are left exactly as the last successful run left them,
+    because an input TWILL cannot read says nothing about whether the finding
+    went away.  The caller decides the exit code from
     :attr:`DetectorRunReport.exit_code`.
     """
 
@@ -2246,6 +2288,17 @@ def run_detectors(
             detector, window_days, window_days_by_detector
         )
         resolved_windows.append(detector_days)
+        skip_reason = skip.get(detector.detector_id) if skip else None
+        if skip_reason is not None:
+            outcomes.append(
+                DetectorOutcome(
+                    detector_id=detector.detector_id,
+                    version=detector.version,
+                    status=STATUS_SKIPPED,
+                    reason=_bounded(skip_reason),
+                )
+            )
+            continue
         parameters = {
             "window_start_utc": (
                 current - timedelta(days=detector_days)

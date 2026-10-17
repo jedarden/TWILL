@@ -1944,8 +1944,28 @@ def detect_command(args: argparse.Namespace) -> int:
     connection = twill_schema.connect(state_dir)
     try:
         catalog_result, catalog_observation = twill_catalog.load_and_record(connection)
+        # D-10 cannot degrade (plan §6.5): without a catalog it can read it
+        # does not run transcript-only — it is skipped with the reason and
+        # its clusters survive untouched until the input returns.  A catalog
+        # that parses but cannot be evaluated (a regex this build refuses)
+        # skips the same way: the input is the problem, not the detector.
+        gate_gap_skip: str | None = None
+        gate_gap_evidence: int | None = None
+        if catalog_result.catalog is None:
+            reason = catalog_result.reason or "no reason reported"
+            gate_gap_skip = f"ICG catalog {catalog_result.status}: {reason}"
+        else:
+            try:
+                gate_gap_evidence = twill_catalog.materialize_gate_gaps(
+                    connection, catalog_result.catalog, window_days=days
+                )
+            except (twill_catalog.CatalogError, sqlite3.Error) as exc:
+                gate_gap_skip = f"ICG catalog could not be evaluated: {exc}"
         report = twill_detectors.run_detectors(
-            connection, window_days=days, only=args.detector
+            connection,
+            window_days=days,
+            only=args.detector,
+            skip={"D-10": gate_gap_skip} if gate_gap_skip else None,
         )
     finally:
         connection.close()
@@ -2001,6 +2021,18 @@ def detect_command(args: argparse.Namespace) -> int:
 
     warnings: list[str] = []
     catalog_data = catalog_result.as_dict()
+    if catalog_result.catalog is not None and gate_gap_evidence is not None:
+        catalog_data["gate_gap_evidence"] = gate_gap_evidence
+        evaluated, unobservable = twill_catalog.gate_gap_coverage(
+            catalog_result.catalog
+        )
+        catalog_data["gate_gap_events_evaluated"] = evaluated
+        catalog_data["gate_gap_events_unobservable"] = unobservable
+        if unobservable:
+            warnings.append(
+                f"D-10 cannot evaluate {unobservable} enabled ICG deny "
+                "event(s) from transcript command text"
+            )
     if catalog_observation is not None:
         catalog_data["observation"] = catalog_observation.as_dict()
     record_stage(
@@ -2014,6 +2046,9 @@ def detect_command(args: argparse.Namespace) -> int:
         warnings.append(
             "no detectors registered; 'twill detect' had nothing to run"
         )
+    for outcome in report.outcomes:
+        if outcome.status == twill_detectors.STATUS_SKIPPED and outcome.reason:
+            warnings.append(f"{outcome.full_id} skipped: {outcome.reason}")
     emit_success(
         {
             "window_days": report.window_days,
@@ -2026,6 +2061,7 @@ def detect_command(args: argparse.Namespace) -> int:
                     "status": outcome.status,
                     "clusters": outcome.clusters,
                     "error": outcome.error,
+                    "reason": outcome.reason,
                 }
                 for outcome in report.outcomes
             ],
@@ -2044,6 +2080,9 @@ def detect_command(args: argparse.Namespace) -> int:
         print("no detectors registered; add detectors in twill_detectors.REGISTRY")
         return EXIT_SUCCESS
     for outcome in report.outcomes:
+        if outcome.status == twill_detectors.STATUS_SKIPPED:
+            print(f"{outcome.full_id}: skipped — {outcome.reason}")
+            continue
         print(f"{outcome.full_id}: {outcome.clusters} cluster(s)")
     total_clusters = sum(outcome.clusters for outcome in report.outcomes)
     print(f"{len(report.outcomes)} detector(s) ran; {total_clusters} cluster(s)")
