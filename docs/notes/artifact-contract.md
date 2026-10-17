@@ -148,3 +148,11 @@ required, must resolve outside the public TWILL tree, and is the only place
 these four artifact namespaces may be written. The public checkout continues
 to gitignore all four namespaces, audit writes, reject secrets before
 persistence, and fail the published-tree check if any artifact leaks into it.
+
+## Phase 7 extension
+
+`host-report-contract.md` specifies a future `twill-artifacts/v2` manifest
+with a fifth `hosts/` namespace for bounded host-local reports. This page
+remains the v1 interchange contract until the v2 publisher and consumer are
+implemented and validated. A v1 reader rejects v2; adding host reports to
+an existing v1 manifest does not publish them.
