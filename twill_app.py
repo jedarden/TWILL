@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import twill_detectors
 import twill_catalog
+import twill_denials
 import twill_brief
 import twill_crosshost
 import twill_digest
@@ -1968,6 +1969,22 @@ def detect_command(args: argparse.Namespace) -> int:
                 )
             except (twill_catalog.CatalogError, sqlite3.Error) as exc:
                 gate_gap_skip = f"ICG catalog could not be evaluated: {exc}"
+        # D-04 cannot degrade either (plan §6.5): denials exist only in the
+        # hook's rolling log, so an absent log skips it with the reason and
+        # an unreadable one skips the same way a catalog that cannot be
+        # evaluated does — the input is the problem, not the detector.  The
+        # log is read only when D-04 is in this run's selection.
+        denial_skip: str | None = None
+        denial_evidence: int | None = None
+        if not args.detector or "D-04" in args.detector:
+            try:
+                denial_evidence = twill_denials.materialize_denials(connection)
+            except FileNotFoundError:
+                denial_skip = "org-rule-guard denial log absent"
+            except (OSError, sqlite3.Error) as exc:
+                denial_skip = (
+                    f"org-rule-guard denial log could not be read: {exc}"
+                )
         # Phase 7's cross-host detector runs only over imported fleet
         # evidence (docs/notes/host-report-contract.md).  Until the first
         # host report is accepted the input does not exist, and the honest
@@ -1991,11 +2008,12 @@ def detect_command(args: argparse.Namespace) -> int:
             registry = tuple(registry) + (
                 twill_crosshost.CROSS_HOST_SIGNATURE,
             )
+        skips = {"D-10": gate_gap_skip, "D-04": denial_skip}
         report = twill_detectors.run_detectors(
             connection,
             window_days=days,
             only=args.detector,
-            skip={"D-10": gate_gap_skip} if gate_gap_skip else None,
+            skip={name: reason for name, reason in skips.items() if reason},
             registry=registry,
         )
         if any(
@@ -2076,6 +2094,9 @@ def detect_command(args: argparse.Namespace) -> int:
             )
     if catalog_observation is not None:
         catalog_data["observation"] = catalog_observation.as_dict()
+    denial_data: dict[str, object] = {}
+    if denial_evidence is not None:
+        denial_data["evidence"] = denial_evidence
     record_stage(
         state_dir,
         "detect",
@@ -2107,6 +2128,7 @@ def detect_command(args: argparse.Namespace) -> int:
                 for outcome in report.outcomes
             ],
             "catalog": catalog_data,
+            "denial_log": denial_data,
             "cross_host_signatures": cross_host_signatures,
             "performance": performance,
         },

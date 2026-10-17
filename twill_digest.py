@@ -475,6 +475,48 @@ def _read_window(
                 f"INSERT INTO session_usage ({usage_quoted_columns}) VALUES ({usage_placeholders})",
                 source.execute(f"SELECT {usage_quoted_columns} FROM session_usage"),
             )
+        # §6.5 evidence tables a detector's SQL joins but the corpus copy
+        # above does not cover.  D-10's gate_gap is scoped by its obs_id
+        # join — rows outside the replayed week find no observation match —
+        # so it copies wholesale; D-04's hook_denial carries its own ts_utc
+        # and no observation join, so it copies with the same window bounds
+        # as observation or a replay of an earlier week would count later
+        # denials it must not see.  Both copies are guarded on existence: a
+        # database last written by an older release has not migrated yet,
+        # and the affected detector then reports its missing table per
+        # detector instead of failing the digest.
+        for table, scoped in (("gate_gap", False), ("hook_denial", True)):
+            evidence_columns = tuple(
+                (str(row[1]), str(row[2] or "TEXT"))
+                for row in source.execute(f"PRAGMA table_info({table})")
+            )
+            if not evidence_columns:
+                continue
+            evidence_names = ", ".join(
+                '"' + name.replace('"', '""') + '"' for name, _ in evidence_columns
+            )
+            evidence_declarations = ", ".join(
+                '"' + name.replace('"', '""') + '" ' + declaration
+                for name, declaration in evidence_columns
+            )
+            memory.execute(
+                f"CREATE TABLE {table} ({evidence_declarations})"
+            )
+            if scoped:
+                evidence_rows = source.execute(
+                    f"SELECT {evidence_names} FROM {table} "
+                    "WHERE ts_utc >= ? AND ts_utc < ?",
+                    (start, end),
+                )
+            else:
+                evidence_rows = source.execute(
+                    f"SELECT {evidence_names} FROM {table}"
+                )
+            memory.executemany(
+                f"INSERT INTO {table} ({evidence_names}) "
+                f"VALUES ({', '.join('?' for _ in evidence_columns)})",
+                evidence_rows,
+            )
         memory.execute("PRAGMA query_only = ON")
 
         results: list[_DetectorWindow] = []

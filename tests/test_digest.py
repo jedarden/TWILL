@@ -760,6 +760,89 @@ class DigestDiffTests(DigestStateCase):
         self.assertIn("detector failures: D-99@1", text)
 
 
+class ReplayEvidenceTableTests(DigestStateCase):
+    """The weekly replay carries §6.5 evidence tables into the window copy.
+
+    A detector whose SQL reads evidence the corpus copy does not hold would
+    report a per-detector error every week; D-10 shipped exactly that way
+    (``no such table: gate_gap``) until the copy learned the evidence
+    tables.  D-04's hook_denial needs the same carriage and, unlike D-10,
+    carries its own timestamps, so it must scope to the replayed window —
+    a replay of an earlier week must not count denials that happened later.
+    """
+
+    def seed_evidence(self):
+        for session_id in ("denial-a", "denial-b"):
+            self.connection.execute(
+                "INSERT INTO hook_denial(rule_id, tool, ts_utc, session_id) "
+                "VALUES ('mutating-kubectl', 'Bash', ?, ?)",
+                (
+                    (IN_WEEK + timedelta(hours=1)).isoformat(),
+                    session_id,
+                ),
+            )
+        # A later denial and a later gate-gap match: outside both replayed
+        # windows, so neither may surface in this week's or the previous
+        # week's numbers.
+        self.connection.execute(
+            "INSERT INTO hook_denial(rule_id, tool, ts_utc, session_id) "
+            "VALUES ('mutating-kubectl', 'Bash', ?, 'denial-c')",
+            (IN_PREVIOUS.isoformat(),),
+        )
+        self.connection.execute(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
+            "command, excerpt) VALUES ('gap-s', ?, ?, 'run_succeeded', "
+            "'git push --force origin main', 'git push --force origin main')",
+            (AFTER_WEEK.isoformat(), AFTER_WEEK.isoformat()),
+        )
+        self.connection.execute(
+            "INSERT INTO gate_gap(pack, id, obs_id, catalog_digest) VALUES "
+            "('git', 'git-force-push', (SELECT max(obs_id) FROM observation), "
+            "'replay-digest')"
+        )
+        self.connection.commit()
+
+    def test_full_registry_replays_without_evidence_table_errors(self):
+        self.seed_evidence()
+
+        report = self.build(registry=twill_detectors.REGISTRY)
+
+        statuses = {
+            detector.detector_id: (detector.current_status, detector.current_error)
+            for detector in report.detectors
+        }
+        for detector_id in ("D-04", "D-10"):
+            self.assertEqual(statuses[detector_id][0], "ok", statuses[detector_id])
+        self.assertEqual(
+            next(
+                detector.current_clusters
+                for detector in report.detectors
+                if detector.detector_id == "D-04"
+            ),
+            1,
+        )
+        self.assertEqual(
+            [finding.key for finding in report.findings if finding.key.startswith("gate-gap:")],
+            [],
+        )
+
+    def test_hook_denial_replay_scopes_to_the_reported_week(self):
+        self.seed_evidence()
+        start, end = twill_digest.week_bounds(twill_digest.previous_week(SUBJECT))
+
+        windows = twill_digest._read_window(
+            self.connection,
+            (twill_detectors.HOOK_DENIAL,),
+            start,
+            end,
+        )
+
+        # The previous week holds no denial (the seeded one is from this
+        # week and the even-later gap observation is after both); a window
+        # leak would have counted this week's rows here.
+        self.assertEqual(list(windows[0].clusters), [])
+
+
 class CrossHostDigestTests(DigestStateCase):
     def add_host_tables(self):
         self.connection.execute(twill_crosshost.HOST_REPORT_DDL)

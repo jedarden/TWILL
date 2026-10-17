@@ -642,6 +642,20 @@ qualifying sessions descending, latest `last_seen` descending, then command asce
 clusters retain `score = 0.0`; the Phase 3 ranker consumes these counts and timestamps for global
 ranking.
 
+**D-04@1 decision (2026-10-16):** a hook denial finding is an org-rule-guard rule the hook denied
+in at least `N = 2` distinct sessions inside the active trailing window — the same recurrence bar
+as `D-01`/`D-02`, because one denial is the gate working and cross-session recurrence is the
+friction. The detector's input is the `hook_denial` evidence table (schema migration 8), which
+`twill detect` refreshes wholesale from the rolling denial log on every run that selects `D-04`:
+fields are re-redacted on the way in, the hook's `...Z` timestamps are normalized to the corpus
+`ts_utc` shape, and the table always mirrors exactly the window that run read. The key is
+`hook-denial:<rule_id>`; `sessions` counts distinct session ids, `events` counts denial records,
+and there is no observation join — denials exist nowhere in the transcripts, which is why the
+detector cannot degrade. A missing or unreadable log skips `D-04` with the reason (exit 0, the
+`D-10` shape) while its clusters survive untouched, and `doctor` reports the log through the
+denial reader's liveness probe. Session-hit, week-hit, and weekly-series queries use the same
+membership rules; persisted clusters retain `score = 0.0` for the Phase 3 ranker.
+
 **D-05@1 decision (2026-09-27):** D-05 pairs a `tool_rejected` observation with the immediately
 following `user_turn_after_correction` observation in the same session. The pair is ignored when the
 tool name or correction excerpt is empty, or when another observation intervenes. Its key is

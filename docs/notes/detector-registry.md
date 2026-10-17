@@ -147,6 +147,28 @@ are excluded. Session-hit and weekly queries use the same qualification rule. Ou
 sessions descending, latest `last_seen` descending, then command ascending; the registry keeps
 `cluster.score` at zero for Phase 3's ranker.
 
+## D-04@1: hook denial
+
+D-04 emits one cluster for each org-rule-guard rule the hook denied in at
+least two distinct sessions inside the trailing window. Its evidence is the
+`hook_denial` table (schema migration 8), which `twill detect` refreshes from
+the rolling denial log (`~/.local/state/org-rule-guard/denials.jsonl` plus its
+`.1` backup, plan §6.5) on every run that selects D-04: fields are re-redacted
+on the way in, the hook's `...Z` timestamp is normalized to the corpus
+`ts_utc` shape, and the whole table is replaced per read, so it always mirrors
+exactly the window the run saw. The key is `hook-denial:<rule_id>`; `sessions`
+counts distinct session ids, `events` counts denial records, and
+`first_seen`/`last_seen` bound them. There is no per-observation join:
+denials exist nowhere in the transcripts (CLAUDE.md's own statement of the
+rules is itself indexed text), so the detector groups the evidence rows
+directly — which is also why D-04 cannot degrade. With the log absent or
+unreadable, `twill detect` skips it with the reason (exit 0), its clusters
+survive untouched, and `doctor` reports the input through the denial reader's
+liveness probe. Session-hit, week-hit, and weekly-series queries use the same
+membership rules; persisted clusters retain `score = 0.0` for the Phase 3
+ranker. A single denial of a rule is the gate working; recurrence across
+sessions is the friction — the same N = 2 distinct sessions as D-01/D-02.
+
 ## D-05@1: rejected tool call
 
 D-05 pairs each `tool_rejected` observation with the immediately following

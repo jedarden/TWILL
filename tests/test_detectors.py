@@ -1704,6 +1704,178 @@ class RetryLoopDetectorTests(unittest.TestCase):
         self.assertEqual([row[0] for row in rows], ["alpha", "gamma", "beta"])
 
 
+def seed_denial(
+    connection: sqlite3.Connection,
+    *,
+    rule_id: str = "mutating-kubectl",
+    session_id: str = "session-a",
+    days_ago: float = 1.0,
+    tool: str = "Bash",
+) -> None:
+    observed_at = datetime.now(timezone.utc) - timedelta(days=days_ago)
+    connection.execute(
+        "INSERT INTO hook_denial(rule_id, tool, ts_utc, session_id) "
+        "VALUES (?, ?, ?, ?)",
+        (rule_id, tool, observed_at.isoformat(), session_id),
+    )
+    connection.commit()
+
+
+class HookDenialDetectorTests(unittest.TestCase):
+    """D-04: denials grouped by rule over the window, from the log only."""
+
+    def setUp(self):
+        self._temporary = tempfile.TemporaryDirectory()
+        self.addCleanup(self._temporary.cleanup)
+        self.state_dir = Path(self._temporary.name) / "state"
+        self.connection = twill_schema.connect(self.state_dir)
+        self.addCleanup(self.connection.close)
+
+    def test_d04_groups_denials_by_rule_across_sessions(self):
+        # The qualifying rule: three denials across two sessions, one of
+        # them repeated inside a single session.  The excluded ones: a
+        # single-session rule, a kind the detector does not read, and a
+        # denial of the qualifying rule outside the window.
+        seed_denial(self.connection, rule_id="mutating-kubectl", session_id="s1", days_ago=5)
+        seed_denial(self.connection, rule_id="mutating-kubectl", session_id="s1", days_ago=4)
+        seed_denial(self.connection, rule_id="mutating-kubectl", session_id="s2", days_ago=3)
+        seed_denial(self.connection, rule_id="latest-image-tag", session_id="s3", days_ago=2)
+        seed_denial(
+            self.connection,
+            rule_id="mutating-kubectl",
+            session_id="s2",
+            days_ago=40,
+        )
+
+        report = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.HOOK_DENIAL,),
+        )
+
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        self.assertEqual(
+            [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
+            [("D-04@1", "ok", 1)],
+        )
+        rows = cluster_rows(self.connection, "D-04")
+        self.assertEqual([row[1] for row in rows], ["hook-denial:mutating-kubectl"])
+        self.assertEqual(rows[0][3], 2)  # sessions
+        self.assertEqual(rows[0][4], 3)  # events
+        self.assertLess(rows[0][5], rows[0][6])
+        self.assertEqual(rows[0][7], 0.0)
+        self.assertEqual(rows[0][9], "open")
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT key, session_id FROM cluster_session "
+                "WHERE detector_id = 'D-04' ORDER BY session_id"
+            ).fetchall(),
+            [
+                ("hook-denial:mutating-kubectl", "s1"),
+                ("hook-denial:mutating-kubectl", "s2"),
+            ],
+        )
+
+        parameters = {
+            "window_start_utc": (
+                datetime.now(timezone.utc) - timedelta(days=30)
+            ).isoformat(),
+            "window_days": 30,
+        }
+        self.assertEqual(
+            self.connection.execute(
+                twill_detectors.HOOK_DENIAL_SQL, parameters
+            ).fetchall(),
+            [("hook-denial:mutating-kubectl", 2, 3, rows[0][5], rows[0][6])],
+        )
+        # The single-session rule emits no cluster, so its session is not
+        # attributed either.
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT count(*) FROM cluster_session WHERE key LIKE '%latest-image-tag'"
+            ).fetchone()[0],
+            0,
+        )
+
+    def test_d04_backtest_and_weekly_series_cover_the_qualifying_rule(self):
+        seed_denial(self.connection, rule_id="mutating-kubectl", session_id="s1", days_ago=8)
+        seed_denial(self.connection, rule_id="mutating-kubectl", session_id="s2", days_ago=3)
+        seed_denial(self.connection, rule_id="latest-image-tag", session_id="s1", days_ago=3)
+
+        parameters = {
+            "window_start_utc": (
+                datetime.now(timezone.utc) - timedelta(days=30)
+            ).isoformat(),
+            "window_days": 30,
+        }
+        weeks = twill_detectors.read_cluster_weeks(
+            self.connection,
+            twill_detectors.HOOK_DENIAL,
+            "hook-denial:mutating-kubectl",
+            window_start_utc=parameters["window_start_utc"],
+            window_days=30,
+        )
+        self.assertGreaterEqual(weeks, 1)
+        # The single-session rule never qualifies, so the week query
+        # reports only the qualifying rule's weeks.
+        week_rows = self.connection.execute(
+            twill_detectors.HOOK_DENIAL_WEEK_HIT_SQL, parameters
+        ).fetchall()
+        self.assertEqual(
+            {row[0] for row in week_rows},
+            {"hook-denial:mutating-kubectl"},
+        )
+        self.assertEqual(len({row[1] for row in week_rows}), weeks)
+        weekly = twill_detectors.read_weekly_counts(
+            self.connection,
+            twill_detectors.HOOK_DENIAL,
+            window_start_utc=parameters["window_start_utc"],
+            window_days=30,
+            window_end_utc=datetime.now(timezone.utc).isoformat(),
+        )
+        self.assertEqual(
+            {key for key, _week in weekly},
+            {"hook-denial:mutating-kubectl"},
+        )
+        self.assertEqual(
+            sum(sessions for (sessions, _events) in weekly.values()),
+            2,
+        )
+        self.assertEqual(
+            sum(events for (_sessions, events) in weekly.values()),
+            2,
+        )
+
+    def test_d04_weekly_series_scopes_to_the_series_window(self):
+        # Two sessions denied inside the series window and a third after
+        # its end: only the in-window denials count, which is what keeps an
+        # earlier week's replay from counting later ones.
+        seed_denial(self.connection, rule_id="mutating-kubectl", session_id="s1", days_ago=4)
+        seed_denial(self.connection, rule_id="mutating-kubectl", session_id="s2", days_ago=3)
+        seed_denial(self.connection, rule_id="mutating-kubectl", session_id="s3", days_ago=1)
+        parameters = {
+            "window_start_utc": (
+                datetime.now(timezone.utc) - timedelta(days=30)
+            ).isoformat(),
+            "window_days": 30,
+        }
+        window_end = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+        weekly = twill_detectors.read_weekly_counts(
+            self.connection,
+            twill_detectors.HOOK_DENIAL,
+            window_start_utc=parameters["window_start_utc"],
+            window_days=30,
+            window_end_utc=window_end,
+        )
+        self.assertEqual(list(weekly.values()), [(2, 2)])
+
+    def test_d04_is_registered_in_catalog_order(self):
+        ids = [detector.detector_id for detector in twill_detectors.REGISTRY]
+        self.assertIn("D-04", ids)
+        self.assertLess(ids.index("D-03"), ids.index("D-04"))
+        self.assertLess(ids.index("D-04"), ids.index("D-05"))
+
+
 class RejectedToolCallDetectorTests(unittest.TestCase):
     def setUp(self):
         self._temporary = tempfile.TemporaryDirectory()
@@ -2679,7 +2851,8 @@ class DetectCliTests(unittest.TestCase):
             outcomes = envelope["data"]["detectors"]
             self.assertEqual(
                 [item["detector_id"] for item in outcomes],
-                ["D-01", "D-02", "D-03", "D-05", "D-06", "D-07", "D-08", "D-09", "D-10"],
+                ["D-01", "D-02", "D-03", "D-04", "D-05", "D-06", "D-07",
+                 "D-08", "D-09", "D-10"],
             )
             for item in outcomes:
                 self.assertEqual(
@@ -2690,14 +2863,33 @@ class DetectCliTests(unittest.TestCase):
                 self.assertEqual(item["full_id"], f"{item['detector_id']}@1")
                 self.assertEqual(item["clusters"], 0)
                 self.assertIsNone(item["error"])
-            self.assertTrue(all(item["status"] == "ok" for item in outcomes[:-1]))
-            self.assertIn(outcomes[-1]["status"], {"ok", "skipped"})
-            if outcomes[-1]["status"] == "skipped":
-                self.assertTrue(outcomes[-1]["reason"])
-            else:
-                self.assertIsNone(outcomes[-1]["reason"])
+            # The throwaway HOME has no denial log, so D-04 skips the same
+            # way D-10 does without ICG on PATH; the transcript-only
+            # detectors must all be clean runs.
+            self.assertTrue(
+                all(
+                    item["status"] == "ok"
+                    for item in outcomes
+                    if item["detector_id"] not in ("D-04", "D-10")
+                )
+            )
+            for item in outcomes:
+                if item["detector_id"] in ("D-04", "D-10"):
+                    self.assertIn(item["status"], {"ok", "skipped"})
+                    if item["status"] == "skipped":
+                        self.assertTrue(item["reason"])
+                    else:
+                        self.assertIsNone(item["reason"])
             self.assertEqual(envelope["data"]["window_days"], 30)
-            self.assertTrue(all("D-10" in warning for warning in envelope["warnings"]))
+            self.assertEqual(envelope["data"]["denial_log"], {})
+            self.assertTrue(
+                all(
+                    "D-04" in warning or "D-10" in warning
+                    for warning in envelope["warnings"]
+                )
+            )
+            self.assertTrue(any("D-04" in warning for warning in envelope["warnings"]))
+            self.assertTrue(any("D-10" in warning for warning in envelope["warnings"]))
             self.assertEqual(result.stderr, "")
 
             human = self.run_cli("detect", "--state-dir", str(state))
@@ -2705,6 +2897,7 @@ class DetectCliTests(unittest.TestCase):
             self.assertIn("D-01@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-02@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-03@1: 0 cluster(s)", human.stdout)
+            self.assertIn("D-04@1: skipped", human.stdout)
             self.assertIn("D-05@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-06@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-07@1: 0 cluster(s)", human.stdout)

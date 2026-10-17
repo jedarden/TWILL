@@ -266,6 +266,28 @@ GATE_GAP_OBS_INDEX_DDL = (
 )
 
 
+# D-04's corpus input (plan §6.5): one row per valid record in the
+# org-rule-guard denial log's rolling window, written by the denial reader
+# when ``twill detect`` runs.  Denials exist nowhere in the transcripts
+# (§6.5: counting them from transcript text is polluted by CLAUDE.md's own
+# statement of the rules), so they are evidence in their own right rather
+# than a join onto ``observation``: the detector groups these rows by rule
+# directly.  The table is replaced wholesale on every successful read, so it
+# always mirrors the log the run actually saw — rotation shrinks it the same
+# way it shrinks the log, and a re-read never duplicates a record.  Stored
+# text is re-redacted on the way in and the timestamp is normalized to the
+# corpus ``ts_utc`` shape so the window predicates match every other
+# detector's.
+HOOK_DENIAL_DDL = (
+    "CREATE TABLE IF NOT EXISTS hook_denial("
+    "rule_id TEXT NOT NULL, tool TEXT NOT NULL, ts_utc TEXT NOT NULL, "
+    "session_id TEXT NOT NULL)"
+)
+HOOK_DENIAL_TS_INDEX_DDL = (
+    "CREATE INDEX IF NOT EXISTS hook_denial_ts_idx ON hook_denial(ts_utc)"
+)
+
+
 # --- versioned migrations (plan §8.4) -------------------------------------
 
 SCHEMA_VERSION_KEY = "schema_version"
@@ -401,6 +423,11 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
             ),
         ),
         Migration(7, "gate_gap_evidence", (GATE_GAP_DDL, GATE_GAP_OBS_INDEX_DDL)),
+        Migration(
+            8,
+            "hook_denial_evidence",
+            (HOOK_DENIAL_DDL, HOOK_DENIAL_TS_INDEX_DDL),
+        ),
     )
 )
 

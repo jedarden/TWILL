@@ -40,10 +40,13 @@ EWMA_BAND_SIGMAS = 2.0
 _REFERENCE_TABLES = ("observation", "rule_doc", "session_usage")
 # Detector evidence tables the weekly replay must carry into the filtered
 # copy alongside the corpus: D-10's cluster SQL joins the catalog reader's
-# gate_gap rows (§6.5) exactly as every other detector joins observation.
-# Its observation join scopes each replay to one week before the in-memory
-# copy, so a large historical evidence table does not multiply replay cost.
-_EVIDENCE_TABLES = ("gate_gap",)
+# gate_gap rows (§6.5) exactly as every other detector joins observation,
+# and D-04's reads the denial reader's hook_denial rows directly.  D-10's
+# observation join scopes each replay to one week before the in-memory
+# copy, so a large historical evidence table does not multiply replay cost;
+# D-04 supplies weekly-hit SQL, so its replay path is the live query and
+# the copy only serves the fallback for a registry without one.
+_EVIDENCE_TABLES = ("gate_gap", "hook_denial")
 _WEEKLY_UPSERT = """
 INSERT INTO cluster_week(detector_id, key, week, sessions, events)
 VALUES (?, ?, ?, ?, ?)
@@ -175,7 +178,10 @@ def _filtered_has_detector_data(
 ) -> bool:
     if connection.execute("SELECT 1 FROM observation LIMIT 1").fetchone() is not None:
         return True
-    for table in ("rule_doc", "session_usage"):
+    # A detector can read non-corpus tables too: D-08/D-09 read the rule
+    # corpus, and the §6.5 evidence tables are what D-10 joins and D-04
+    # groups — an empty observation copy says nothing about their input.
+    for table in ("rule_doc", "session_usage", "gate_gap", "hook_denial"):
         if table in detector.cluster_sql and connection.execute(
             f"SELECT 1 FROM {table} LIMIT 1"
         ).fetchone() is not None:

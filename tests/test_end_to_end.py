@@ -191,6 +191,29 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
         memory = cls.claude_dir / "memory" / "MEMORY.md"
         memory.parent.mkdir(parents=True, exist_ok=True)
         memory.write_text("# Memory\n\n- Prefer precise staging paths.\n")
+        # The denial log is D-04's corpus input (§6.5): plant one whose only
+        # rule is denied twice within a single session — below the two
+        # distinct sessions the detector requires — so every detector runs
+        # cleanly over the corpus with zero clusters.
+        denials = cls.home / ".local" / "state" / "org-rule-guard"
+        denials.mkdir(parents=True, exist_ok=True)
+        (denials / "denials.jsonl").write_text(
+            "\n".join(
+                json.dumps(
+                    {
+                        "ts": "2026-09-20T18:00:0" + str(offset) + "Z",
+                        "rule_id": "never-force-push",
+                        "tool": "Bash",
+                        "cwd": "/workspace/demo",
+                        "session_id": "claude-clean-001",
+                        "fragment": "git push --force origin main",
+                    }
+                )
+                for offset in (0, 1)
+            )
+            + "\n",
+            encoding="utf-8",
+        )
 
     @classmethod
     def _stage_by_source(cls, source: str, name: str, data: bytes) -> None:

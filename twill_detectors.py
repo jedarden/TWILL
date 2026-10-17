@@ -1524,6 +1524,92 @@ GATE_GAP = Detector(
 )
 
 
+# D-04 reads the org-rule-guard denial log's evidence table (§6.5), not the
+# transcript corpus: denials exist nowhere else, because CLAUDE.md's own
+# statement of the rules is itself indexed text.  Like D-10 it cannot
+# degrade — without the log it is skipped with the reason, and its clusters
+# survive untouched until the input returns.  The recurrence threshold is
+# the same N = 2 distinct sessions as D-01/D-02: one denial is the gate
+# working; the same rule denied across sessions is the friction TWILL looks
+# for.
+HOOK_DENIAL_SQL = """
+    SELECT 'hook-denial:' || rule_id AS key,
+           count(DISTINCT session_id) AS sessions,
+           count(*) AS events,
+           min(ts_utc) AS first_seen,
+           max(ts_utc) AS last_seen
+    FROM hook_denial
+    WHERE ts_utc >= :window_start_utc
+    GROUP BY rule_id
+    HAVING count(DISTINCT session_id) >= 2
+    ORDER BY sessions DESC, last_seen DESC, key ASC
+"""
+
+HOOK_DENIAL_HIT_SQL = """
+    SELECT 'hook-denial:' || rule_id AS key, session_id
+    FROM hook_denial
+    WHERE ts_utc >= :window_start_utc
+    GROUP BY rule_id, session_id
+    ORDER BY key ASC, session_id ASC
+"""
+
+HOOK_DENIAL_WEEK_HIT_SQL = """
+    WITH qualifying AS (
+      SELECT rule_id, session_id, ts_utc
+      FROM hook_denial
+      WHERE ts_utc >= :window_start_utc
+    ),
+    qualifying_rules AS (
+      SELECT rule_id
+      FROM qualifying
+      GROUP BY rule_id
+      HAVING count(DISTINCT session_id) >= 2
+    )
+    SELECT substr('hook-denial:' || qualifying.rule_id, 1, 240) AS key,
+           strftime('%G-W%V', qualifying.ts_utc) AS week
+    FROM qualifying
+    JOIN qualifying_rules USING (rule_id)
+    GROUP BY substr('hook-denial:' || qualifying.rule_id, 1, 240),
+             strftime('%G-W%V', qualifying.ts_utc)
+    ORDER BY key ASC, week ASC
+"""
+
+HOOK_DENIAL_WEEKLY_HIT_SQL = """
+    WITH qualifying AS (
+      SELECT rule_id, session_id, ts_utc
+      FROM hook_denial
+      WHERE ts_utc >= :window_start_utc
+        AND ts_utc < :window_end_utc
+    ),
+    qualifying_rules AS (
+      SELECT rule_id
+      FROM qualifying
+      GROUP BY rule_id
+      HAVING count(DISTINCT session_id) >= 2
+    )
+    SELECT substr('hook-denial:' || qualifying.rule_id, 1, 240) AS key,
+           strftime('%G-W%V', qualifying.ts_utc) AS week,
+           count(DISTINCT qualifying.session_id) AS sessions,
+           count(*) AS events
+    FROM qualifying
+    JOIN qualifying_rules USING (rule_id)
+    GROUP BY substr('hook-denial:' || qualifying.rule_id, 1, 240),
+             strftime('%G-W%V', qualifying.ts_utc)
+    ORDER BY key ASC, week ASC
+"""
+
+HOOK_DENIAL = Detector(
+    "D-04",
+    1,
+    "org-rule-guard hook denials grouped by rule across sessions — a rule "
+    "the gate keeps having to enforce",
+    HOOK_DENIAL_SQL,
+    session_hits_sql=HOOK_DENIAL_HIT_SQL,
+    week_hits_sql=HOOK_DENIAL_WEEK_HIT_SQL,
+    weekly_hits_sql=HOOK_DENIAL_WEEKLY_HIT_SQL,
+)
+
+
 # The shipped catalog.  Phase 2's detector beads (D-01 missing binary, D-02
 # recurring error signature, ... D-10 ICG gate gap) append their entries here;
 # an entry leaves this tuple when its successor version lands.
@@ -1531,6 +1617,7 @@ REGISTRY: tuple[Detector, ...] = build_registry(
     MISSING_BINARY,
     RECURRING_ERROR_SIGNATURE,
     RETRY_LOOP,
+    HOOK_DENIAL,
     REJECTED_TOOL_CALL,
     INTERRUPT_CORRECTION,
     REDISCOVERY,

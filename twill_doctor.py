@@ -22,6 +22,7 @@ from urllib.parse import quote
 
 import twill_detectors
 import twill_catalog
+import twill_denials
 import twill_digest
 import twill_reader
 import twill_rulecorpus
@@ -76,6 +77,7 @@ SELFTEST_EXPECTED_CLUSTERS = {
     "D-01": 1,
     "D-02": 1,
     "D-03": 1,
+    "D-04": 1,
     "D-05": 1,
     "D-06": 1,
     "D-07": 1,
@@ -360,6 +362,8 @@ def _check_database_schema(
             required_tables.append("cluster_session")
         if expected >= 7:
             required_tables.append("gate_gap")
+        if expected >= 8:
+            required_tables.append("hook_denial")
         for table in required_tables:
             connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
     except Exception as exc:
@@ -859,6 +863,101 @@ def _check_dead_man_switch(
         "dead_man_switch",
         BROKEN,
         "dead-man's switch: transcript files arrived but zero observations were ingested in the last 24 hours",
+        details,
+    )
+
+
+def _check_host_coverage(
+    connection: sqlite3.Connection | None,
+    open_error: str | None,
+    now: datetime,
+) -> CheckResult:
+    """Phase 7: report per-host coverage and flag hosts gone silent.
+
+    The contract (``docs/notes/host-report-contract.md``, "Doctor's per-host
+    coverage") pins this check to the accepted host reports the Phase 7
+    importer stores: a host's ``generated_at`` and ``last_ingest_success_at``
+    heartbeats, never a file mtime or the most recent event timestamp — a
+    quiet host that still publishes empty snapshots is healthy.  A stale or
+    silent remote host degrades the check and never fails the run (exit 1,
+    not exit 2); local corruption keeps the existing BROKEN semantics.
+
+    The expected-host roster arrives with the importer's configuration
+    surface, so until that lands this check evaluates whatever accepted
+    reports exist and stays healthy when there are none — an expected host
+    that has never reported cannot be named without a roster.
+    """
+
+    import twill_crosshost
+
+    if connection is None:
+        return _result(
+            "host_coverage",
+            BROKEN,
+            f"database unavailable: {open_error or 'could not open state database'}",
+            {"error": open_error or "could not open state database"},
+        )
+    if not twill_crosshost.host_reports_imported(connection):
+        return _result(
+            "host_coverage",
+            HEALTHY,
+            "no accepted host reports yet",
+            {"hosts": {}},
+        )
+    try:
+        reports = connection.execute(
+            "SELECT host_id, generated_at, last_ingest_success_at, window_end "
+            "FROM host_report WHERE signature_scheme = ? ORDER BY host_id",
+            (twill_crosshost.SIGNATURE_SCHEME,),
+        ).fetchall()
+    except Exception as exc:
+        return _result(
+            "host_coverage",
+            BROKEN,
+            f"accepted host reports cannot be read: {_exception_text(exc)}",
+            {"error": _exception_text(exc)},
+        )
+
+    hosts: dict[str, object] = {}
+    stale_hosts: list[str] = []
+    for row_index, row in enumerate(reports):
+        if len(row) != 4 or not isinstance(row[0], str) or not row[0]:
+            return _result(
+                "host_coverage",
+                BROKEN,
+                f"host report row {row_index} has an invalid shape",
+                {"row": row_index},
+            )
+        host_id, generated_at, ingested_at, window_end = row
+        state, reason = twill_crosshost.freshness(
+            str(generated_at), str(ingested_at), now
+        )
+        hosts[host_id] = {
+            "state": state,
+            "reason": reason,
+            "generated_at": generated_at,
+            "last_ingest_success_at": ingested_at,
+            "last_covered_date": window_end,
+        }
+        if state == "stale_host":
+            stale_hosts.append(host_id)
+
+    details: dict[str, object] = {
+        "hosts": hosts,
+        "stale_hosts": stale_hosts,
+    }
+    if not stale_hosts:
+        return _result(
+            "host_coverage",
+            HEALTHY,
+            f"{len(hosts)} accepted host report(s), none stale",
+            details,
+        )
+    return _result(
+        "host_coverage",
+        DEGRADED,
+        f"{len(stale_hosts)} of {len(hosts)} accepted host report(s) stale: "
+        + ", ".join(redact_text(host) for host in stale_hosts),
         details,
     )
 
@@ -1406,17 +1505,33 @@ def _seed_selftest_fixture(connection: sqlite3.Connection, now: datetime) -> Non
     twill_catalog.materialize_gate_gaps(
         connection, fixture_catalog, window_days=SELFTEST_WINDOW_DAYS, now=now
     )
+    # D-04 (hook denial): one rule denied in two sessions inside the window,
+    # plus a single-session rule the two-session bar must exclude and an
+    # out-of-window denial of the qualifying rule.  The rows are seeded
+    # directly — the fixture is local and deterministic, so doctor never
+    # reads the host's rolling log.
+    for rule_id, session_id, days_ago in (
+        ("selftest-mutating-kubectl", "selftest-h", 1.0),
+        ("selftest-mutating-kubectl", "selftest-i", 2.0),
+        ("selftest-latest-image-tag", "selftest-h", 1.0),
+        ("selftest-mutating-kubectl", "selftest-h", SELFTEST_WINDOW_DAYS + 10.0),
+    ):
+        connection.execute(
+            "INSERT INTO hook_denial(rule_id, tool, ts_utc, session_id) "
+            "VALUES (?, 'Bash', ?, ?)",
+            (rule_id, (now - timedelta(days=days_ago)).isoformat(), session_id),
+        )
 
 
 def _selftest_fixture(now: datetime) -> sqlite3.Connection:
     """Build the in-memory fixture the self-test replays the registry over.
 
     The schema is exactly what a fresh state database would carry — the v1
-    baseline plus the post-v1 tables the corpus has grown (today, D-10's
-    ``gate_gap`` evidence) — so a detector whose SQL no longer matches the
-    shipped tables or columns fails here before a digest is built from it.
-    ``:memory:`` keeps the doctor surface read-only: no file, no lock, no
-    state-directory side effects.
+    baseline plus the post-v1 tables the corpus has grown (D-10's
+    ``gate_gap`` and D-04's ``hook_denial`` evidence) — so a detector whose
+    SQL no longer matches the shipped tables or columns fails here before a
+    digest is built from it.  ``:memory:`` keeps the doctor surface
+    read-only: no file, no lock, no state-directory side effects.
     """
 
     connection = sqlite3.connect(":memory:")
@@ -1424,6 +1539,8 @@ def _selftest_fixture(now: datetime) -> sqlite3.Connection:
         connection.executescript(twill_schema.V1_SCHEMA)
         connection.execute(twill_schema.GATE_GAP_DDL)
         connection.execute(twill_schema.GATE_GAP_OBS_INDEX_DDL)
+        connection.execute(twill_schema.HOOK_DENIAL_DDL)
+        connection.execute(twill_schema.HOOK_DENIAL_TS_INDEX_DDL)
         _seed_selftest_fixture(connection, now)
     except BaseException:
         connection.close()
@@ -1831,6 +1948,7 @@ def run_doctor(
     if reader_registry is None:
         reader_registry = (
             twill_catalog.register_reader(),
+            twill_denials.register_reader(),
             *twill_reader.READER_REGISTRY,
         )
     effective_reader_registry = twill_reader.build_reader_registry(*reader_registry)
@@ -1850,6 +1968,7 @@ def run_doctor(
         cursor = _check_cursor_health(connection, open_error)
         rule_corpus = _check_rule_corpus(connection, open_error)
         dead_man = _check_dead_man_switch(connection, open_error, reference)
+        host_coverage = _check_host_coverage(connection, open_error, reference)
         parse_drift = _check_parse_shape_drift(connection, open_error)
     finally:
         if connection is not None:
@@ -1870,6 +1989,7 @@ def run_doctor(
             cursor,
             rule_corpus,
             dead_man,
+            host_coverage,
             parse_drift,
             self_test,
             optional_inputs,
