@@ -104,6 +104,32 @@ class CatalogParserTests(unittest.TestCase):
                 document(always=[always_event(), always_event()])
             )
 
+    def test_rewrite_presence_is_pinned_to_the_updated_input_channel(self):
+        def rewritten(event_id, **kwargs):
+            event = never_event(event_id, **kwargs)
+            event["action"] = "updated_input"
+            event["sanctioned_alternative"]["rewrite"] = f"git push --lease {event_id}"
+            return event
+
+        lying_deny = document(never=[rewritten("deny-with-rewrite")])
+        lying_deny["never"][0]["action"] = "deny"
+        with self.assertRaisesRegex(twill_catalog.CatalogError, "updated_input channel"):
+            twill_catalog.parse_catalog(lying_deny)
+        empty_rewrite = document(never=[never_event("rewrite-channel-without-rewrite")])
+        empty_rewrite["never"][0]["action"] = "updated_input"
+        with self.assertRaisesRegex(twill_catalog.CatalogError, "updated_input channel"):
+            twill_catalog.parse_catalog(empty_rewrite)
+        paired = document(
+            never=[rewritten("rewritten", pack="pack-a"), rewritten("force", pack="pack-b")],
+            always=[always_event(pack="pack-a")],
+        )
+        catalog = twill_catalog.parse_catalog(paired)
+        self.assertEqual(catalog.digest, paired["catalog_digest"])
+        self.assertEqual(
+            catalog.never[1].sanctioned_alternative["rewrite"],
+            "git push --lease force",
+        )
+
 
 class CatalogCommandTests(unittest.TestCase):
     def completed(self, value, returncode=0, stderr=""):

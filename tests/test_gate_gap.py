@@ -212,6 +212,12 @@ class GateGapMatcherTests(unittest.TestCase):
                 id="rewritten",
                 action="updated_input",
                 match={"regex": r"^git"},
+                # The rewrite channel owes a rewrite (contract pin): an
+                # updated_input event without one is not a valid document.
+                sanctioned_alternative={
+                    "reason": "use the safe path instead",
+                    "rewrite": "git push --lease origin main",
+                },
             ),
             never(
                 id="annotated",

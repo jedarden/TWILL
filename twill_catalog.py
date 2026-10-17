@@ -270,6 +270,14 @@ def _event(value: object, *, never: bool) -> CatalogEvent:
     _string(alternative["reason"], "event.sanctioned_alternative.reason")
     if "rewrite" in alternative and not isinstance(alternative["rewrite"], str):
         raise CatalogError("event.sanctioned_alternative.rewrite must be a string")
+    # The rewrite template exists only where the engine substitutes input;
+    # ICG pins its presence to the channel ("a rewrite on a deny would be a
+    # lying catalog entry"), so a document that splits them is not v1/v2.
+    if ("rewrite" in alternative) != (action == "updated_input"):
+        raise CatalogError(
+            "event.sanctioned_alternative.rewrite presence must match the "
+            "updated_input channel"
+        )
     return CatalogEvent(
         event_id,
         pack,
