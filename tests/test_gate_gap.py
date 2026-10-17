@@ -833,6 +833,15 @@ class DetectCommandGateGapTests(unittest.TestCase):
             never(),
             never(id="content", check="content_regex", match={"regex": "secret"}),
         )
+        connection = twill_schema.connect(self.state_dir)
+        seed_observation(
+            connection,
+            session_id="s1",
+            kind="run_succeeded",
+            command="git push --force origin main",
+        )
+        connection.commit()
+        connection.close()
         captured = StringIO()
         with mock.patch.object(twill_detectors, "REGISTRY", (twill_detectors.GATE_GAP,)):
             with mock.patch.object(
@@ -845,9 +854,20 @@ class DetectCommandGateGapTests(unittest.TestCase):
 
         self.assertEqual(code, EXIT_SUCCESS)
         envelope = json.loads(captured.getvalue())
+        self.assertEqual(envelope["data"]["detectors"][0]["status"], "ok")
+        self.assertEqual(envelope["data"]["detectors"][0]["clusters"], 1)
+        self.assertEqual(envelope["data"]["catalog"]["gate_gap_evidence"], 1)
         self.assertEqual(envelope["data"]["catalog"]["gate_gap_events_evaluated"], 1)
         self.assertEqual(envelope["data"]["catalog"]["gate_gap_events_unobservable"], 1)
         self.assertTrue(any("cannot evaluate 1" in item for item in envelope["warnings"]))
+        connection = sqlite3.connect(self.state_dir / "twill.db")
+        try:
+            self.assertEqual(
+                [row[1] for row in cluster_rows(connection)],
+                ["gate-gap:pack-a:never-one"],
+            )
+        finally:
+            connection.close()
 
     def test_detect_reports_the_skip_on_the_human_surface(self):
         absent = twill_catalog.CatalogRead("absent", reason="no icg on PATH")

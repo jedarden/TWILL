@@ -1821,9 +1821,10 @@ def _check_optional_inputs(
 
     The readers own their predicates because they know how to identify their
     external input.  Doctor only evaluates the registry and renders a stable
-    summary.  A missing input is expected and therefore healthy; a predicate
-    that cannot answer is degraded so the operator does not mistake an
-    unreadable probe for a clean absence.
+    summary.  A missing input is expected and therefore does not degrade the
+    doctor run, but its own status is degraded so the operator can see that
+    the input-dependent detector cannot currently run. A predicate that
+    cannot answer also marks that input degraded and degrades the check.
     """
 
     inputs: dict[str, dict[str, object]] = {}
@@ -1841,9 +1842,16 @@ def _check_optional_inputs(
             live = False
             error = _exception_text(exc)
             probe_errors.append(reader.name)
-            inputs[reader.name] = {"live": False, "error": error}
+            inputs[reader.name] = {
+                "live": False,
+                "status": DEGRADED,
+                "error": error,
+            }
         else:
-            inputs[reader.name] = {"live": live}
+            inputs[reader.name] = {
+                "live": live,
+                "status": "live" if live else DEGRADED,
+            }
 
         if live:
             live_inputs.append(reader.name)
@@ -1881,7 +1889,8 @@ def _check_optional_inputs(
         "optional_inputs",
         HEALTHY,
         f"{len(live_inputs)} of {len(inputs)} optional input(s) live; "
-        f"{len(absent_inputs)} absent",
+        f"{len(absent_inputs)} absent/degraded"
+        + (f" ({', '.join(absent_inputs)})" if absent_inputs else ""),
         details,
     )
 

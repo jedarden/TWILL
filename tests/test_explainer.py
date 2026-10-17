@@ -1238,6 +1238,10 @@ class ExplainerTestCase(unittest.TestCase):
             twill_explainer.PromptCluster(
                 self.cluster("cross-host", detector_id="D-11"), (self.excerpt(5),)
             ),
+            twill_explainer.PromptCluster(
+                self.cluster("gate-gap:sample:never-event", detector_id="D-10"),
+                (self.excerpt(6),),
+            ),
         ]
 
         prompt = twill_explainer.build_prompt(clusters)
@@ -1247,6 +1251,7 @@ class ExplainerTestCase(unittest.TestCase):
         self.assertNotIn("D-01:drafted", prompt)
         self.assertNotIn("D-01:dismissed", prompt)
         self.assertNotIn("D-11:cross-host", prompt)
+        self.assertNotIn("D-10:gate-gap:sample:never-event", prompt)
         self.assertEqual(prompt.count(twill_explainer.EXCERPT_BEGIN), 1)
 
     def test_hard_candidate_gates_override_inconsistent_markers(self):
@@ -1693,6 +1698,34 @@ class ExplainerTestCase(unittest.TestCase):
             [(row.detector_id, row.key) for row in candidates],
             [("D-02", "local-failure")],
         )
+
+    def test_db_candidate_loader_excludes_gate_gap_before_limit(self):
+        connection = twill_schema.connect(self.root / "state")
+        self.addCleanup(connection.close)
+        self.seed_cluster_row(
+            connection, detector_id="D-10", key="gate-gap:sample:never-event"
+        )
+        self.seed_cluster_row(connection)
+        self.seed_observation(
+            connection, "local-session", datetime(2026, 9, 5, tzinfo=timezone.utc)
+        )
+        connection.execute(
+            "UPDATE cluster SET score = 50.0 WHERE detector_id = 'D-10'"
+        )
+        connection.commit()
+
+        candidates = twill_explainer.load_candidate_clusters(connection, top_k=1)
+        prompt_candidates = twill_explainer.load_candidate_prompt_clusters(
+            connection, top_k=1
+        )
+
+        self.assertEqual(
+            [(row.detector_id, row.key) for row in candidates],
+            [("D-01", "command-not-found:sqlite3")],
+        )
+        self.assertEqual(len(prompt_candidates), 1)
+        self.assertEqual(prompt_candidates[0].cluster, candidates[0])
+        self.assertEqual(prompt_candidates[0].excerpts[0].session_id, "local-session")
 
     def test_prompt_candidate_loader_excludes_unsupported_missing_and_blank_evidence(self):
         connection = twill_schema.connect(self.root / "state")

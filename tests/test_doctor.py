@@ -7,6 +7,7 @@ import unittest
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from types import SimpleNamespace
+from unittest import mock
 
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -14,6 +15,7 @@ CLI = ROOT / "twill"
 sys.path.insert(0, str(ROOT))
 
 import twill_crosshost  # noqa: E402
+import twill_catalog  # noqa: E402
 import twill_detectors  # noqa: E402
 import twill_digest  # noqa: E402
 import twill_doctor  # noqa: E402
@@ -70,6 +72,18 @@ class DoctorChecksTests(unittest.TestCase):
             ],
         )
         self.assertTrue(all(check.status == twill_doctor.HEALTHY for check in report.checks))
+
+    def test_missing_icg_catalog_is_reported_without_failing_doctor(self):
+        with mock.patch.object(twill_catalog, "catalog_live", return_value=False):
+            report = self.healthy_report()
+
+        self.assertEqual(report.exit_code, twill_doctor.EXIT_HEALTHY)
+        inputs = self.check(report, "optional_inputs")
+        self.assertEqual(inputs.status, twill_doctor.HEALTHY)
+        self.assertEqual(
+            inputs.details["inputs"]["icg_catalog"],
+            {"live": False, "status": twill_doctor.DEGRADED},
+        )
 
     def test_ingest_budget_miss_is_broken_and_keeps_the_last_success(self):
         self.create_database()
@@ -1161,6 +1175,22 @@ class OptionalInputLivenessTests(unittest.TestCase):
         self.assertEqual(check.details["live"], 0)
         self.assertEqual(check.details["absent"], 1)
         self.assertEqual(check.details["absent_inputs"], ["icg_catalog"])
+        self.assertEqual(
+            check.details["inputs"]["icg_catalog"],
+            {"live": False, "status": twill_doctor.DEGRADED},
+        )
+        self.assertIn("icg_catalog", check.message)
+
+    def test_icg_catalog_reader_reports_live_when_available(self):
+        registry = twill_reader.build_reader_registry(
+            twill_reader.ReaderRegistration("icg_catalog", lambda: True),
+        )
+        check = self.optional_inputs(self.report(registry))
+        self.assertEqual(check.status, twill_doctor.HEALTHY)
+        self.assertEqual(
+            check.details["inputs"]["icg_catalog"],
+            {"live": True, "status": "live"},
+        )
 
     def test_registry_reports_live_and_absent_inputs_without_degrading(self):
         registry = twill_reader.build_reader_registry(
@@ -1175,7 +1205,10 @@ class OptionalInputLivenessTests(unittest.TestCase):
         self.assertEqual(check.details["absent_inputs"], ["receipts"])
         self.assertEqual(
             check.details["inputs"],
-            {"catalog": {"live": True}, "receipts": {"live": False}},
+            {
+                "catalog": {"live": True, "status": "live"},
+                "receipts": {"live": False, "status": twill_doctor.DEGRADED},
+            },
         )
         self.assertIn("1 of 2", check.message)
         self.assertIn("1 absent", check.message)
@@ -1193,7 +1226,13 @@ class OptionalInputLivenessTests(unittest.TestCase):
         self.assertEqual(check.details["probe_errors"], ["denials"])
         self.assertEqual(
             check.details["inputs"],
-            {"denials": {"live": False, "error": "probe unavailable"}},
+            {
+                "denials": {
+                    "live": False,
+                    "status": twill_doctor.DEGRADED,
+                    "error": "probe unavailable",
+                }
+            },
         )
 
     def test_registry_rejects_duplicate_reader_names(self):

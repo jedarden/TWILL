@@ -259,6 +259,25 @@ class RankerTestCase(unittest.TestCase):
         cross_host = next(row for row in ranking.all_clusters if row.detector_id == "D-11")
         self.assertFalse(cross_host.new_lesson_candidate)
 
+    def test_gate_gap_is_visible_but_does_not_take_a_lesson_slot(self):
+        self.add_cluster(
+            "gate-gap:sample:never-event", detector_id="D-10", sessions=20, events=20
+        )
+        self.add_cluster("local-failure", detector_id="D-02", sessions=2, events=2)
+
+        ranking = self.rank(top_k=1).ranking
+
+        self.assertEqual(
+            [(row.detector_id, row.key) for row in ranking.clusters],
+            [("D-02", "local-failure")],
+        )
+        gate_gap = next(
+            row for row in ranking.all_clusters if row.detector_id == "D-10"
+        )
+        self.assertGreater(gate_gap.score, ranking.clusters[0].score)
+        self.assertFalse(gate_gap.new_lesson_candidate)
+        self.assertIn(gate_gap, ranking.suppressed_clusters)
+
     def test_score_and_coverage_rollback_together(self):
         rules = self.root / "rules"
         rules.mkdir()

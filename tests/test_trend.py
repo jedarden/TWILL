@@ -50,6 +50,57 @@ class WeeklyClusterTests(unittest.TestCase):
         self.connection = twill_schema.connect(Path(temporary.name) / "state")
         self.addCleanup(self.connection.close)
 
+    def test_gate_gap_replays_into_weekly_series_and_trend(self):
+        for session_id, day, kind, command in (
+            ("a", 14, "run_succeeded", "protected command"),
+            ("a", 15, "run_failed", "protected command"),
+            ("b", 21, "run_succeeded", "protected command"),
+            ("c", 22, "tool_error", "protected command"),
+        ):
+            observed_at = datetime(2026, 9, day, 10, tzinfo=timezone.utc)
+            cursor = self.connection.execute(
+                "INSERT INTO observation(session_id, ts_utc, ts_local, kind, command) "
+                "VALUES (?, ?, ?, ?, ?)",
+                (
+                    session_id,
+                    observed_at.isoformat(),
+                    observed_at.isoformat(),
+                    kind,
+                    command,
+                ),
+            )
+            self.connection.execute(
+                "INSERT INTO gate_gap(pack, id, obs_id, catalog_digest) "
+                "VALUES ('sample', 'never-event', ?, ?)",
+                (cursor.lastrowid, "0" * 64),
+            )
+        self.connection.commit()
+
+        run = twill_detectors.run_detectors(
+            self.connection,
+            window_days=30,
+            registry=(twill_detectors.GATE_GAP,),
+            now=NOW,
+        )
+
+        self.assertEqual(run.exit_code, 0, run.outcomes)
+        self.assertEqual(
+            self.connection.execute(
+                "SELECT detector_id, key, week, sessions, events FROM cluster_week "
+                "ORDER BY week"
+            ).fetchall(),
+            [
+                ("D-10", "gate-gap:sample:never-event", "2026-W38", 1, 2),
+                ("D-10", "gate-gap:sample:never-event", "2026-W39", 1, 1),
+            ],
+        )
+        report = twill_trend.build_trend_report(self.connection, detector="D-10")
+        self.assertEqual(report.detector_ids, ("D-10",))
+        self.assertEqual(
+            [(finding.detector_id, finding.key) for finding in report.findings],
+            [("D-10", "gate-gap:sample:never-event")],
+        )
+
     def test_weekly_rows_group_distinct_sessions_and_events_per_iso_week(self):
         for session_id, timestamp in (
             ("a", datetime(2026, 9, 14, 10, tzinfo=timezone.utc)),
