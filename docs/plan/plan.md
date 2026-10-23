@@ -5,7 +5,7 @@
 
 **Type:** Greenfield
 **Status:** Draft
-**Last updated:** 2026-09-19
+**Last updated:** 2026-10-23
 
 ---
 
@@ -26,6 +26,13 @@ the existing graph, `sqlite3: command not found` appeared in 1,096 distinct sess
 `bf: command not found` in 697, and `go: command not found` in 632. All three were eventually
 fixed on the host, but only after thousands of sessions had paid for them — and nothing recorded
 that the fix worked. TWILL is the missing loop.
+
+**Authorized extension (2026-10-23):** execution-continuity analysis also finds avoidable human
+interventions: an agent requesting settled approval, offering an authorized next action instead of
+performing it, leaving a known in-scope defect optional, abandoning an outcome after a status
+question, or declaring a blocker contradicted by recorded evidence. Phase 9 adds this capability
+to the same detect, review and measure loop. The mechanism and synthetic fixtures are public;
+source conversations, evidence bundles, adjudications and generated learnings remain private.
 
 Two constraints shaped the design before any code: it must be **independent of transcript
 ingestion** (a distiller failure must never touch capture, and learning must not be triggered by
@@ -59,6 +66,9 @@ successfully` 10,930 times into every worker prompt.
   lab, bench, and agent-sandbox come in Phase 7 by host-local distillation reporting up through the
   private artifacts repository (§7.3, Open Question 4), never through the archive's `mirror/`, and
   never by copying transcripts off the host that produced them.
+- **No execution supervisor or new permission authority.** Phase 9 observes behavior; it never
+  resumes an agent, admits a proposal, answers a permission request, changes a budget, releases a
+  hold, or installs a proposed fix. Reversibility alone does not establish authorization.
 - **Not a dashboard.** The deliverable is a markdown digest and a CLI. A web surface can be built
   later on the same store if the digest proves worth reading.
 - **This repository never holds a distilled artifact.** TWILL is public; what it produces is not.
@@ -110,7 +120,9 @@ are binding; in lowercase prose they are descriptive.
 - **Observation** — one durable derived row extracted from a transcript: a failed command, an error
   signature, a hook denial, a rejected tool call, an interrupt, a file read. The atom of evidence.
 - **Detector** — a named, versioned SQL query (`D-01` … ) over observations that emits candidate
-  findings. A detector is both how a problem is found and how its disappearance is later proven.
+  findings. A detector is both how a problem is found and how its recurrence is later measured.
+  Phase 9 separates a candidate signal from a supported finding; a phrase or an idle turn alone
+  never establishes an autonomy failure.
 - **Cluster** — observations grouped by `(detector_id, normalized_key)`, scored and ranked. The unit
   a human reviews.
 - **Lesson** — a reviewed, redacted, committed markdown document describing one recurring problem,
@@ -126,6 +138,12 @@ are binding; in lowercase prose they are descriptive.
   **escalation**, not a new lesson.
 - **Escalation** — moving an already-enacted lesson one layer stronger because measurement shows the
   problem did not stop.
+- **Execution episode** — a derived, source-linked objective and its captured authority, pending
+  actions, decisions, waits and outcome across related turns. A status question does not by itself
+  end an episode; an explicit cancellation, replacement or completion does.
+- **Autonomy candidate** — a versioned signal with supporting and disconfirming source references.
+  Its disposition is `supported`, `needs_review` or `dismissed`; unknown authority is `needs_review`,
+  never assumed approval. A supported disposition still requires normal human lesson acceptance.
 - **Digest** — the weekly markdown report of ranked clusters, lesson state changes, and measurements.
 
 ## 5. Acceptance Scenarios
@@ -184,6 +202,42 @@ are binding; in lowercase prose they are descriptive.
   Explain prompt file returns nothing; the test fails the build if it returns anything.
 - **Fail:** any fixture value appears anywhere outside the fixture file itself.
 
+### Scenario 5: An authorized next action survives a status question
+
+- **Setup:** synthetic Claude and Codex sessions capture a user request to create two documents,
+  a pending second document, a later progress question, and a terminal assistant offer to create
+  that same document only after another approval. One fixture includes the user's answer to an
+  interactive question inside a tool result; another includes a later scope-equivalent restart.
+- **Action:** ordinary ingest, autonomy detection, review, rank, Explain dry-run and digest.
+- **Pass:** the evidence links the original request, actual answer, pending action, terminal offer
+  and any restart; the status question does not replace the objective. The candidate appears with
+  its disposition and exact reproduction command. Only supported evidence can draft a lesson.
+- **Fail:** the approval answer is omitted, a tool-result wrapper is treated as a new human request,
+  an intermediate async question is mistaken for a terminal reply, or a phrase alone proves failure.
+
+### Scenario 6: Necessary approval and incomplete evidence cause abstention
+
+- **Setup:** paired synthetic sessions use the same offer wording, but the next action respectively
+  expands scope, has an unresolved permission hold, requires a purchase or physical intervention,
+  follows a cancellation, or belongs to an advice-only request. Further fixtures lack a terminal
+  marker, refer to quoted prior instructions, or expose only today's rules for an older session.
+- **Pass:** evidenced legitimate waits are dismissed with a reason; missing authority, scope or
+  termination proof remains `needs_review` with the missing information recorded. Neither class
+  enters Explain as an established failure or contributes a supported-finding count.
+- **Fail:** reversibility, an assistant promise, user silence, a generic restart, or current policy
+  is treated as historical user authorization; a subagent handoff is counted as owner abandonment.
+
+### Scenario 7: The public mechanism generates private, measurable findings
+
+- **Setup:** public synthetic fixtures demonstrate a supported case, an ambiguous candidate and a
+  legitimate wait; a private evaluation corpus supplies operator adjudications and a dated fix.
+- **Pass:** the CLI, digest, Explain and measurement share the same evidence identities and versions;
+  evidence, adjudications and measurements resolve only to private state or external `artifacts_root`.
+  An unchanged replay is idempotent. Unknown terminal state, missing telemetry and unreviewed
+  candidates appear in denominators as unknown; an empty input never proves an intervention worked.
+- **Fail:** a real incident or generated learning reaches the public checkout, an accepted lesson
+  is silently modified, or fewer candidate phrases are reported as verified outcome improvement.
+
 ## 6. Architecture
 
 ### 6.1 Component Overview
@@ -230,7 +284,10 @@ One operation, end-to-end: the hourly ingest.
 The weekly path continues: `ranker` selects top-K uncovered clusters → `explainer` builds one
 bounded prompt (≤ 8 KB per cluster, ids and counts plus redacted excerpts) → `claude -p` returns
 strict JSON → schema validation → draft lesson files → digest markdown. The daily path is
-`measurer` only.
+`measurer` only. Phase 9 additionally derives bounded interaction records and execution episodes
+in the ingest transaction, runs deterministic candidate detectors, and passes only supported,
+source-linked evidence bundles through the existing ranking and Explain boundary. It adds no
+model call and never passes a whole session to Explain.
 
 ### 6.3 Concurrency / Execution Model
 
@@ -448,6 +505,65 @@ before any lesson file or cluster-state write.
 over the trailing 180 days, so a reviewer sees whether this is a standing problem or one bad week.
 `guard` points at the ready-to-install artifact the router generated (§9 Phase 5); TWILL never
 installs it.
+
+### 7.1.1 Phase 9 additive interaction and assessment records
+
+Keep the six existing normalized event kinds and their detector semantics stable. Add a separate
+versioned interaction contract, persisted in the same derived database and cursor transaction:
+
+- `interaction`: source identity/revision, session/thread and turn/message identity, parent/call/
+  question links, source line or native-record locator, timestamp, actor/channel, origin, terminal
+  state and bounded redacted text fields. Origins distinguish real human text, actual interactive
+  answers, assistant prose, tool results, harness bookkeeping, quoted history and sidechains.
+- `execution_episode` and source-linked assertions: objective, authority/action scope, restrictions,
+  unresolved decisions, revocation, pending actions, waits and completion. Assertions distinguish
+  captured facts from conservative inference and unknowns; assistant claims cannot grant authority.
+- `autonomy_assessment`: candidate/episode identity, detector and analyzer versions, input/evidence
+  hashes, family, disposition, reason, supporting and disconfirming references, missing information,
+  evidence strength and any explicit operator adjudication. These rows are derived, not lessons.
+
+Every free-text field is redacted before persistence and bounded to 240 decoded characters.
+Use multiple typed source-linked fields rather than copying a session into one large text value.
+Deterministically cap retained interactions at 1,000 per session and each candidate bundle at 24
+referenced records; record omitted counts and affected bounds. A cap or missing reference that
+removes material context forces `needs_review`; truncating a 240-character field follows the same
+rule when it hides scope, authority or a disconfirmer. It must not create a supported finding. Existing
+observation caps remain unchanged. All new tables are additive migrations; rewrite/shrink,
+rebuild, retention and `doctor --rescan-redaction` cover these rows with existing atomicity rules.
+
+**Private artifact compatibility decision:** preserve `twill-artifacts/v1`, its four `paths`,
+its recognized `artifacts` inventory, the accepted-lesson payload and the exact six-field
+`twill-measurement/v1` rows. Add an optional root `extensions.autonomy` object containing `schema:
+twill-autonomy-artifacts/v1`, `manifest: autonomy/manifest.json`, `bytes` and `sha256`. That sidecar
+manifest inventories only `autonomy/assessments/A-<32 lowercase hex>.jsonl` (schema
+`twill-autonomy-assessment/v1`), `autonomy/impact/YYYY-MM-DD.json` (`twill-autonomy-impact/v1`) and
+`autonomy/interventions.jsonl` (`twill-autonomy-intervention/v1`). Candidate ids hash source episode
+identity plus family; version/input hashes remain explicit fields, so re-analysis can supersede an
+assessment without creating an unrelated incident. Each inventory entry carries schema, bytes and
+SHA-256; the sidecar carries schema, producer and generated-at fields like the root manifest.
+
+This is an additive private-output extension: existing v1 readers ignore unknown root fields and
+files outside the original four namespaces as their contract already requires. New readers and
+publishers validate the extension pointer, complete sidecar inventory, schemas, safe paths, hashes,
+no-symlink rule and payloads, and stage/validate root manifest, sidecar and changed artifacts in one
+commit. Unknown extension versions fail closed for autonomy operations. Do not use or redefine the
+reserved Phase-7 `twill-artifacts/v2` or `hosts/` transport; its future root may carry the same
+additive extension independently. No external intake or recall consumer is required to understand
+autonomy output. Before enabling writes, extend `.gitignore`, the open-path audit and published-tree
+containment checks to reject `autonomy/` output in the public checkout. This stays in the existing
+private artifacts repository, with one authoritative artifact copy and a derived DB projection.
+
+**Adjudication durability decision:** each assessment journal keeps monotonically revisioned
+operator decisions, their reasons, source references and supersessions; input changes invalidate
+support rather than rewriting history. Write the private journal and valid sidecar/root manifests
+atomically through the artifact rollback boundary before updating the DB projection. A failed
+artifact publication leaves the old snapshot and no new adjudication; successful artifact publication
+followed by a DB failure leaves the journal authoritative and the command reports the failure.
+Reconcile the projection from validated artifacts before using support; a revision/hash mismatch
+excludes stale support and reports degraded coverage until reconciliation succeeds. Re-import only
+when detector/analyzer and input/evidence hashes match. Reversal or invalidation immediately removes
+current ranking, Explain and measurement eligibility without modifying immutable accepted-lesson
+content or deleting historical points. Missing assessment coverage cannot drive automatic resolution.
 
 ### 7.2 Source of Truth & Storage
 
@@ -925,6 +1041,135 @@ decided. **Superseded 2026-10-16 before it started:** WARP's live recall surface
 subsumption conditional, so the service this phase describes is not built — what remains is lesson
 delivery toward NEEDLE's kernel, gated on NEEDLE N-T09's intake contract (§16, Open Question 3).
 
+### Phase 9: Execution continuity and autonomy analysis
+
+**Admission and boundary (2026-10-23):** the operator authorized this capability and its worker
+implementation batch. This is an additive TWILL phase; Phases 0-8, existing proposal holds and the
+external lesson-delivery gate retain their current status. The scope is detection, evidence review
+and measurement. Installing learned rules or repairing an execution supervisor is separate work.
+No real session, incident narrative, project-specific policy or evaluation label is committed here.
+
+**9A — Reconstruct interactions.** Extend Claude and Codex source adapters with the separate
+§7.1.1 contract. Capture actual ordinary requests, assistant terminal replies, question/answer
+pairs including answers inside tool results, source provenance and explicit interruption states.
+Main-agent and delegated turns remain distinguishable. Deduplicate repeated provider messages;
+resolve an answer to its actual question rather than its position in a wrapper. Source-specific
+completed-turn metadata establishes terminality: `final_answer` or `end_turn`-like text alone does
+not. Missing, unknown or contradictory boundaries are retained as unknown. Use source-native
+terminal records where present. A versioned optional, operator-configured adapter may inspect the
+provider's own local history SQLite read-only to confirm a completed turn and its final item; it
+must use a consistent snapshot, refuse unsupported schema shapes, and never write or repair that
+source. This is not an archive-derived index and adds no archive dependency. Without that optional
+source, supported JSONL still ingests; uncertain terminality remains review-only.
+
+**9B — Derive outcome and authority evidence.** Build episodes from source-linked interactions,
+keeping objective, explicit authorization, scope restrictions, settled decisions, outstanding
+questions, external waits, pending actions and observed completion distinct. Carry authority across
+status exchanges and explicit same-outcome resumptions; split on a replacement, cancellation or
+material scope change. A proposal label, recorded permission hold or explicit restriction defeats
+inferred permission. Neither assistant promises, model conclusions, silence nor a later generic
+"continue" establishes original authority. Current rule documents support coverage and routing;
+only captured historical instructions/answers or a versioned instruction record with an effective
+time can establish what authority existed then. Missing historical policy stays unknown. Action
+and resource equivalence is conservative and versioned; semantic uncertainty causes abstention.
+
+**9C — Detect candidate families.** Reserve `D-12` unnecessary next-action handoff, `D-13` repeated
+approval for a settled action, `D-14` known in-scope defect offered as optional work, `D-15` status
+exchange followed by evidenced outcome abandonment, and `D-16` blocker claim contradicted by
+recorded capability/check evidence. Start each at version 1; use the existing registry, query
+families, provenance stamps and failure isolation. The existing `twill detect` first runs a
+deterministic candidate pass that writes `autonomy_assessment` independently of the registry's supported projection, so unreviewed signals
+are discoverable even when no supported cluster exists. Phrase matches shortlist candidates only.
+Use stable cross-session cluster keys from family plus normalized action/resource class, excluding
+session/episode ids, source paths and free-form prose; retain episode ids only in evidence joins.
+D-12/D-13/D-14 support needs a proven terminal reply, captured applicable authority, a concrete
+unmet action/acceptance boundary, scope-equivalent proposed continuation and no evidenced reason
+to stop. D-15 instead requires affirmative abandonment/re-approval evidence tied to the still-active
+authorized objective and the status exchange; a normal terminal status answer, or elapsed time
+without continuation, does not prove abandonment. D-16 requires a captured authorized pending
+action and the contradictory recorded check; it need not contain an offered continuation.
+D-14 requires acknowledgement of a defect that impedes the authorized outcome; extra features
+are excluded. D-16 requires an actual recorded contradiction under matching access/capability
+conditions; a check that was never run makes a claim unverified, not false. Later success with
+new credentials, new approval or changed conditions is not retroactive proof. Multiple detectors
+may reference one episode, but aggregate intervention totals deduplicate the underlying exchange.
+
+Keep `needs_review` candidates visible with omissions and disconfirming evidence. Support must
+come from conservative captured evidence or an explicit operator adjudication with a reason and
+source references; no model establishes permission or silently promotes a candidate. Registry
+cluster/session/week/weekly/backtest queries consume only version-and-hash-matching supported
+assessments, separately from candidate discovery. Dispositions are stable under unchanged replay,
+versioned, and invalidated by changed inputs. An operator may
+reverse an assessment without rewriting the immutable content of an accepted lesson.
+
+**9D — Review through existing surfaces.** Add `twill autonomy [--window 30d] [--state STATE]
+[--json]` to inspect candidates and evidence, and `twill autonomy review ID --disposition
+supported|needs_review|dismissed --reason TEXT` for explicit operator adjudication. Mutating review
+uses the existing lock, redaction, JSON/error and §7.1.1 artifact extension/durability rules. Human
+acceptance of a lesson remains a separate action. Bounded evidence bundles carry request,
+authority/answer, terminal behavior, continuation/outcome, disconfirmers, missingness, source
+locators and an exact reproduction command. Only supported findings enter lesson ranking,
+Explain, accepted-lesson backtests and supported-finding measurements; review-only candidates
+remain in a separately labeled digest/CLI section. Recurrence still requires at least two distinct
+qualifying sessions; one supported incident can be reviewed without manufacturing a lesson.
+
+Reuse the existing Explain invocation, schema validation, shared `cluster_prompt_id`, redaction,
+8 KiB per-cluster and 64 KiB total limits. It summarizes qualified evidence and proposes wording;
+it does not adjudicate authority, select a routing layer from prose, or receive raw sessions.
+Routing uses structured evidence and the established precedence. Missing proof of a deterministic
+prevention point keeps `retrieval_only`; a supported covered recurrence is an escalation. Generated
+rules and guard artifacts remain private until explicitly adopted in their owning layer.
+
+**9E — Evaluate and measure impact.** Extend existing measure/trend/digest surfaces with eligible
+execution-turn opportunities, terminal-state coverage, candidates by disposition, supported
+findings, explicit human restart/approval exchanges and unknown/unassessed counts. Store raw
+numerators and denominators by source, detector/analyzer version, time window and input coverage;
+show rates only for comparable, nonzero known denominators. Annotation-based precision/abstention
+reports use explicitly adjudicated cases, never unlabeled cases as negative examples. Report
+observable elapsed time and token/cost attribution only where matching telemetry exists; missing
+values are null, session totals are not wholly assigned to one exchange, and wall time is not
+assumed to be wasted compute. Preserve intervention timestamps and comparable before/after windows
+on the existing private measurement stream. Results show association, not automatic causal credit.
+
+All replay queries (cluster, session-hit, week-hit, weekly and backtest) use the same supported
+membership and current matching evidence versions. A changed rubric or parser requires an analyzer
+and affected detector version bump; a stored model summary never changes a count. Historical
+coverage gaps stay explicit: every replay window reports assessed/eligible coverage; absent
+supported rows alongside unassessed or invalidated candidates is unknown, never a verified zero
+or evidence for automatic resolution. No new model call, model backend, telemetry service, timer,
+supervisor, public incident dataset, auto-applied policy or extra learning store is part of this phase.
+
+**Completion criteria:** Scenarios 5-7 pass from raw-shaped synthetic source records through actual
+CLI ingest, detection, adjudication, ranking, Explain dry-run, digest and measurement. The golden
+corpus includes positives for all five families and negative controls for advice-only requests,
+scope expansion, unresolved permissions, explicit cancellation, purchases, physical actions,
+legitimate external waits, changed access, quoted instructions, worker boilerplate, delegated
+handoffs, intermediate async prompts, incomplete sources and unavailable historical authority.
+No false supported findings are allowed in those mandatory negative fixtures; ambiguous fixtures
+must abstain. Public fixtures are authored synthetically, never copied or lightly anonymized from
+real incidents. Append/rewrite/rebuild replay, retention, cap-induced abstention, secret/injection
+fixtures, read-only provider access and all existing §10.2 gates pass. Existing §12 budgets apply
+unchanged; stages report new input/coverage counters so dropped conversation evidence is visible.
+
+**Worker delivery order:** interaction reconstruction → episode/authority derivation → candidate
+families → evidence review and pipeline integration → evaluation and impact measurement. Each
+owner includes its implementation, necessary tests, public contract/docs updates and required
+verification. Shared parser/schema/registry/CLI edits are ordered by real dependencies; no bead is
+created solely to run checks. No additional permission is needed for routine implementation
+within this admitted boundary; a genuine scope expansion stays a proposal.
+
+**Admitted implementation batch (2026-10-23):** each worker depends on its predecessor;
+9A waits on planning owner `twill-0ff526bc` until this plan is verified and delivered. These
+are implementation owners under the operator request, not unapproved discovery proposals.
+
+| Slice | Owning bead | Delivered result |
+|---|---|---|
+| 9A | `twill-5b1f3778` | Reconstruct source-linked Claude and Codex execution interactions |
+| 9B | `twill-22c1d3bc` | Derive conservative execution episodes and captured authority |
+| 9C | `twill-9977ae8b` | Detect five evidence-backed autonomy failure families |
+| 9D | `twill-7c871049` | Expose private autonomy evidence review through the learning pipeline |
+| 9E | `twill-3c587c73` | Measure autonomy interventions with coverage and private adjudications |
+
 ## 10. Testing Strategy & Quality Gates
 
 ### 10.1 Test Levels
@@ -939,6 +1184,9 @@ delivery toward NEEDLE's kernel, gated on NEEDLE N-T09's intake contract (§16, 
 - **Property:** idempotency — ingest twice, assert identical rows; and monotonicity — a cursor never
   moves backwards except on an identity change.
 - **Oracle:** the Phase 2 regression oracle against known real counts (§9, Phase 2).
+- **Autonomy:** public synthetic positive/negative fixtures exercise Scenarios 5-7 end to end;
+  private operator adjudications evaluate real-world precision and intervention rates without
+  committing source evidence or treating missing labels as correct classifications.
 
 ### 10.2 Quality Gates (Stop-Ship)
 
@@ -1051,6 +1299,8 @@ twill trend    [--detector D-02] [--weeks 12] [--new-only] [--json]  # change-po
 twill brief    <repo|launch-dir> [--top 10] [--json]                 # pull-only pre-flight
 twill accept <id> | dismiss <id> --reason TEXT | apply <id> --layer LAYER [--bead ID] [--emit-guard]
 twill unapply <id>   # `un-apply` is accepted as an alias after the owning layer reverts its change
+twill autonomy [--window 30d] [--state supported|needs_review|dismissed] [--json]  # Phase 9
+twill autonomy review ID --disposition supported|needs_review|dismissed --reason TEXT
 twill measure  [--lesson ID] [--json]
 twill prune    [--older-than 180d]
 twill status   [--json]
@@ -1132,6 +1382,8 @@ triage-only summarization while routing stays manual.
 6. **Should TWILL detect fabricated work** (a bead closed with no artifact, the "fake-done" taxonomy)?
    It is the highest-value detector class and the most likely to be wrong about a human's intent.
    Owner: operator. Resolve by: Phase 6. Impact if wrong: false accusations in a digest a human reads.
+   Phase 9 does not resolve this question: an evidenced unnecessary handoff is not an accusation
+   of fabricated work, and missing artifacts or absent completion telemetry never prove fabrication.
 7. **Resolved 2026-09-28:** `utilities/friction-receipt` owns and installs the `SessionEnd` hook;
    it writes versioned receipts to `${XDG_STATE_HOME:-$HOME/.local/state}/twill/friction-receipts/`.
    TWILL owns only the read path, and the producer's format is pinned above.
@@ -1155,3 +1407,4 @@ triage-only summarization while routing stays manual.
 | 2026-09-19 | Adopted 9 of 10 `plan-idea-gen` finalists into the phases that own them (backtest P4, change-point + waste + rule-earnings P3, guard generator P5, reproduction-first digest + dead-man's switch P2, usage/shape extraction P1, `twill brief` P6, receipts as an optional input §6.5). The always/never event catalog was routed to **ICG** instead of being adopted here; `D-10` consumes it. Open Questions 7–8 added. | plan-idea-gen (bead twill-502355a3) |
 | 2026-09-24 | Locked the ordered seven-layer routing precedence, the conservative generic-error fallback, and the per-lesson `routing.reason` contract. | opencode (bead twill-dd6383a5) |
 | 2026-10-16 | Open Question 4 resolved: other hosts are covered by host-local TWILL reporting up through the §7.3 artifacts transport, never by pulling transcripts; §2's fleet-wide line and Phase 7's delivery reworded to match. | gate audit (bead twill-05a4374a) |
+| 2026-10-23 | Authorized Phase 9 autonomy analysis: bounded interaction/authority evidence, five conservative detector families, private adjudication and impact measurement; added Scenarios 5-7 and a dependency-ordered worker boundary. Public mechanism and synthetic fixtures; private inputs and generated learnings. | operator request; planning bead twill-0ff526bc |
