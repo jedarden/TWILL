@@ -9,12 +9,11 @@ failure reaches detect, rank, and Explain through the real CLI path.
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest import mock
 
@@ -49,15 +48,51 @@ class PromptInjectionFixturePipelineTests(unittest.TestCase):
 
         cls.state_dir = work / "state"
         manifest = json.loads((FIXTURE_ROOT / "manifest.json").read_text())
-        fixture_paths = {}
         for source in manifest["sources"]:
             relative = manifest["sources"][source]["cases"]["injection-bearing"]["files"][0]
             fixture = FIXTURE_ROOT / relative
             source_dir = work / "sources" / f".{source}"
             source_dir.mkdir(parents=True)
             target = source_dir / fixture.name
-            shutil.copyfile(fixture, target)
-            fixture_paths[source] = fixture
+            records = [json.loads(line) for line in fixture.read_text().splitlines() if line.strip()]
+            event_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+            for record in records:
+                if "timestamp" in record:
+                    record["timestamp"] = event_at
+                if isinstance(record.get("payload"), dict) and "timestamp" in record["payload"]:
+                    record["payload"]["timestamp"] = event_at
+            # Add a real failing tool call/result to the copied source. The
+            # injection stays inside untrusted source content, and ingest
+            # must derive the observation itself.
+            if source == "claude":
+                session_id = records[0]["sessionId"]
+                untrusted = records[0]["message"]["content"]
+                records.extend([
+                    {"type": "assistant", "sessionId": session_id, "timestamp": event_at,
+                     "message": {"role": "assistant", "content": [{"type": "tool_use",
+                     "id": "injection-run", "name": "Bash",
+                     "input": {"command": "imaginary-tool --version"}}]}},
+                    {"type": "user", "sessionId": session_id, "timestamp": event_at,
+                     "message": {"role": "user", "content": [{"type": "tool_result",
+                     "tool_use_id": "injection-run", "is_error": True,
+                     "content": "Exit code 127\nError: imaginary-tool: command not found\n"
+                     + untrusted}]}},
+                ])
+            else:
+                session_id = records[0]["payload"]["session_id"]
+                untrusted = records[1]["payload"]["message"]["text"]
+                records.extend([
+                    {"type": "response_item", "payload": {"session_id": session_id,
+                     "timestamp": event_at, "type": "custom_tool_call", "name": "exec_command",
+                     "call_id": "injection-run", "input": json.dumps({"cmd": "imaginary-tool --version"})}},
+                    {"type": "response_item", "payload": {"session_id": session_id,
+                     "timestamp": event_at, "type": "custom_tool_call_output",
+                     "call_id": "injection-run", "output": json.dumps({
+                         "chunk_id": "synthetic", "wall_time_seconds": 0.01, "exit_code": 127,
+                         "output": "Error: imaginary-tool: command not found\n" + untrusted,
+                     })}},
+                ])
+            target.write_text("".join(json.dumps(record) + "\n" for record in records))
             result = cls.run_cli(
                 "ingest",
                 "--file",
@@ -70,75 +105,31 @@ class PromptInjectionFixturePipelineTests(unittest.TestCase):
             if result.returncode != 0:
                 raise AssertionError(result.stderr)
 
-        cls.seed_detector_observations(fixture_paths)
+        connection = twill_schema.connect_read_only(cls.state_dir)
+        try:
+            rows = connection.execute(
+                "SELECT DISTINCT session_id FROM observation "
+                "WHERE kind='run_failed' AND program='imaginary-tool'"
+            ).fetchall()
+            if len(rows) != len(manifest["sources"]):
+                raise AssertionError("CLI ingest did not derive both injection run failures")
+        finally:
+            connection.close()
 
         cls.detect = cls.run_json_cli("detect")
         cls.rank = cls.run_json_cli("rank")
-        cls.cluster_ids = tuple(
-            f'{row["detector_id"]}:{row["key"]}'
-            for row in cls.rank["data"]["clusters"]
-        )
-        if not cls.cluster_ids:
+        if not cls.rank["data"]["clusters"]:
             raise AssertionError("injection fixtures did not produce a rank candidate")
         cls.dry_run = cls.run_json_cli("explain", "--dry-run")
-
-    @staticmethod
-    def iter_strings(value):
-        if isinstance(value, str):
-            yield value
-        elif isinstance(value, list):
-            for item in value:
-                yield from PromptInjectionFixturePipelineTests.iter_strings(item)
-        elif isinstance(value, dict):
-            for item in value.values():
-                yield from PromptInjectionFixturePipelineTests.iter_strings(item)
-
-    @classmethod
-    def seed_detector_observations(cls, fixture_paths):
-        """Bind fixture text to the normalized detector shape used by D-01/D-02.
-
-        Ingest currently retains parser events as ``session_activity`` while
-        the detector registry consumes normalized ``run_failed`` rows.  Keep
-        this adapter in scratch state so the fixture still supplies the
-        untrusted text without changing the production ingestion contract.
-        """
-
-        connection = twill_schema.connect(cls.state_dir)
+        # Explain's established byte/cluster budget can select fewer than
+        # rank returned. Build model fixtures for the selected candidates.
+        connection = twill_schema.connect_read_only(cls.state_dir)
         try:
-            signature = "error: command not found: imaginary-tool"
-            for source, fixture in fixture_paths.items():
-                records = [
-                    json.loads(line)
-                    for line in fixture.read_text().splitlines()
-                    if line.strip()
-                ]
-                if source == "claude":
-                    session_id = records[0]["sessionId"]
-                else:
-                    session_id = records[0]["payload"]["session_id"]
-                injection = next(
-                    text
-                    for record in records
-                    for text in cls.iter_strings(record)
-                    if "SYSTEM OVERRIDE" in text
-                )
-                connection.execute(
-                    "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
-                    "program, command, signature, sig_hash, excerpt, cwd) "
-                    "VALUES (?, ?, ?, 'run_failed', ?, ?, ?, ?, ?, ?)",
-                    (
-                        session_id,
-                        "2026-09-20T17:00:03+00:00",
-                        "2026-09-20T17:00:03+00:00",
-                        "imaginary-tool",
-                        None,
-                        signature,
-                        twill_app.h12(signature),
-                        injection,
-                        "/workspace/demo",
-                    ),
-                )
-            connection.commit()
+            selected = twill_explainer.load_candidate_prompt_clusters(connection)
+            cls.cluster_ids = tuple(
+                f"{item.cluster.detector_id}:{item.cluster.key}"
+                for item in selected[:cls.dry_run["data"]["clusters"]]
+            )
         finally:
             connection.close()
 
@@ -243,14 +234,15 @@ class PromptInjectionFixturePipelineTests(unittest.TestCase):
         connection = twill_schema.connect_read_only(self.state_dir)
         try:
             states = {
-                row[0]
+                f"{row[0]}:{row[1]}": row[2]
                 for row in connection.execute(
-                    "SELECT state FROM cluster ORDER BY detector_id, key"
+                    "SELECT detector_id, key, state FROM cluster ORDER BY detector_id, key"
                 )
             }
         finally:
             connection.close()
-        self.assertEqual(states, {"open"})
+        self.assertTrue(states)
+        self.assertTrue(all(state == "open" for state in states.values()))
 
         with mock.patch.object(
             twill_explainer,
@@ -283,14 +275,18 @@ class PromptInjectionFixturePipelineTests(unittest.TestCase):
         connection = twill_schema.connect_read_only(self.state_dir)
         try:
             states = {
-                row[0]
+                f"{row[0]}:{row[1]}": row[2]
                 for row in connection.execute(
-                    "SELECT state FROM cluster ORDER BY detector_id, key"
+                    "SELECT detector_id, key, state FROM cluster ORDER BY detector_id, key"
                 )
             }
         finally:
             connection.close()
-        self.assertEqual(states, {"drafted"})
+        self.assertEqual(
+            {key for key, state in states.items() if state == "drafted"},
+            set(self.cluster_ids),
+        )
+        self.assertTrue(all(state in {"drafted", "open"} for state in states.values()))
 
         accepted = self.run_json_cli("lessons", "--state", "accepted")
         self.assertEqual(accepted["data"]["lessons"], [])

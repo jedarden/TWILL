@@ -56,6 +56,21 @@ from codex_reader import (
     TokenUsage,
     NormalizedEvent as CodexEvent,
 )
+from twill_history import (
+    HistorySchemaError,
+    HistorySnapshot,
+    completed_keys_for_session,
+    configured_path as configured_history_path,
+)
+from twill_interactions import (
+    INTERACTION_SCHEMA,
+    MAX_INTERACTIONS_PER_SESSION,
+    MAX_TEXT_LENGTH,
+    TERMINAL_UNKNOWN,
+    Interaction,
+    apply_completed_history,
+    sort_key,
+)
 from twill_reader import (
     ClaudeCodeLineParser,
     MessageUsage,
@@ -314,6 +329,10 @@ class SessionData:
     # kept beside transcript-derived data so callers can use the richer
     # summary without making receipt availability a prerequisite for ingest.
     receipt: twill_receipts.FrictionReceipt | None = None
+    # Interaction-contract records (plan §7.1.1): still unredacted here —
+    # the persistence boundary redacts and bounds them, like event text.
+    interactions: tuple[Interaction, ...] = ()
+    interaction_source: str | None = None
 
     @property
     def usage_records(self) -> tuple[MessageUsage, ...]:
@@ -539,7 +558,7 @@ def _parse_codex_scan(
         )
         for event in normalized_events
     )
-    usage, usage_rows, normalized_events = _extract_usage(
+    usage, usage_rows, normalized_events, interactions, interaction_source = _extract_usage(
         path, source_kind, session_id, scan.new_offset
     )
     return SessionData(
@@ -552,6 +571,8 @@ def _parse_codex_scan(
         record_type_counts=record_type_counts,
         normalized_events=normalized_events,
         receipt=_session_receipt(session_id, receipt_dir),
+        interactions=interactions,
+        interaction_source=interaction_source,
     ), invalid_lines
 
 
@@ -653,7 +674,7 @@ def parse_scan(
                 )
             )
             event_index += 1
-    usage, usage_rows, normalized_events = _extract_usage(
+    usage, usage_rows, normalized_events, interactions, interaction_source = _extract_usage(
         path, source_kind, session_id, scan.new_offset
     )
     return SessionData(
@@ -666,6 +687,8 @@ def parse_scan(
         record_type_counts=record_type_counts,
         normalized_events=normalized_events,
         receipt=_session_receipt(session_id, receipt_dir),
+        interactions=interactions,
+        interaction_source=interaction_source,
     ), invalid_lines
 
 
@@ -681,7 +704,7 @@ def read_session(path: Path, receipt_dir: Path | None = None) -> SessionData:
 def extract_usage(path: Path, source_kind: str | None = None) -> SessionUsage | None:
     kind = source_kind or _source_kind(path)
     end_offset = twill_cursor.scan_lines(path, 0).new_offset
-    usage, _, _ = _extract_usage(path, kind, path.stem, end_offset)
+    usage, _, _, _, _ = _extract_usage(path, kind, path.stem, end_offset)
     return usage
 
 
@@ -841,7 +864,12 @@ def _message_usage_summary(
 
 def _extract_claude_usage(
     path: Path, fallback_session_id: str, end_offset: int | None = None
-) -> tuple[SessionUsage | None, tuple[MessageUsage, ...], tuple[ClaudeEvent, ...]]:
+) -> tuple[
+    SessionUsage | None,
+    tuple[MessageUsage, ...],
+    tuple[ClaudeEvent, ...],
+    tuple[Interaction, ...],
+]:
     parser = ClaudeCodeLineParser()
     normalized_events = []
     consumed = 0
@@ -857,6 +885,7 @@ def _extract_claude_usage(
             )
     normalized_events.extend(parser.finish())
     events = tuple(normalized_events)
+    interactions = parser.interactions
     rows = parser.usage
     if not rows and parser.cost_state_counters:
         rows = (
@@ -872,7 +901,7 @@ def _extract_claude_usage(
             parser.first_timestamp, parser.last_timestamp
         )
     if not rows and parser.total_cost_usd is None and not parser.has_cost_state:
-        return None, (), events
+        return None, (), events, interactions
     session_id = parser.session_id or fallback_session_id
     summary = _message_usage_summary(
         session_id,
@@ -881,7 +910,7 @@ def _extract_claude_usage(
         cost_usd=parser.total_cost_usd,
         wall_seconds=wall_seconds,
     )
-    return summary, rows, events
+    return summary, rows, events, interactions
 
 
 def _codex_usage_row(row: TokenUsage, *, cost_usd: float | None = None) -> MessageUsage:
@@ -902,13 +931,19 @@ def _codex_usage_row(row: TokenUsage, *, cost_usd: float | None = None) -> Messa
 
 def _extract_codex_usage(
     path: Path, fallback_session_id: str, end_offset: int | None = None
-) -> tuple[SessionUsage | None, tuple[MessageUsage, ...], tuple[CodexEvent, ...]]:
+) -> tuple[
+    SessionUsage | None,
+    tuple[MessageUsage, ...],
+    tuple[CodexEvent, ...],
+    tuple[Interaction, ...],
+]:
     reader = CodexRolloutReader()
     parsed = reader.parse(path, end_offset=end_offset)
     events = (*parsed.events, *reader.finish())
+    interactions = reader.interactions
     max_rows = reader.usage_max
     if not max_rows and reader.cost_usd is None:
-        return None, (), events
+        return None, (), events, interactions
     if max_rows:
         row = max_rows[0]
         usage_rows = (_codex_usage_row(row, cost_usd=reader.cost_usd),)
@@ -931,7 +966,7 @@ def _extract_codex_usage(
         wall_seconds=_usage_wall_seconds(reader.first_timestamp, reader.last_timestamp),
         messages=max(1, reader.message_count),
     )
-    return summary, usage_rows, events
+    return summary, usage_rows, events, interactions
 
 
 def _looks_like_codex(path: Path, end_offset: int | None = None) -> bool:
@@ -971,13 +1006,17 @@ def _extract_usage(
     fallback_session_id: str,
     end_offset: int | None = None,
 ) -> tuple[
-    SessionUsage | None, tuple[MessageUsage, ...], tuple[ClaudeEvent | CodexEvent, ...]
+    SessionUsage | None,
+    tuple[MessageUsage, ...],
+    tuple[ClaudeEvent | CodexEvent, ...],
+    tuple[Interaction, ...],
+    str,
 ]:
     if source_kind == "codex" or (
         source_kind == "jsonl" and _looks_like_codex(path, end_offset)
     ):
-        return _extract_codex_usage(path, fallback_session_id, end_offset)
-    return _extract_claude_usage(path, fallback_session_id, end_offset)
+        return (*_extract_codex_usage(path, fallback_session_id, end_offset), "codex")
+    return (*_extract_claude_usage(path, fallback_session_id, end_offset), "claude")
 
 
 def _coerce_session_usage(session: SessionData) -> SessionUsage | None:
@@ -1000,6 +1039,28 @@ class CursorUpdate:
     last_offset: int
     parse_errors: int
     parse_error_runs: int
+
+
+@dataclass(frozen=True)
+class PersistResult:
+    """What one session persist wrote, beyond the derived event count."""
+
+    observations: int
+    interactions: int = 0
+    interactions_omitted: int = 0
+    interactions_truncated: int = 0
+
+
+@dataclass(frozen=True)
+class _InteractionReport:
+    retained: int = 0
+    omitted_over_cap: int = 0
+    truncated_fields: int = 0
+
+
+#: Sentinel distinguishing "the history adapter has not been probed yet" from
+#: a probed-and-absent adapter (``None``).
+_HISTORY_UNSET = object()
 
 
 def _next_parse_error_runs(
@@ -1062,6 +1123,12 @@ class Store:
         # a single lazily minted run_at, so a run that parses nothing new
         # writes no parse_shape rows at all.
         self._parse_run_at: str | None = None
+        # The optional history adapter (plan §9A) is opened lazily, at most
+        # once per Store lifetime, so every confirmation in one run reads one
+        # consistent snapshot of the operator-configured source.  A schema
+        # refusal disables it for the run instead of failing ingestion.
+        self._history_snapshot: HistorySnapshot | None | object = _HISTORY_UNSET
+        self._history_label: str | None = None
         if not read_only:
             self.connection.executescript(SCHEMA)
             _ensure_transcript_event_signature_columns(self.connection)
@@ -1069,7 +1136,32 @@ class Store:
             self.connection.commit()
 
     def close(self) -> None:
+        snapshot = self._history_snapshot
+        if isinstance(snapshot, HistorySnapshot):
+            snapshot.close()
         self.connection.close()
+
+    def _history(self) -> HistorySnapshot | None:
+        """Open the optional history adapter once, or record why not."""
+
+        if self._history_snapshot is not _HISTORY_UNSET:
+            snapshot = self._history_snapshot
+            return snapshot if isinstance(snapshot, HistorySnapshot) else None
+        path = configured_history_path()
+        if path is None:
+            self._history_snapshot = None
+            return None
+        try:
+            snapshot = HistorySnapshot.open(path)
+        except HistorySchemaError:
+            # Schema discrimination (plan §9A): an unrecognized source shape
+            # is refused loudly but never breaks JSONL ingestion.
+            self._history_snapshot = None
+            self._history_label = "refused: unsupported schema"
+            return None
+        self._history_snapshot = snapshot
+        self._history_label = "codex-thread-history/v1"
+        return snapshot
 
     def _persist_usage(
         self,
@@ -1158,7 +1250,7 @@ class Store:
         replace: bool,
         stale_session_ids: Sequence[str] = (),
         cursor_update: CursorUpdate | None = None,
-    ) -> int:
+    ) -> PersistResult:
         """Write one session's derived rows — and its cursor row — in one transaction.
 
         ``replace`` re-ingests from scratch (the Phase 0 re-read semantic and
@@ -1169,7 +1261,7 @@ class Store:
         events are appended; observations are re-derived from the readers'
         full normalized set, or the stored generic events for unsupported
         shapes. A crash either lands both halves or neither
-        (plan §6.2 step 6).  Returns the session's observation count.
+        (plan §6.2 step 6).  Returns the session's persist report.
         """
         key = _session_key(session.path)
         now = datetime.now(timezone.utc).isoformat()
@@ -1183,6 +1275,7 @@ class Store:
         stored_launch_dir = self.redactor.redact_text(
             launch_dir_from_path(session.path)
         )
+        interactions = self._apply_history_terminality(session)
         with conn:
             if replace:
                 for stale_id in dict.fromkeys((*stale_session_ids, stored_session_id)):
@@ -1261,13 +1354,203 @@ class Store:
                     parse_error_runs=cursor_update.parse_error_runs,
                     now=now,
                 )
-        return observation_count
+            interaction_report = self._persist_interactions(
+                conn,
+                key,
+                interactions,
+                stored_session_id=stored_session_id,
+                stored_source_path=stored_source_path,
+                stored_source_kind=session.interaction_source or stored_source_kind,
+                cursor_update=cursor_update,
+                now=now,
+            )
+        return PersistResult(
+            observations=observation_count,
+            interactions=interaction_report.retained,
+            interactions_omitted=interaction_report.omitted_over_cap,
+            interactions_truncated=interaction_report.truncated_fields,
+        )
 
     def ingest(self, session: SessionData) -> tuple[int, int]:
         """Persist one whole in-memory session, replacing its derived rows."""
 
-        observation_count = self._persist(session, replace=True)
-        return len(session.events), observation_count
+        result = self._persist(session, replace=True)
+        return len(session.events), result.observations
+
+    def _apply_history_terminality(
+        self, session: SessionData
+    ) -> tuple[Interaction, ...]:
+        """Confirm unknown terminality from the optional history adapter.
+
+        Only Codex-shaped sources consult the optional Codex history adapter;
+        Claude has no supported SQLite history shape. The adapter is read-only
+        and snapshot-consistent (one open per Store run); a schema refusal
+        leaves terminality unknown and is recorded for the summary row.
+        """
+
+        interactions = session.interactions
+        if not interactions or session.interaction_source != "codex":
+            return interactions
+        if not any(
+            interaction.terminal_state == TERMINAL_UNKNOWN and interaction.message_id
+            for interaction in interactions
+        ):
+            return interactions
+        snapshot = self._history()
+        if snapshot is None:
+            return interactions
+        try:
+            completed = completed_keys_for_session(snapshot, session.session_id)
+        except HistorySchemaError:
+            self._history_label = "refused: unsupported schema"
+            return interactions
+        if not completed:
+            return interactions
+        return apply_completed_history(interactions, completed)
+
+    def _persist_interactions(
+        self,
+        conn: sqlite3.Connection,
+        session_key: str,
+        interactions: tuple[Interaction, ...],
+        *,
+        stored_session_id: str,
+        stored_source_path: str,
+        stored_source_kind: str,
+        cursor_update: CursorUpdate | None,
+        now: str,
+    ) -> _InteractionReport:
+        """Replace one session's interaction rows inside the ingest transaction.
+
+        Redaction happens field by field before any bind, every free-text
+        field is bounded to 240 decoded characters afterwards, and the
+        deterministic 1,000-interaction session cap applies in source order
+        with the omitted count published beside the retained rows (plan
+        §7.1.1).  Unchanged input produces unchanged rows: the full set is
+        deleted and rederived from the same source bytes every run.
+        """
+
+        conn.execute("DELETE FROM interaction WHERE session_key = ?", (session_key,))
+        conn.execute(
+            "DELETE FROM interaction_summary WHERE session_key = ?", (session_key,)
+        )
+        if not interactions:
+            return _InteractionReport()
+        source_identity = None
+        source_offset = None
+        if cursor_update is not None:
+            source_identity = self.redactor.redact_text(
+                cursor_update.facts.identity_sha
+            )
+            source_offset = int(cursor_update.last_offset)
+        cutoff = (
+            datetime.now(timezone.utc) - timedelta(seconds=self.retention_seconds)
+            if self.retention_seconds is not None
+            else None
+        )
+        retained = 0
+        omitted_over_cap = 0
+        omitted_first_ordinal = None
+        omitted_last_ordinal = None
+        truncated_fields = 0
+        terminal_unknown = 0
+        history_confirmed = 0
+        for interaction in sorted(interactions, key=sort_key):
+            ts_utc, ts_local = _timestamp_pair(interaction.timestamp or now)
+            if cutoff is not None and _parse_timestamp(ts_utc) < cutoff:
+                continue
+            if retained >= MAX_INTERACTIONS_PER_SESSION:
+                omitted_over_cap += 1
+                if omitted_first_ordinal is None:
+                    omitted_first_ordinal = interaction.ordinal
+                omitted_last_ordinal = interaction.ordinal
+                continue
+            full_text = self.redactor.redact_text(interaction.text)
+            stored_text = self.redactor.redact_excerpt(interaction.text)
+            field_truncations = int(len(full_text) > MAX_TEXT_LENGTH)
+            metadata: dict[str, str | None] = {}
+            for name, value in (
+                ("session_id", stored_session_id),
+                ("thread_id", interaction.thread_id),
+                ("source_path", stored_source_path),
+                ("locator", interaction.locator),
+                ("message_id", interaction.message_id),
+                ("channel", interaction.channel),
+            ):
+                redacted = self.redactor.redact_text(value) if value else ""
+                field_truncations += int(len(redacted) > MAX_TEXT_LENGTH)
+                metadata[name] = redacted[:MAX_TEXT_LENGTH] or None
+            truncated = int(field_truncations > 0)
+            conn.execute(
+                "INSERT INTO interaction(session_key, session_id, thread_id, "
+                "contract_version, source, source_path, "
+                "source_identity, source_offset, source_line, event_index, locator, "
+                "ordinal, turn_id, message_id, parent_ordinal, call_ordinal, "
+                "question_ordinal, ts_utc, ts_local, actor, channel, origin, "
+                "sidechain, terminal_state, truncated, truncated_fields, "
+                "history_confirmed, text) "
+                "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+                (
+                    session_key,
+                    metadata["session_id"],
+                    metadata["thread_id"],
+                    INTERACTION_SCHEMA,
+                    stored_source_kind,
+                    metadata["source_path"],
+                    source_identity,
+                    source_offset,
+                    interaction.source_line,
+                    interaction.event_index,
+                    metadata["locator"],
+                    interaction.ordinal,
+                    interaction.turn_id,
+                    metadata["message_id"],
+                    interaction.parent_ordinal,
+                    interaction.call_ordinal,
+                    interaction.question_ordinal,
+                    ts_utc,
+                    ts_local,
+                    self.redactor.redact_text(interaction.actor),
+                    metadata["channel"],
+                    self.redactor.redact_text(interaction.origin),
+                    1 if interaction.sidechain else 0,
+                    self.redactor.redact_text(interaction.terminal_state),
+                    truncated,
+                    field_truncations,
+                    int(interaction.history_confirmed),
+                    stored_text or None,
+                ),
+            )
+            retained += 1
+            truncated_fields += field_truncations
+            history_confirmed += int(interaction.history_confirmed)
+            if interaction.terminal_state == TERMINAL_UNKNOWN:
+                terminal_unknown += 1
+        conn.execute(
+            "INSERT INTO interaction_summary(session_key, source, retained, "
+            "omitted_over_cap, omitted_first_ordinal, omitted_last_ordinal, "
+            "truncated_fields, terminal_unknown, "
+            "history_confirmed, history_adapter, ingested_at) "
+            "VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                session_key,
+                stored_source_kind,
+                retained,
+                omitted_over_cap,
+                omitted_first_ordinal,
+                omitted_last_ordinal,
+                truncated_fields,
+                terminal_unknown,
+                history_confirmed,
+                self._history_label,
+                now,
+            ),
+        )
+        return _InteractionReport(
+            retained=retained,
+            omitted_over_cap=omitted_over_cap,
+            truncated_fields=truncated_fields,
+        )
 
     def skip_unchanged_path(self, path: Path) -> bool:
         """Keep idle cursors out of a bounded batch without hiding errors.
@@ -1359,7 +1642,7 @@ class Store:
         parse_errors = invalid_lines + (1 if scan.pending_tail else 0)
         parse_error_runs = _next_parse_error_runs(row, parse_errors)
         stale_ids = (row.session_id,) if row is not None else ()
-        observations = self._persist(
+        persisted = self._persist(
             session,
             replace=plan.replace_session,
             stale_session_ids=stale_ids,
@@ -1375,7 +1658,10 @@ class Store:
             "session_id": session.session_id,
             "action": plan.action,
             "events": len(session.events),
-            "observations": observations,
+            "observations": persisted.observations,
+            "interactions": persisted.interactions,
+            "interactions_omitted": persisted.interactions_omitted,
+            "interactions_truncated": persisted.interactions_truncated,
             "parse_seconds": perf_counter() - parse_started,
         }
 
@@ -1723,6 +2009,15 @@ def ingest_command(
 
     total_events = sum(item["events"] for item in processed)
     total_observations = sum(item["observations"] for item in processed)
+    interaction_counts = {
+        "interactions": sum(int(item.get("interactions", 0)) for item in processed),
+        "interactions_omitted": sum(
+            int(item.get("interactions_omitted", 0)) for item in processed
+        ),
+        "interactions_truncated": sum(
+            int(item.get("interactions_truncated", 0)) for item in processed
+        ),
+    }
     wall_time_seconds = perf_counter() - started
     single_file_parse_seconds = max(
         (float(item["parse_seconds"]) for item in processed),
@@ -1741,6 +2036,7 @@ def ingest_command(
         "sessions": len(processed),
         "events": total_events,
         "observations": total_observations,
+        **interaction_counts,
         "performance": performance,
     }
     counts = {
@@ -1748,6 +2044,7 @@ def ingest_command(
         "sessions": len(processed),
         "events": total_events,
         "observations": total_observations,
+        **interaction_counts,
     }
     if performance["misses"]:
         record_stage(

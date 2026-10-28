@@ -428,6 +428,53 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
             "hook_denial_evidence",
             (HOOK_DENIAL_DDL, HOOK_DENIAL_TS_INDEX_DDL),
         ),
+        Migration(
+            9,
+            "interaction_contract",
+            (
+                # Phase 9A (plan §7.1.1): the versioned interaction contract,
+                # additive to the six event kinds.  One row per conversation
+                # element a source transcript carries; text is post-redaction
+                # and <=240 decoded characters, with `truncated` recording the
+                # material-omission flag.  Links reference `ordinal`, the
+                # parser-assigned position in the session's interaction
+                # sequence, so the graph is a function of the source bytes.
+                "CREATE TABLE IF NOT EXISTS interaction("
+                "interaction_id INTEGER PRIMARY KEY, "
+                "session_key TEXT NOT NULL REFERENCES session(session_key), "
+                "session_id TEXT NOT NULL, thread_id TEXT, contract_version TEXT NOT NULL, "
+                "source TEXT NOT NULL, source_path TEXT NOT NULL, "
+                "source_identity TEXT, source_offset INTEGER, "
+                "source_line INTEGER NOT NULL, event_index INTEGER NOT NULL DEFAULT 0, "
+                "locator TEXT, ordinal INTEGER NOT NULL, "
+                "turn_id INTEGER, message_id TEXT, "
+                "parent_ordinal INTEGER, call_ordinal INTEGER, question_ordinal INTEGER, "
+                "ts_utc TEXT NOT NULL, ts_local TEXT NOT NULL, "
+                "actor TEXT NOT NULL, channel TEXT, origin TEXT NOT NULL, "
+                "sidechain INTEGER NOT NULL DEFAULT 0, "
+                "terminal_state TEXT NOT NULL DEFAULT 'none', "
+                "truncated INTEGER NOT NULL DEFAULT 0, "
+                "truncated_fields INTEGER NOT NULL DEFAULT 0, "
+                "history_confirmed INTEGER NOT NULL DEFAULT 0, "
+                "text TEXT, "
+                "UNIQUE(session_key, ordinal))",
+                "CREATE INDEX IF NOT EXISTS interaction_session "
+                "ON interaction(session_id, ts_utc)",
+                "CREATE INDEX IF NOT EXISTS interaction_turn "
+                "ON interaction(session_key, turn_id)",
+                # Omission exposure (plan §7.1.1): the retained/omitted split
+                # at the 1,000-interaction session cap, truncation counts and
+                # terminality coverage, one row per session, replaced in the
+                # same cursor transaction that writes the interactions.
+                "CREATE TABLE IF NOT EXISTS interaction_summary("
+                "session_key TEXT PRIMARY KEY REFERENCES session(session_key), "
+                "source TEXT NOT NULL, retained INTEGER NOT NULL, "
+                "omitted_over_cap INTEGER NOT NULL, omitted_first_ordinal INTEGER, "
+                "omitted_last_ordinal INTEGER, truncated_fields INTEGER NOT NULL, "
+                "terminal_unknown INTEGER NOT NULL, history_confirmed INTEGER NOT NULL, "
+                "history_adapter TEXT, ingested_at TEXT NOT NULL)",
+            ),
+        ),
     )
 )
 

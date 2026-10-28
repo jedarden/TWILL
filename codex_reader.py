@@ -19,9 +19,29 @@ from __future__ import annotations
 import json
 import os
 import re
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from pathlib import Path
 from typing import BinaryIO, Iterator
+
+from twill_interactions import (
+    ACTOR_ASSISTANT,
+    ACTOR_SYSTEM,
+    ACTOR_TOOL,
+    ACTOR_USER,
+    ORIGIN_ASSISTANT_TEXT,
+    ORIGIN_HARNESS,
+    ORIGIN_HUMAN_ANSWER,
+    ORIGIN_HUMAN_REQUEST,
+    ORIGIN_QUESTION,
+    ORIGIN_QUOTED_HISTORY,
+    ORIGIN_TOOL_CALL,
+    ORIGIN_TOOL_RESULT,
+    TERMINAL_COMPLETED,
+    TERMINAL_INTERRUPTED,
+    TERMINAL_UNKNOWN,
+    Interaction,
+    reterminalize,
+)
 
 
 KIND_RUN = "run"
@@ -71,6 +91,25 @@ _OUTPUT_TYPES = frozenset({"custom_tool_call_output", "function_call_output"})
 _READ_CHUNK_BYTES = 1 << 20
 _REJECTION_EVENT_TYPES = frozenset(
     {"tool_call_rejected", "tool_rejected", "approval_rejected"}
+)
+
+# Tools whose call asks the human a question and whose output is that
+# human's real interactive answer (plan §9A).
+QUESTION_TOOL_NAMES = frozenset(
+    {"ask_user", "ask_user_question", "request_user_input", "user_input"}
+)
+
+# Event records that carry a source-native completion of the current turn
+# (plan §9A: use source-native terminal records where present).
+_TASK_COMPLETE_TYPES = frozenset({"task_complete", "turn_complete", "task_finished"})
+
+# Content prefixes Codex wraps injected context in — quoted history, never an
+# original statement of this session.
+_QUOTED_HISTORY_PREFIXES = (
+    "<user_instructions>",
+    "<environment_context>",
+    "<turn_context>",
+    "<app_context>",
 )
 
 
@@ -137,6 +176,10 @@ class _PendingCall:
     session_id: str | None
     cwd: str | None
     sidechain: bool
+    # Interaction links (plan §7.1.1): the question/tool_call interaction
+    # emitted at the invocation, so its output links back to its call.
+    interaction_ordinal: int | None = None
+    is_question: bool = False
 
 
 class CodexRolloutLineParser:
@@ -158,6 +201,91 @@ class CodexRolloutLineParser:
         self._model: str | None = None
         self._first_timestamp: str | None = None
         self._last_timestamp: str | None = None
+        # Interaction graph state (plan §9A), mirroring the Claude parser.
+        self._interactions: list[Interaction] = []
+        self._main_turn = 0
+        self._sidechain_turn = 0
+        self._seen_assistant_message_ids: set[str] = set()
+        self._pending_question: dict[bool, int | None] = {False: None, True: None}
+        self._last_assistant: dict[bool, int | None] = {False: None, True: None}
+        self._interaction_thread_id: str | None = None
+        self._interaction_channel: str | None = None
+
+    @property
+    def interactions(self) -> tuple[Interaction, ...]:
+        """The interaction-contract records derived so far (plan §7.1.1)."""
+
+        return tuple(self._interactions)
+
+    def _current_turn(self, sidechain: bool) -> int:
+        return self._sidechain_turn if sidechain else self._main_turn
+
+    def _emit_interaction(
+        self,
+        *,
+        origin: str,
+        actor: str,
+        source_line: int,
+        context: dict[str, object],
+        index: int = 0,
+        text: str = "",
+        message_id: str | None = None,
+        locator: str | None = None,
+        terminal_state: str = "none",
+        turn_id: int | None = None,
+        call_ordinal: int | None = None,
+        question_ordinal: int | None = None,
+        channel: str | None = None,
+    ) -> int:
+        ordinal = len(self._interactions)
+        sidechain = context["sidechain"] is True
+        self._interactions.append(
+            Interaction(
+                origin=origin,
+                actor=actor,
+                source_line=source_line,
+                event_index=index,
+                ordinal=ordinal,
+                timestamp=context.get("timestamp") if isinstance(context.get("timestamp"), str) else None,
+                session_id=context.get("session_id") if isinstance(context.get("session_id"), str) else None,
+                thread_id=self._interaction_thread_id,
+                cwd=context.get("cwd") if isinstance(context.get("cwd"), str) else None,
+                sidechain=sidechain,
+                channel=channel or self._interaction_channel,
+                turn_id=(
+                    turn_id
+                    if turn_id is not None
+                    else self._current_turn(sidechain) or None
+                ),
+                message_id=message_id,
+                parent_ordinal=None,
+                call_ordinal=call_ordinal,
+                question_ordinal=question_ordinal,
+                locator=locator,
+                terminal_state=terminal_state,
+                text=text,
+            )
+        )
+        return ordinal
+
+    def _open_turn(self, sidechain: bool) -> int:
+        if sidechain:
+            self._sidechain_turn += 1
+        else:
+            self._main_turn += 1
+        self._close_trailing(sidechain, TERMINAL_UNKNOWN)
+        return self._current_turn(sidechain)
+
+    def _close_trailing(self, sidechain: bool, terminal_state: str) -> None:
+        index = self._last_assistant.get(sidechain)
+        if index is not None:
+            reterminalize(self._interactions, index, terminal_state)
+            self._last_assistant[sidechain] = None
+
+    def _interrupt_turn(self, sidechain: bool) -> None:
+        self._awaiting_correction = True
+        self._close_trailing(sidechain, TERMINAL_INTERRUPTED)
+        self._pending_question[sidechain] = None
 
     @property
     def usage(self) -> tuple[TokenUsage, ...]:
@@ -267,7 +395,7 @@ class CodexRolloutLineParser:
         return []
 
     def finish(self) -> list[NormalizedEvent]:
-        """Flush unresolved shell calls with an unknown exit status."""
+        """Flush unresolved shell calls and close trailing replies."""
 
         events: list[NormalizedEvent] = []
         for call_id in self._pending_order:
@@ -276,6 +404,8 @@ class CodexRolloutLineParser:
                 events.append(self._run_event(pending, None, None, len(events)))
         self._pending.clear()
         self._pending_order.clear()
+        self._close_trailing(False, TERMINAL_UNKNOWN)
+        self._close_trailing(True, TERMINAL_UNKNOWN)
         return events
 
     def _update_context(self, record: dict[str, object], payload: dict[str, object]) -> None:
@@ -305,6 +435,12 @@ class CodexRolloutLineParser:
         self, record: dict[str, object], payload: dict[str, object]
     ) -> dict[str, object]:
         timestamp = _first_string(record.get("timestamp"), payload.get("timestamp"))
+        self._interaction_thread_id = _first_string(
+            record.get("thread_id"), payload.get("thread_id"), self.session_id
+        )
+        self._interaction_channel = _first_string(
+            record.get("channel"), payload.get("channel")
+        )
         sidechain = (
             record.get("isSidechain") is True
             or record.get("sidechain") is True
@@ -330,6 +466,7 @@ class CodexRolloutLineParser:
                 payload.get("id"), payload.get("message_id"), payload.get("response_id")
             )
             self._message_ids.add(message_id or f"line:{source_line}")
+            self._emit_assistant_message(payload, source_line, context, message_id)
         if payload_type in _CALL_TYPES:
             return self._register_call(payload, source_line, context)
         if payload_type in _OUTPUT_TYPES:
@@ -344,6 +481,40 @@ class CodexRolloutLineParser:
             # from an actual correction after an interruption.
             self._awaiting_correction = False
         return []
+
+    def _emit_assistant_message(
+        self,
+        payload: dict[str, object],
+        source_line: int,
+        context: dict[str, object],
+        message_id: str | None,
+    ) -> None:
+        """Emit one assistant_text interaction per content block.
+
+        Streaming duplicates repeat the same provider message id; the
+        interaction graph keeps the first occurrence only.  A ``phase``
+        marker on the record is never treated as proof of completion —
+        only a source-native terminal record may set it (plan §9A).
+        """
+
+        duplicate = bool(message_id) and message_id in self._seen_assistant_message_ids
+        if message_id:
+            self._seen_assistant_message_ids.add(message_id)
+        sidechain = context["sidechain"] is True
+        for block_index, text in enumerate(_content_texts(payload.get("content"))):
+            if duplicate or not text.strip():
+                continue
+            ordinal = self._emit_interaction(
+                origin=ORIGIN_ASSISTANT_TEXT,
+                actor=ACTOR_ASSISTANT,
+                source_line=source_line,
+                context=context,
+                index=block_index,
+                text=text,
+                message_id=message_id,
+                locator=f"response_item/message[{block_index}]",
+            )
+            self._last_assistant[sidechain] = ordinal
 
     def _parse_event_message(
         self,
@@ -368,8 +539,25 @@ class CodexRolloutLineParser:
             return []
 
         if payload_type == "turn_aborted":
-            self._awaiting_correction = True
+            # Explicit interruption: the harness's own terminal record, so
+            # the trailing reply is marked interrupted, not merely unknown.
+            self._emit_interaction(
+                origin=ORIGIN_HARNESS,
+                actor=ACTOR_SYSTEM,
+                source_line=source_line,
+                context=context,
+                text=_text_from_value(payload.get("reason") or payload.get("message")),
+                locator=f"event_msg/{payload_type}",
+                terminal_state=TERMINAL_INTERRUPTED,
+            )
+            self._interrupt_turn(context["sidechain"] is True)
             return [self._interrupt_event(source_line, context)]
+
+        if payload_type in _TASK_COMPLETE_TYPES:
+            # Source-native completion (plan §9A): upgrade this turn's
+            # trailing assistant reply from unknown to completed.
+            self._close_trailing(context["sidechain"] is True, TERMINAL_COMPLETED)
+            return []
 
         if payload_type in _REJECTION_EVENT_TYPES:
             text = _text_from_value(
@@ -424,6 +612,29 @@ class CodexRolloutLineParser:
         )
         call_id = _first_string(payload.get("call_id"), payload.get("id"))
         events: list[NormalizedEvent] = []
+        if name.rsplit(".", 1)[-1] in QUESTION_TOOL_NAMES:
+            question_ordinal = self._emit_interaction(
+                origin=ORIGIN_QUESTION,
+                actor=ACTOR_ASSISTANT,
+                source_line=source_line,
+                context=context,
+                text=_codex_question_text(raw_input),
+                locator=f"response_item/{payload.get('type')}",
+            )
+            call = replace(call, interaction_ordinal=question_ordinal, is_question=True)
+            self._pending_question[context["sidechain"] is True] = question_ordinal
+        else:
+            call_ordinal = self._emit_interaction(
+                origin=ORIGIN_TOOL_CALL,
+                actor=ACTOR_ASSISTANT,
+                source_line=source_line,
+                context=context,
+                text=command
+                or (raw_input.strip() if isinstance(raw_input, str) else ""),
+                locator=f"response_item/{payload.get('type')}",
+                channel=name or None,
+            )
+            call = replace(call, interaction_ordinal=call_ordinal)
         if kind == KIND_FILE_READ:
             file_path = command or ""
             events.append(
@@ -457,6 +668,7 @@ class CodexRolloutLineParser:
         text = _text_from_value(payload.get("output"))
         call_id = _first_string(payload.get("call_id"), payload.get("id"))
         pending = self._remove_pending(call_id)
+        self._emit_output_interaction(payload, text, pending, source_line, context)
 
         if _matches_rejection(text):
             return [
@@ -491,6 +703,42 @@ class CodexRolloutLineParser:
             ]
         return []
 
+    def _emit_output_interaction(
+        self,
+        payload: dict[str, object],
+        text: str,
+        pending: _PendingCall | None,
+        source_line: int,
+        context: dict[str, object],
+    ) -> None:
+        """Emit the answer or tool_result interaction for one call output."""
+
+        if pending is not None and pending.is_question:
+            if pending.interaction_ordinal is not None:
+                sidechain = context["sidechain"] is True
+                if self._pending_question.get(sidechain) == pending.interaction_ordinal:
+                    self._pending_question[sidechain] = None
+            self._emit_interaction(
+                origin=ORIGIN_HUMAN_ANSWER,
+                actor=ACTOR_USER,
+                source_line=source_line,
+                context=context,
+                text=text,
+                locator=f"response_item/{payload.get('type')}",
+                question_ordinal=pending.interaction_ordinal,
+            )
+            return
+        self._emit_interaction(
+            origin=ORIGIN_TOOL_RESULT,
+            actor=ACTOR_TOOL,
+            source_line=source_line,
+            context=context,
+            text=text,
+            locator=f"response_item/{payload.get('type')}",
+            channel=pending.name if pending else None,
+            call_ordinal=pending.interaction_ordinal if pending else None,
+        )
+
     def _consume_user_prompt(
         self,
         texts: list[str],
@@ -498,10 +746,13 @@ class CodexRolloutLineParser:
         context: dict[str, object],
     ) -> list[NormalizedEvent]:
         events: list[NormalizedEvent] = []
-        for text in texts:
+        for block_index, text in enumerate(texts):
             stripped = text.strip()
             if not stripped:
                 continue
+            self._emit_prompt_interaction(
+                text, source_line, context, index=block_index
+            )
             if stripped == _INTERRUPT_SENTINEL:
                 self._awaiting_correction = True
                 events.append(self._interrupt_event(source_line, context, len(events)))
@@ -521,6 +772,74 @@ class CodexRolloutLineParser:
                 # content blocks rather than creating duplicate corrections.
                 break
         return events
+
+    def _emit_prompt_interaction(
+        self,
+        text: str,
+        source_line: int,
+        context: dict[str, object],
+        *,
+        index: int,
+    ) -> None:
+        """Classify one user prompt block into its interaction origin.
+
+        Injected context wrappers are quoted history, the interrupt sentinel
+        is harness bookkeeping with an explicit terminal state, a real turn
+        that answers a pending question resolves to that question, and any
+        other original text opens a new turn.
+        """
+
+        stripped = text.strip()
+        sidechain = context["sidechain"] is True
+        if stripped == _INTERRUPT_SENTINEL:
+            self._emit_interaction(
+                origin=ORIGIN_HARNESS,
+                actor=ACTOR_USER,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"response_item/user[{index}]",
+                terminal_state=TERMINAL_INTERRUPTED,
+            )
+            self._interrupt_turn(sidechain)
+            return
+        if stripped.startswith(_QUOTED_HISTORY_PREFIXES):
+            self._emit_interaction(
+                origin=ORIGIN_QUOTED_HISTORY,
+                actor=ACTOR_SYSTEM,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"response_item/user[{index}]",
+            )
+            return
+        pending_question = self._pending_question.get(sidechain)
+        if pending_question is not None:
+            self._pending_question[sidechain] = None
+            self._emit_interaction(
+                origin=ORIGIN_HUMAN_ANSWER,
+                actor=ACTOR_USER,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"response_item/user[{index}]",
+                question_ordinal=pending_question,
+            )
+            return
+        turn_id = self._open_turn(sidechain)
+        self._emit_interaction(
+            origin=ORIGIN_HUMAN_REQUEST,
+            actor=ACTOR_USER,
+            source_line=source_line,
+            context=context,
+            index=index,
+            text=text,
+            locator=f"response_item/user[{index}]",
+            turn_id=turn_id,
+        )
 
     def _consume_cost(self, value: dict[str, object]) -> None:
         cost = _first_nonnegative_float(
@@ -657,6 +976,12 @@ class CodexRolloutReader:
         return self._line_parser.session_id
 
     @property
+    def interactions(self) -> tuple[Interaction, ...]:
+        """Interaction-contract records derived so far (plan §7.1.1)."""
+
+        return self._line_parser.interactions
+
+    @property
     def usage_max(self) -> tuple[TokenUsage, ...]:
         return self._line_parser.usage_max
 
@@ -745,6 +1070,24 @@ def _first_string(*values: object) -> str | None:
         if isinstance(value, str) and value:
             return value
     return None
+
+
+def _codex_question_text(raw_input: object) -> str:
+    """Recover the question a question-tool invocation asks the human."""
+
+    if isinstance(raw_input, str):
+        try:
+            parsed = json.loads(raw_input)
+        except (TypeError, json.JSONDecodeError):
+            return raw_input
+        return _codex_question_text(parsed)
+    if not isinstance(raw_input, dict):
+        return ""
+    for key in ("question", "query", "prompt", "message"):
+        value = raw_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return _text_from_value(raw_input)
 
 
 def _content_texts(value: object) -> list[str]:

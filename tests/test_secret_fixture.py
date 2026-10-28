@@ -27,12 +27,12 @@ import functools
 import io
 import json
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
 import unittest
 from pathlib import Path
+from datetime import datetime, timedelta, timezone
 from unittest import mock
 
 try:
@@ -281,7 +281,42 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
             session_dir = work / "sources" / f".{source}"
             session_dir.mkdir(parents=True)
             target = session_dir / fixture.name
-            shutil.copyfile(fixture, target)
+            records = [json.loads(line) for line in fixture.read_text().splitlines() if line.strip()]
+            event_at = (datetime.now(timezone.utc) - timedelta(days=2)).isoformat()
+            for record in records:
+                if "timestamp" in record:
+                    record["timestamp"] = event_at
+                if isinstance(record.get("payload"), dict) and "timestamp" in record["payload"]:
+                    record["payload"]["timestamp"] = event_at
+            if source == "claude":
+                session_id = records[0]["sessionId"]
+                untrusted = records[0]["message"]["content"]
+                records.extend([
+                    {"type": "assistant", "sessionId": session_id, "timestamp": event_at,
+                     "message": {"role": "assistant", "content": [{"type": "tool_use",
+                     "id": "secret-run", "name": "Bash",
+                     "input": {"command": "deployctl --version"}}]}},
+                    {"type": "user", "sessionId": session_id, "timestamp": event_at,
+                     "message": {"role": "user", "content": [{"type": "tool_result",
+                     "tool_use_id": "secret-run", "is_error": True,
+                     "content": "Exit code 127\nError: deployctl: command not found\n"
+                     + untrusted}]}},
+                ])
+            else:
+                session_id = records[0]["payload"]["session_id"]
+                untrusted = records[1]["payload"]["message"]["text"]
+                records.extend([
+                    {"type": "response_item", "payload": {"session_id": session_id,
+                     "timestamp": event_at, "type": "custom_tool_call", "name": "exec_command",
+                     "call_id": "secret-run", "input": json.dumps({"cmd": "deployctl --version"})}},
+                    {"type": "response_item", "payload": {"session_id": session_id,
+                     "timestamp": event_at, "type": "custom_tool_call_output",
+                     "call_id": "secret-run", "output": json.dumps({
+                         "chunk_id": "synthetic", "wall_time_seconds": 0.01, "exit_code": 127,
+                         "output": "Error: deployctl: command not found\n" + untrusted,
+                     })}},
+                ])
+            target.write_text("".join(json.dumps(record) + "\n" for record in records))
             cls.fixture_paths[source] = target
             cls.run_cli(
                 "ingest",
@@ -293,7 +328,16 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
                 str(cls.state_dir),
             )
 
-        cls._seed_detector_observations()
+        connection = twill_schema.connect_read_only(cls.state_dir)
+        try:
+            rows = connection.execute(
+                "SELECT DISTINCT session_id FROM observation "
+                "WHERE kind='run_failed' AND program='deployctl'"
+            ).fetchall()
+            if len(rows) != len(cls.fixtures):
+                raise AssertionError("CLI ingest did not derive both secret run failures")
+        finally:
+            connection.close()
         cls.run_cli("detect", "--state-dir", str(cls.state_dir))
         cls.run_cli("rank", "--state-dir", str(cls.state_dir))
         cls.run_cli("digest", "--stdout", "--state-dir", str(cls.state_dir))
@@ -385,40 +429,6 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
             )
         if exit_code != 0:
             raise AssertionError(f"Explain lesson write failed with exit {exit_code}")
-
-    @classmethod
-    def _seed_detector_observations(cls):
-        """Adapt parser events to D-01's normalized detector input contract."""
-
-        connection = twill_schema.connect(cls.state_dir)
-        try:
-            for index, (source, fixture) in enumerate(cls.fixtures.items()):
-                row = connection.execute(
-                    "SELECT session_id FROM session WHERE source_path = ?",
-                    (str(cls.fixture_paths[source]),),
-                ).fetchone()
-                if row is None:
-                    raise AssertionError(f"{source}: ingested session is missing")
-                normalized = twill_app.signature(fixture["error_line"])
-                timestamp = f"2026-09-20T16:00:0{index + 3}+00:00"
-                connection.execute(
-                    "INSERT INTO observation(session_id, ts_utc, ts_local, kind, "
-                    "program, command, signature, sig_hash, excerpt) "
-                    "VALUES (?, ?, ?, 'run_failed', ?, ?, ?, ?, ?)",
-                    (
-                        row[0],
-                        timestamp,
-                        timestamp,
-                        "deployctl",
-                        "deployctl",
-                        normalized,
-                        twill_app.h12(normalized),
-                        fixture["error_line"],
-                    ),
-                )
-            connection.commit()
-        finally:
-            connection.close()
 
     @classmethod
     def _fixture_path(cls, manifest, source):
@@ -581,19 +591,16 @@ class SecretFixturePipelineTests(unittest.TestCase, metaclass=NonSkippable):
                 self.assertIn(marker, stored, f"{source}: {marker} never reached the DB")
 
     def test_the_redacted_credential_line_is_what_persisted(self):
-        # The exact string the Store's redactor produces for the credential
-        # line — computed with the same Redactor, not hardcoded — must be
-        # present verbatim, so the fixture provably went through this
-        # boundary rather than the assertions passing on an empty database.
+        # Original credential-bearing source lines must persist in redacted
+        # form; the added tool result is verified separately through the
+        # CLI-derived run_failed observation.
         stored = {value for _, _, value in self.stored_texts}
         for source, fixture in self.fixtures.items():
             for line in fixture["credential_lines"]:
                 expected = Redactor().redact_text(line)
-                self.assertIn(
-                    expected,
-                    stored,
-                    f"{source}: the redacted form of the credential line did "
-                    "not persist unchanged",
+                self.assertTrue(
+                    expected in stored,
+                    f"{source}: a credential line did not persist after redaction",
                 )
 
     def test_the_error_line_is_captured_and_signatured(self):

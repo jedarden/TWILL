@@ -122,6 +122,45 @@ def _delete_expired(connection: sqlite3.Connection, cutoff: datetime) -> None:
     ]
     if expired:
         connection.executemany("DELETE FROM observation WHERE obs_id = ?", expired)
+    # The additive interaction contract shares the retention boundary. Keep
+    # the summary's retained count in sync with the rows that survive pruning.
+    if connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='interaction'"
+    ).fetchone() and connection.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='session'"
+    ).fetchone():
+        connection.execute(
+            "DELETE FROM interaction WHERE julianday(ts_utc) IS NOT NULL "
+            "AND julianday(ts_utc) < julianday(?)",
+            (coarse_cutoff.isoformat(),),
+        )
+        rows = connection.execute(
+            "SELECT interaction_id, ts_utc FROM interaction "
+            "WHERE julianday(ts_utc) IS NULL OR julianday(ts_utc) >= julianday(?)",
+            (coarse_cutoff.isoformat(),),
+        ).fetchall()
+        expired_interactions = [
+            (row[0],)
+            for row in rows
+            if (parsed := _timestamp(row[1])) is not None and parsed < cutoff
+        ]
+        if expired_interactions:
+            connection.executemany(
+                "DELETE FROM interaction WHERE interaction_id = ?",
+                expired_interactions,
+            )
+        connection.execute(
+            "UPDATE interaction_summary SET retained = "
+            "(SELECT count(*) FROM interaction "
+            "WHERE interaction.session_key = interaction_summary.session_key), "
+            "truncated_fields = coalesce((SELECT sum(truncated_fields) FROM interaction "
+            "WHERE interaction.session_key = interaction_summary.session_key), 0), "
+            "terminal_unknown = (SELECT count(*) FROM interaction "
+            "WHERE interaction.session_key = interaction_summary.session_key "
+            "AND terminal_state = 'unknown'), "
+            "history_confirmed = coalesce((SELECT sum(history_confirmed) FROM interaction "
+            "WHERE interaction.session_key = interaction_summary.session_key), 0)"
+        )
 
 
 def _seconds(value: object) -> float:

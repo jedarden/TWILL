@@ -2359,52 +2359,59 @@ class UnreadRuleDocDetectorTests(unittest.TestCase):
         self.connection.commit()
 
     def test_d09_reports_live_documents_without_recent_reads(self):
+        # This detector uses a rolling 30-day window. Keep the fixture's
+        # relative read ages stable as the calendar advances.
+        def ago(days):
+            return (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+
+        new_at = ago(2)
+        old_at = ago(100)
         self.seed_rule_doc(
             "/rules/new.md",
             "sha-new",
-            "2026-09-20T00:00:00+00:00",
+            new_at,
         )
         self.seed_rule_doc(
             "/rules/old.md",
             "sha-old",
-            "2026-08-01T00:00:00+00:00",
-            last_read="2026-08-15T00:00:00+00:00",
+            old_at,
+            last_read=ago(90),
         )
         self.seed_rule_doc(
             "/rules/recent.md",
             "sha-recent",
-            "2026-09-21T00:00:00+00:00",
-            last_read="2026-09-23T00:00:00+00:00",
+            ago(2),
+            last_read=ago(1),
         )
         self.seed_rule_doc(
             "/rules/observed.md",
             "sha-observed",
-            "2026-09-20T12:00:00+00:00",
+            ago(2),
         )
         self.connection.execute(
             "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
             "VALUES ('s-read', ?, ?, 'file_read', '/rules/observed.md')",
             (
-                "2026-09-23T00:00:00+00:00",
-                "2026-09-23T00:00:00+00:00",
+                ago(1),
+                ago(1),
             ),
         )
         self.connection.commit()
         self.seed_rule_doc(
             "/rules/shared-read.md",
             "sha-shared",
-            "2026-09-19T00:00:00+00:00",
+            ago(3),
         )
         self.seed_rule_doc(
             "/rules/shared-copy.md",
             "sha-shared",
-            "2026-09-18T00:00:00+00:00",
-            last_read="2026-09-23T00:00:00+00:00",
+            ago(4),
+            last_read=ago(1),
         )
         self.seed_rule_doc(
             "/rules/stale.md",
             "sha-stale",
-            "2026-09-22T00:00:00+00:00",
+            ago(2),
             stale=1,
         )
 
@@ -2431,8 +2438,8 @@ class UnreadRuleDocDetectorTests(unittest.TestCase):
         self.assertEqual(
             [(row[5], row[6]) for row in rows],
             [
-                ("2026-09-20T00:00:00+00:00", "2026-09-20T00:00:00+00:00"),
-                ("2026-08-01T00:00:00+00:00", "2026-08-01T00:00:00+00:00"),
+                (new_at, new_at),
+                (old_at, old_at),
             ],
         )
 

@@ -42,13 +42,52 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 from typing import Iterator
+
+from twill_interactions import (
+    ACTOR_ASSISTANT,
+    ACTOR_SYSTEM,
+    ACTOR_TOOL,
+    ACTOR_USER,
+    ORIGIN_ASSISTANT_TEXT,
+    ORIGIN_HARNESS,
+    ORIGIN_HUMAN_ANSWER,
+    ORIGIN_HUMAN_REQUEST,
+    ORIGIN_QUESTION,
+    ORIGIN_QUOTED_HISTORY,
+    ORIGIN_TOOL_CALL,
+    ORIGIN_TOOL_RESULT,
+    TERMINAL_INTERRUPTED,
+    TERMINAL_UNKNOWN,
+    Interaction,
+    reterminalize,
+)
 
 
 RUN_TOOL_NAME = "Bash"
 READ_TOOL_NAME = "Read"
+
+# Tools whose call is a question to the human and whose result is that
+# human's real interactive answer (plan §9A).  The wording is fixed per
+# client version, like the rejection sentinels.
+QUESTION_TOOL_NAMES = frozenset({"AskUserQuestion", "ask_user_question", "ask_user"})
+
+# User-text prefixes that mark quoted history rather than an original
+# statement of this session: local-command wrappers and the harness caveat
+# that introduces pasted history.
+_QUOTED_HISTORY_PREFIXES = (
+    "<user_instructions>",
+    "<environment_context>",
+    "<turn_context>",
+    "<command-name>",
+    "<command-message>",
+    "<command-args>",
+    "<local-command-stdout>",
+    "<local-command-stderr>",
+    "Caveat:",
+)
 
 KIND_RUN = "run"
 KIND_TOOL_ERROR = "tool_error"
@@ -228,6 +267,10 @@ class _RecordContext:
     session_id: str | None
     cwd: str | None
     sidechain: bool
+    thread_id: str | None = None
+    channel: str | None = None
+    record_id: str | None = None
+    parent_id: str | None = None
 
 
 @dataclass(frozen=True)
@@ -240,6 +283,11 @@ class _PendingToolUse:
     file_path: str | None
     source_line: int
     context: _RecordContext
+    # Interaction graph links (plan §7.1.1): the tool_call/question
+    # interaction emitted at the invocation, so its result can link back to
+    # its actual call rather than its position in a wrapper record.
+    interaction_ordinal: int | None = None
+    is_question: bool = False
 
 
 class ClaudeCodeLineParser:
@@ -264,6 +312,18 @@ class ClaudeCodeLineParser:
         self._cost_state_counters: dict[str, int] = {}
         self._first_timestamp: str | None = None
         self._last_timestamp: str | None = None
+        # Interaction graph state (plan §9A).  Turns are counted separately
+        # for main and sidechain threads so delegated turns stay
+        # distinguishable; terminality of the trailing assistant reply is
+        # resolved per thread as the next boundary arrives.
+        self._interactions: list[Interaction] = []
+        self._main_turn = 0
+        self._sidechain_turn = 0
+        self._seen_assistant_message_ids: set[str] = set()
+        self._pending_question: dict[bool, int | None] = {False: None, True: None}
+        self._last_assistant: dict[bool, int | None] = {False: None, True: None}
+        self._question_by_tool_use_id: dict[str, int] = {}
+        self._record_ordinal: dict[str, int] = {}
 
     @property
     def usage(self) -> tuple[MessageUsage, ...]:
@@ -317,6 +377,93 @@ class ClaudeCodeLineParser:
     def last_timestamp(self) -> str | None:
         return self._last_timestamp
 
+    @property
+    def interactions(self) -> tuple[Interaction, ...]:
+        """The interaction-contract records derived so far (plan §7.1.1)."""
+
+        return tuple(self._interactions)
+
+    # -- interaction plumbing ------------------------------------------------
+
+    def _current_turn(self, sidechain: bool) -> int:
+        return self._sidechain_turn if sidechain else self._main_turn
+
+    def _emit_interaction(
+        self,
+        *,
+        origin: str,
+        actor: str,
+        source_line: int,
+        context: _RecordContext,
+        index: int = 0,
+        text: str = "",
+        message_id: str | None = None,
+        locator: str | None = None,
+        terminal_state: str = "none",
+        turn_id: int | None = None,
+        call_ordinal: int | None = None,
+        question_ordinal: int | None = None,
+        channel: str | None = None,
+    ) -> int:
+        """Append one interaction and return its ordinal."""
+
+        ordinal = len(self._interactions)
+        parent_ordinal = (
+            self._record_ordinal.get(context.parent_id)
+            if context.parent_id else None
+        )
+        self._interactions.append(
+            Interaction(
+                origin=origin,
+                actor=actor,
+                source_line=source_line,
+                event_index=index,
+                ordinal=ordinal,
+                timestamp=context.timestamp,
+                session_id=context.session_id,
+                thread_id=context.thread_id,
+                cwd=context.cwd,
+                sidechain=context.sidechain,
+                turn_id=(
+                    turn_id
+                    if turn_id is not None
+                    else self._current_turn(context.sidechain) or None
+                ),
+                message_id=message_id,
+                parent_ordinal=parent_ordinal,
+                call_ordinal=call_ordinal,
+                question_ordinal=question_ordinal,
+                locator=locator,
+                terminal_state=terminal_state,
+                text=text,
+                channel=channel or context.channel,
+            )
+        )
+        if context.record_id:
+            self._record_ordinal.setdefault(context.record_id, ordinal)
+        return ordinal
+
+    def _open_turn(self, sidechain: bool) -> int:
+        """Start a new turn on one thread, closing the previous trailing reply."""
+
+        if sidechain:
+            self._sidechain_turn += 1
+        else:
+            self._main_turn += 1
+        self._close_trailing(sidechain, TERMINAL_UNKNOWN)
+        return self._current_turn(sidechain)
+
+    def _close_trailing(self, sidechain: bool, terminal_state: str) -> None:
+        index = self._last_assistant.get(sidechain)
+        if index is not None:
+            reterminalize(self._interactions, index, terminal_state)
+            self._last_assistant[sidechain] = None
+
+    def _interrupt_turn(self, sidechain: bool) -> None:
+        self._awaiting_correction = True
+        self._close_trailing(sidechain, TERMINAL_INTERRUPTED)
+        self._pending_question[sidechain] = None
+
     def parse_line(self, line: str, source_line: int) -> list[NormalizedEvent]:
         stripped = line.strip()
         if not stripped:
@@ -344,7 +491,13 @@ class ClaudeCodeLineParser:
         return []
 
     def finish(self) -> list[NormalizedEvent]:
-        """Flush runs whose result never arrived (unknown exit)."""
+        """Flush unresolved runs, and close each thread's trailing reply.
+
+        Claude Code JSONL carries no source-native terminal record, so the
+        trailing assistant reply of an unterminated thread can only ever be
+        ``unknown`` — never ``completed`` (plan §9A: a reply that merely
+        looks final does not prove completion).
+        """
 
         events = [
             self._run_event(pending, exit_code=None, error_excerpt=None, index=index)
@@ -355,6 +508,8 @@ class ClaudeCodeLineParser:
             )
         ]
         self._pending.clear()
+        self._close_trailing(False, TERMINAL_UNKNOWN)
+        self._close_trailing(True, TERMINAL_UNKNOWN)
         return events
 
     # -- record plumbing -----------------------------------------------------
@@ -377,6 +532,17 @@ class ClaudeCodeLineParser:
             session_id=self.session_id,
             cwd=self.cwd,
             sidechain=record.get("isSidechain") is True,
+            thread_id=_first_string(
+                record.get("agentId"), record.get("threadId"),
+                record.get("thread_id"), self.session_id,
+            ),
+            channel=_first_string(
+                record.get("channel"),
+                record.get("message", {}).get("channel")
+                if isinstance(record.get("message"), dict) else None,
+            ),
+            record_id=_first_string(record.get("uuid")),
+            parent_id=_first_string(record.get("parentUuid"), record.get("parent_uuid")),
         )
 
     # -- assistant records ---------------------------------------------------
@@ -387,11 +553,51 @@ class ClaudeCodeLineParser:
         source_line: int,
         context: _RecordContext,
     ) -> list[NormalizedEvent]:
+        message = record.get("message")
+        message_id = (
+            _first_string(
+                message.get("id"),  # type: ignore[union-attr]
+                record.get("uuid"),
+            )
+            if isinstance(message, dict)
+            else None
+        )
+        # One provider response can arrive as repeated records (streaming
+        # duplicates carry the same message.id); the interaction graph keeps
+        # the first occurrence only.
+        duplicate = bool(message_id) and message_id in self._seen_assistant_message_ids
+        if message_id:
+            self._seen_assistant_message_ids.add(message_id)
+
         events: list[NormalizedEvent] = []
-        for block in _content_blocks(record):
+        for block_index, block in enumerate(_content_blocks(record)):
+            if block.get("type") == "text" and not duplicate:
+                text = block.get("text")
+                if isinstance(text, str) and text.strip():
+                    ordinal = self._emit_interaction(
+                        origin=ORIGIN_ASSISTANT_TEXT,
+                        actor=ACTOR_ASSISTANT,
+                        source_line=source_line,
+                        context=context,
+                        index=block_index,
+                        text=text,
+                        message_id=message_id,
+                        locator=f"assistant/text[{block_index}]",
+                    )
+                    # The latest assistant reply of the thread is the
+                    # turn-final candidate; without a source-native terminal
+                    # record it stays unknown (plan §9A).
+                    self._last_assistant[context.sidechain] = ordinal
             if block.get("type") != "tool_use":
                 continue
             pending = _register_tool_use(block, source_line, context)
+            if not duplicate:
+                ordinal = self._emit_call_interaction(pending, block, source_line, context, block_index)
+                pending = replace(pending, interaction_ordinal=ordinal)
+                if pending.tool_use_id:
+                    if pending.is_question:
+                        self._question_by_tool_use_id[pending.tool_use_id] = ordinal
+                        self._pending_question[context.sidechain] = ordinal
             if pending.tool_use_id:
                 self._pending[pending.tool_use_id] = pending
             elif pending.name == RUN_TOOL_NAME and pending.command is not None:
@@ -404,6 +610,37 @@ class ClaudeCodeLineParser:
         if events:
             self._awaiting_correction = False
         return events
+
+    def _emit_call_interaction(
+        self,
+        pending: _PendingToolUse,
+        block: dict[str, object],
+        source_line: int,
+        context: _RecordContext,
+        block_index: int,
+    ) -> int:
+        """Emit the question or tool_call interaction for one tool_use block."""
+
+        if pending.name in QUESTION_TOOL_NAMES:
+            return self._emit_interaction(
+                origin=ORIGIN_QUESTION,
+                actor=ACTOR_ASSISTANT,
+                source_line=source_line,
+                context=context,
+                index=block_index,
+                text=_question_text(block),
+                locator=f"assistant/tool_use[{block_index}]",
+            )
+        return self._emit_interaction(
+            origin=ORIGIN_TOOL_CALL,
+            actor=ACTOR_ASSISTANT,
+            source_line=source_line,
+            context=context,
+            index=block_index,
+            text=pending.command or pending.file_path or "",
+            locator=f"assistant/tool_use[{block_index}]",
+            call_ordinal=None,
+        )
 
     # -- user records --------------------------------------------------------
 
@@ -421,13 +658,19 @@ class ClaudeCodeLineParser:
             event = self._classify_user_text(
                 content, source_line, index=0, context=context, is_meta=is_meta
             )
+            self._emit_user_text_interaction(
+                content, source_line, context, index=0, is_meta=is_meta
+            )
             return [event] if event is not None else []
 
         events: list[NormalizedEvent] = []
-        for block in content if isinstance(content, list) else []:
+        for block_index, block in enumerate(content if isinstance(content, list) else []):
             if not isinstance(block, dict):
                 continue
             if block.get("type") == "tool_result":
+                self._emit_result_interaction(
+                    block, source_line, context, index=block_index
+                )
                 event = self._consume_tool_result(block, source_line, context)
             elif block.get("type") == "text":
                 text = block.get("text")
@@ -442,11 +685,163 @@ class ClaudeCodeLineParser:
                     if isinstance(text, str)
                     else None
                 )
+                if isinstance(text, str):
+                    self._emit_user_text_interaction(
+                        text,
+                        source_line,
+                        context,
+                        index=block_index,
+                        is_meta=is_meta,
+                    )
             else:
                 event = None
             if event is not None:
                 events.append(event)
         return events
+
+    # -- interaction emission for user records -------------------------------
+
+    def _emit_user_text_interaction(
+        self,
+        text: str,
+        source_line: int,
+        context: _RecordContext,
+        *,
+        index: int,
+        is_meta: bool,
+    ) -> None:
+        """Classify one user text turn into its interaction origin.
+
+        The classification mirrors the event contract's ordering rules but
+        keeps the conversation-level distinctions the events deliberately
+        drop: harness bookkeeping (``isMeta``), quoted history wrappers, the
+        interrupt sentinel, interactive answers to a pending question, and
+        real human requests that open turns.
+        """
+
+        stripped = text.strip()
+        if not stripped:
+            return
+        if is_meta:
+            self._emit_interaction(
+                origin=ORIGIN_HARNESS,
+                actor=ACTOR_SYSTEM,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"user/text[{index}]",
+            )
+            return
+        if stripped == _INTERRUPT_SENTINEL:
+            self._emit_interaction(
+                origin=ORIGIN_HARNESS,
+                actor=ACTOR_USER,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"user/text[{index}]",
+                terminal_state=TERMINAL_INTERRUPTED,
+            )
+            self._interrupt_turn(context.sidechain)
+            return
+        if _matches_rejection(stripped):
+            self._emit_interaction(
+                origin=ORIGIN_HARNESS,
+                actor=ACTOR_USER,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"user/text[{index}]",
+            )
+            return
+        if stripped.startswith(_QUOTED_HISTORY_PREFIXES):
+            self._emit_interaction(
+                origin=ORIGIN_QUOTED_HISTORY,
+                actor=ACTOR_SYSTEM,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"user/text[{index}]",
+            )
+            return
+        pending_question = self._pending_question.get(context.sidechain)
+        if pending_question is not None:
+            # An interactive answer resolves its actual question, not the
+            # wrapper position it happens to arrive at.
+            self._pending_question[context.sidechain] = None
+            self._emit_interaction(
+                origin=ORIGIN_HUMAN_ANSWER,
+                actor=ACTOR_USER,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"user/text[{index}]",
+                question_ordinal=pending_question,
+            )
+            return
+        turn_id = self._open_turn(context.sidechain)
+        self._emit_interaction(
+            origin=ORIGIN_HUMAN_REQUEST,
+            actor=ACTOR_USER,
+            source_line=source_line,
+            context=context,
+            index=index,
+            text=text,
+            locator=f"user/text[{index}]",
+            turn_id=turn_id,
+        )
+
+    def _emit_result_interaction(
+        self,
+        block: dict[str, object],
+        source_line: int,
+        context: _RecordContext,
+        *,
+        index: int,
+    ) -> None:
+        """Emit the answer or tool_result interaction for one tool_result block."""
+
+        content_text = _tool_result_text(block.get("content"))
+        tool_use_id = block.get("tool_use_id")
+        question_ordinal = (
+            self._question_by_tool_use_id.pop(tool_use_id, None)
+            if isinstance(tool_use_id, str)
+            else None
+        )
+        pending = (
+            self._pending.get(tool_use_id) if isinstance(tool_use_id, str) else None
+        )
+        if question_ordinal is not None:
+            sidechain = context.sidechain
+            if self._pending_question.get(sidechain) == question_ordinal:
+                self._pending_question[sidechain] = None
+            self._emit_interaction(
+                origin=ORIGIN_HUMAN_ANSWER,
+                actor=ACTOR_USER,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=content_text,
+                locator=f"user/tool_result[{index}]",
+                question_ordinal=question_ordinal,
+            )
+            return
+        self._emit_interaction(
+            origin=ORIGIN_TOOL_RESULT,
+            actor=ACTOR_TOOL,
+            source_line=source_line,
+            context=context,
+            index=index,
+            text=content_text,
+            locator=f"user/tool_result[{index}]",
+            channel=pending.name if pending else None,
+            call_ordinal=pending.interaction_ordinal if pending else None,
+        )
 
     def _note_timestamp(self, timestamp: str | None) -> None:
         if not timestamp:
@@ -766,7 +1161,33 @@ def _register_tool_use(
         file_path=file_path if isinstance(file_path, str) else None,
         source_line=source_line,
         context=context,
+        is_question=name in QUESTION_TOOL_NAMES if isinstance(name, str) else False,
     )
+
+
+def _question_text(block: dict[str, object]) -> str:
+    """Recover the question a question-tool invocation asks the human."""
+
+    tool_input = block.get("input")
+    if isinstance(tool_input, str):
+        return tool_input
+    if not isinstance(tool_input, dict):
+        return ""
+    questions = tool_input.get("questions")
+    if isinstance(questions, list):
+        parts = []
+        for item in questions:
+            if isinstance(item, dict):
+                question = item.get("question")
+                if isinstance(question, str) and question.strip():
+                    parts.append(question.strip())
+        if parts:
+            return "\n".join(parts)
+    for key in ("question", "query", "prompt", "message"):
+        value = tool_input.get(key)
+        if isinstance(value, str) and value.strip():
+            return value
+    return ""
 
 
 def _content_blocks(record: dict[str, object]) -> list[dict[str, object]]:

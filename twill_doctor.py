@@ -185,6 +185,13 @@ _REDACTION_RESCAN_FIELDS = (
     # redacted at persistence just like ``observation.excerpt``.
     ("transcript_event", "event_id", "text"),
     ("observation", "obs_id", "excerpt"),
+    ("interaction", "interaction_id", "session_id"),
+    ("interaction", "interaction_id", "thread_id"),
+    ("interaction", "interaction_id", "source_path"),
+    ("interaction", "interaction_id", "locator"),
+    ("interaction", "interaction_id", "message_id"),
+    ("interaction", "interaction_id", "channel"),
+    ("interaction", "interaction_id", "text"),
 )
 
 

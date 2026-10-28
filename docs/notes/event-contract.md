@@ -1,5 +1,8 @@
 # The normalized event contract
 
+Phase 9A's separate conversation record is documented in
+[interaction-contract.md](interaction-contract.md).
+
 The record every transcript parser must emit, pinning plan §6.2 step 4. A parser
 consumes complete JSONL lines from one transcript format and yields zero or more
 normalized events per line; the detector layer keys on nothing else. Today two
