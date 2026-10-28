@@ -85,6 +85,11 @@ SELFTEST_EXPECTED_CLUSTERS = {
     "D-08": 1,
     "D-09": 1,
     "D-10": 1,
+    "D-12": 1,
+    "D-13": 1,
+    "D-14": 1,
+    "D-15": 1,
+    "D-16": 1,
 }
 REQUIRED_TABLES = (
     "cluster",
@@ -246,6 +251,10 @@ def rescan_redaction(
         # fields. Never retain pre-rescan text or support hashes.
         import twill_episodes
         twill_episodes.project_all(connection)
+        if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                              "AND name='autonomy_assessment'").fetchone():
+            import twill_autonomy
+            twill_autonomy.project(connection)
     return {
         "rows_scanned": rows_scanned,
         "rows_changed": rows_changed,
@@ -1538,6 +1547,34 @@ def _seed_selftest_fixture(connection: sqlite3.Connection, now: datetime) -> Non
             "VALUES (?, 'Bash', ?, ?)",
             (rule_id, (now - timedelta(days=days_ago)).isoformat(), session_id),
         )
+    # D-12..D-16: query-family fixture over the supported assessment
+    # projection. Raw-shaped CLI ingestion coverage lives in test_autonomy;
+    # doctor only proves the registered SQL can replay the current contract.
+    for number in range(12, 17):
+        family = f"D-{number}"
+        session_key = f"selftest-autonomy-{number}"
+        episode_id = f"selftest-episode-{number}"
+        stamp = (now - timedelta(days=1)).isoformat()
+        connection.execute(
+            "INSERT INTO interaction(session_key, session_id, contract_version, source, "
+            "source_path, source_line, ordinal, ts_utc, ts_local, actor, origin) "
+            "VALUES (?, ?, 'twill-interaction/v1', 'codex', 'selftest', 1, 0, ?, ?, "
+            "'user', 'human_request')",
+            (session_key, session_key, stamp, stamp),
+        )
+        connection.execute(
+            "INSERT INTO execution_episode VALUES (?, ?, 'twill-execution-episode/v1', "
+            "'selftest-input', 0, 0, NULL, 'Build report', 'build:report', "
+            "'authorized', 'known', 'unknown', 'active', 0)",
+            (episode_id, session_key),
+        )
+        connection.execute(
+            "INSERT INTO autonomy_assessment VALUES (?, ?, ?, ?, 1, "
+            "'autonomy-analyzer/v1', 'selftest-input', 'selftest-evidence', ?, "
+            "'supported', 'selftest', '[]', '[]', '[]', 'captured', ?)",
+            (f"selftest-candidate-{number}", episode_id, session_key, family,
+             f"autonomy:{family}:build:report", stamp),
+        )
 
 
 def _selftest_fixture(now: datetime) -> sqlite3.Connection:
@@ -1558,6 +1595,10 @@ def _selftest_fixture(now: datetime) -> sqlite3.Connection:
         connection.execute(twill_schema.GATE_GAP_OBS_INDEX_DDL)
         connection.execute(twill_schema.HOOK_DENIAL_DDL)
         connection.execute(twill_schema.HOOK_DENIAL_TS_INDEX_DDL)
+        for migration in twill_schema.MIGRATIONS:
+            if migration.version >= 9:
+                for statement in migration.statements:
+                    connection.execute(statement)
         _seed_selftest_fixture(connection, now)
     except BaseException:
         connection.close()

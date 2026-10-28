@@ -1610,6 +1610,49 @@ HOOK_DENIAL = Detector(
 )
 
 
+def _autonomy_queries(family: str) -> tuple[str, str, str, str]:
+    # One eligibility relation drives every replay/query family. The input
+    # hash joins the current episode, so a changed ingest immediately removes
+    # stale automatic support even before the next candidate pass.
+    eligible = f"""
+      WITH eligible AS (
+        SELECT a.cluster_key AS key, i.session_id, a.assessed_at AS ts_utc
+        FROM autonomy_assessment AS a
+        JOIN execution_episode AS e ON e.episode_id=a.episode_id
+        JOIN interaction AS i ON i.session_key=e.session_key
+             AND i.ordinal=e.start_ordinal
+        WHERE a.family='{family}' AND a.detector_version=1
+          AND a.analyzer_version='autonomy-analyzer/v1'
+          AND a.input_sha=e.input_sha AND a.disposition='supported'
+          AND a.assessed_at >= :window_start_utc
+    """
+    base = eligible + ")\n"
+    cluster = base + """SELECT key, count(DISTINCT session_id) AS sessions,
+      count(*) AS events, min(ts_utc) AS first_seen, max(ts_utc) AS last_seen
+      FROM eligible GROUP BY key ORDER BY key"""
+    session = base + """SELECT key, session_id FROM eligible
+      GROUP BY key, session_id ORDER BY key, session_id"""
+    week = base + """SELECT key, strftime('%G-W%V', ts_utc) AS week
+      FROM eligible GROUP BY key, week ORDER BY key, week"""
+    weekly = eligible + " AND a.assessed_at < :window_end_utc\n)\n" + """
+      SELECT key, strftime('%G-W%V', ts_utc) AS week,
+      count(DISTINCT session_id) AS sessions, count(*) AS events
+      FROM eligible GROUP BY key, week ORDER BY key, week"""
+    return cluster, session, week, weekly
+
+
+AUTONOMY_DETECTORS = tuple(
+    Detector(family, 1, description, *_autonomy_queries(family))
+    for family, description in (
+        ("D-12", "Unnecessary handoff of an authorized pending action"),
+        ("D-13", "Repeated approval request for a settled action"),
+        ("D-14", "Acknowledged in-scope defect offered as optional work"),
+        ("D-15", "Evidenced abandonment after a status exchange"),
+        ("D-16", "Blocker claim contradicted by matching capability check"),
+    )
+)
+
+
 # The shipped catalog.  Phase 2's detector beads (D-01 missing binary, D-02
 # recurring error signature, ... D-10 ICG gate gap) append their entries here;
 # an entry leaves this tuple when its successor version lands.
@@ -1624,6 +1667,7 @@ REGISTRY: tuple[Detector, ...] = build_registry(
     STALE_RULE,
     UNREAD_RULE_DOC,
     GATE_GAP,
+    *AUTONOMY_DETECTORS,
 )
 
 

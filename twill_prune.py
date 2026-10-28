@@ -305,6 +305,11 @@ def prune_observations(
             _rollback_scope(connection, owns_transaction)
         raise
 
+    if connection.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                          "AND name='autonomy_assessment'").fetchone():
+        import twill_autonomy
+        twill_autonomy.project(connection)
+
     detector_report = twill_detectors.run_detectors(
         connection,
         window_days=DEFAULT_ANALYSIS_WINDOW_DAYS,

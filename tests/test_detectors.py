@@ -2859,7 +2859,7 @@ class DetectCliTests(unittest.TestCase):
             self.assertEqual(
                 [item["detector_id"] for item in outcomes],
                 ["D-01", "D-02", "D-03", "D-04", "D-05", "D-06", "D-07",
-                 "D-08", "D-09", "D-10"],
+                 "D-08", "D-09", "D-10", "D-12", "D-13", "D-14", "D-15", "D-16"],
             )
             for item in outcomes:
                 self.assertEqual(

@@ -499,6 +499,23 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
                 "ON episode_assertion(episode_id, kind)",
             ),
         ),
+        Migration(
+            11,
+            "autonomy_assessment_contract",
+            (
+                "CREATE TABLE IF NOT EXISTS autonomy_assessment("
+                "candidate_id TEXT PRIMARY KEY, episode_id TEXT NOT NULL, "
+                "session_key TEXT NOT NULL, family TEXT NOT NULL, "
+                "detector_version INTEGER NOT NULL, analyzer_version TEXT NOT NULL, "
+                "input_sha TEXT NOT NULL, evidence_sha TEXT NOT NULL, "
+                "cluster_key TEXT NOT NULL, disposition TEXT NOT NULL, "
+                "reason TEXT NOT NULL, supporting_refs TEXT NOT NULL, "
+                "disconfirming_refs TEXT NOT NULL, missing TEXT NOT NULL, "
+                "evidence_strength TEXT NOT NULL, assessed_at TEXT NOT NULL)",
+                "CREATE INDEX IF NOT EXISTS autonomy_assessment_membership "
+                "ON autonomy_assessment(family, disposition, cluster_key, session_key)",
+            ),
+        ),
     )
 )
 

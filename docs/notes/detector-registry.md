@@ -251,6 +251,37 @@ observations, and `first_seen` and `last_seen` use the row's `indexed_at` timest
 by `indexed_at` descending, then key ascending. D-09 feeds rule decay and deletion review rather than
 the new-lesson path.
 
+## D-12@1 through D-16@1: autonomy assessments
+
+`twill detect` first derives `autonomy_assessment` rows from the versioned
+interaction and execution-episode projections. The candidate pass is separate
+from cluster refresh. A candidate is identified by a stable hash of episode
+identity and family; it records input and evidence hashes, analyzer and
+detector versions, source-linked supporting and disconfirming references,
+missing information, reason and `supported`, `needs_review` or `dismissed`
+disposition. Candidate discovery does not make a cluster.
+
+The families are unnecessary next-action handoff (D-12), repeated approval
+for a settled action (D-13), acknowledged outcome-blocking defect offered as
+optional work (D-14), affirmative abandonment after a status exchange (D-15),
+and a blocker claim contradicted by a matching recorded capability check
+(D-16). Phrase shapes shortlist candidates only. Support requires captured
+applicable authority and pending action. D-12 to D-14 also require a
+source-native completed terminal reply; D-15 requires affirmative abandonment
+and repeated approval after a captured status exchange; D-16 requires a check
+under the same access conditions. Missing context, truncation, a permission
+hold, cancellation, completion, changed conditions and legitimate waits prevent
+automatic support. More than 24 referenced records forces `needs_review`.
+
+Each family's cluster, session-hit, week-hit and weekly/backtest SQL reads only
+`supported` assessments whose detector and analyzer versions match and whose
+input hash still matches the current episode. Keys contain the family plus a
+normalized action verb and resource class; they never contain session or
+episode IDs. Re-ingesting changed source invalidates membership immediately;
+the next detect refreshes the derived assessments and clusters. The public
+checkout contains only synthetic fixtures; source evidence and review output
+belong in private state or `artifacts_root`.
+
 ## Adding or changing a detector
 
 To add one (the D-01 … D-10 beads): append a `Detector` to

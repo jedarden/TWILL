@@ -28,6 +28,7 @@ from time import perf_counter
 from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import twill_detectors
+import twill_autonomy
 import twill_catalog
 import twill_denials
 import twill_episodes
@@ -2310,6 +2311,10 @@ def detect_command(args: argparse.Namespace) -> int:
     connection = twill_schema.connect(state_dir)
     cross_host_signatures: list[dict[str, object]] = []
     try:
+        # Candidate discovery precedes supported-cluster refresh. It runs
+        # independently of the detector selection so unresolved assessments
+        # remain inspectable even when no supported cluster is emitted.
+        twill_autonomy.project(connection)
         catalog_result, catalog_observation = twill_catalog.load_and_record(connection)
         # D-10 cannot degrade (plan §6.5): without a catalog it can read it
         # does not run transcript-only — it is skipped with the reason and
