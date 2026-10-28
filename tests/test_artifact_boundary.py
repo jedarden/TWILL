@@ -242,6 +242,7 @@ class ArtifactBoundaryTests(unittest.TestCase):
             record.path,
             measurement,
             digest,
+            self.artifacts / "autonomy" / "impact" / "2026-09-24.json",
             *guards,
         )
         external = self.artifacts.resolve()
@@ -271,6 +272,10 @@ class ArtifactBoundaryTests(unittest.TestCase):
                 Path("guards") / f"{LESSON_ID}.memory.md",
                 Path("guards") / f"{LESSON_ID}.retrieval.md",
                 Path("manifest.json"),
+                Path("autonomy"),
+                Path("autonomy") / "manifest.json",
+                Path("autonomy") / "impact",
+                Path("autonomy") / "impact" / "2026-09-24.json",
             },
         )
         for path in (self.artifacts, *self.artifacts.rglob("*")):

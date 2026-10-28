@@ -30,6 +30,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import twill_detectors
 import twill_autonomy
 import twill_autonomy_review
+import twill_autonomy_impact
 import twill_catalog
 import twill_denials
 import twill_episodes
@@ -2729,6 +2730,21 @@ def explain_command(args: argparse.Namespace) -> int:
 def autonomy_command(args: argparse.Namespace) -> int:
     config = load_config()
     state_dir = _state_dir(args.state_dir)
+    if args.autonomy_action == "intervention":
+        connection = twill_schema.connect(state_dir)
+        try:
+            try:
+                result = twill_autonomy_impact.record_intervention(
+                    connection, config.require_artifacts_root(), args.candidate_id,
+                    args.at, args.reason)
+            except ValueError as exc:
+                raise UsageError(str(exc)) from exc
+        finally:
+            connection.close()
+        emit_success(result, json_mode=args.json)
+        if not args.json:
+            print(f"recorded autonomy intervention A-{result['candidate_id']} at {result['intervened_at']}")
+        return EXIT_SUCCESS
     if args.autonomy_action == "review":
         connection = twill_schema.connect(state_dir)
         try:
@@ -2820,6 +2836,7 @@ def trend_command(args: argparse.Namespace) -> int:
 
     state_dir = _state_dir(args.state_dir)
     db_path = twill_schema.state_db_path(state_dir)
+    autonomy_weeks = []
     if not db_path.is_file():
         report = twill_trend.empty_trend_report(weeks=weeks)
     else:
@@ -2831,11 +2848,27 @@ def trend_command(args: argparse.Namespace) -> int:
                 detector=args.detector,
                 new_only=args.new_only,
             )
+            if args.detector is None or args.detector in twill_autonomy.FAMILIES:
+                now = datetime.now(timezone.utc)
+                monday = (now - timedelta(days=now.weekday())).replace(
+                    hour=0, minute=0, second=0, microsecond=0)
+                root = load_config().require_artifacts_root()
+                for offset in range(weeks, 0, -1):
+                    first = monday - timedelta(days=7 * offset)
+                    last = first + timedelta(days=7)
+                    impact = twill_autonomy_impact.summarize(
+                        connection, root, first.isoformat(), last.isoformat())
+                    if args.detector:
+                        impact["groups"] = [cell for cell in impact["groups"]
+                                            if cell["family"] == args.detector]
+                    autonomy_weeks.append(impact)
         finally:
             connection.close()
 
+    data = report.as_dict()
+    data["autonomy_weeks"] = autonomy_weeks
     emit_success(
-        report.as_dict(),
+        data,
         json_mode=args.json,
         warnings=report.warnings,
     )
@@ -3429,6 +3462,13 @@ def build_parser() -> argparse.ArgumentParser:
     autonomy_review.add_argument("--state-dir", default=argparse.SUPPRESS)
     autonomy_review.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
     autonomy_review.set_defaults(handler=autonomy_command)
+    autonomy_intervention = autonomy_sub.add_parser("intervention", help="record a dated private intervention")
+    autonomy_intervention.add_argument("candidate_id", metavar="ID")
+    autonomy_intervention.add_argument("--at", required=True, help="intervention timestamp with UTC offset")
+    autonomy_intervention.add_argument("--reason", required=True)
+    autonomy_intervention.add_argument("--state-dir", default=argparse.SUPPRESS)
+    autonomy_intervention.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    autonomy_intervention.set_defaults(handler=autonomy_command)
 
     rank = subparsers.add_parser(
         "rank", help="refresh rule coverage and list new-lesson candidates"
@@ -3663,7 +3703,7 @@ def main(argv: Sequence[str] | None = None) -> int:
         rebuilds_state = args.command == "doctor" and args.rebuild
         rescans_redaction = args.command == "doctor" and args.rescan_redaction
         needs_lock = (args.command in MUTATING_VERBS or
-                      (args.command == "autonomy" and args.autonomy_action == "review")) and not (
+                      (args.command == "autonomy" and args.autonomy_action in ("review", "intervention"))) and not (
             args.command == "explain" and args.dry_run
         )
         if needs_lock or writes_artifact or rebuilds_state or rescans_redaction:

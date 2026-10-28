@@ -55,6 +55,7 @@ FIXTURE_ROOT = ROOT / "tests" / "fixtures" / "transcripts"
 sys.path.insert(0, str(ROOT))
 
 from twill_app import read_session  # noqa: E402
+from twill_artifacts import write_manifest  # noqa: E402
 
 #: The ISO week every corpus timestamp falls in.  The digest is pinned to it
 #: so the rendered week is a property of the corpus, not of the clock, and
@@ -264,6 +265,10 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
 
         shutil.rmtree(cls.home / ".local", ignore_errors=True)
         shutil.rmtree(cls.artifacts / "digests", ignore_errors=True)
+        if (cls.artifacts / "manifest.json").exists():
+            # The prior pipeline now has an autonomy impact snapshot. Keep
+            # its private inventory valid after this test removes the digest.
+            write_manifest(cls.artifacts)
         cls._stage_corpus()
         ingest_first = cls.run_cli("ingest", "--limit", "50", "--json")
         cls._grow_corpus()

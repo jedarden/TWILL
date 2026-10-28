@@ -238,7 +238,7 @@ def _autonomy_inventory(root: Path) -> list[dict[str, object]]:
 
 
 def _validate_autonomy_payload(path: Path, schema: str) -> None:
-    """Validate the reserved impact/intervention envelopes without defining 9E metrics."""
+    """Validate private impact and intervention contracts before publication."""
     content = path.read_bytes()
     if len(content) > 1024 * 1024:
         raise ArtifactContractError("autonomy payload exceeds one MiB")
@@ -264,6 +264,58 @@ def _validate_autonomy_payload(path: Path, schema: str) -> None:
                 walk(item)
     for value in values:
         walk(value)
+        if schema == AUTONOMY_INTERVENTION_SCHEMA:
+            required = {"schema", "candidate_id", "intervened_at", "reason",
+                        "source", "family", "detector_version", "analyzer_version",
+                        "input_sha", "evidence_sha"}
+            if set(value) != required or not re.fullmatch(r"[0-9a-f]{32}",
+                                                          str(value.get("candidate_id", ""))):
+                raise ArtifactContractError("invalid autonomy intervention shape")
+            _timestamp(value["intervened_at"])
+            if (not isinstance(value["reason"], str) or not value["reason"].strip()
+                    or value["family"] not in {"D-12", "D-13", "D-14", "D-15", "D-16"}
+                    or type(value["detector_version"]) is not int or value["detector_version"] < 1
+                    or not isinstance(value["analyzer_version"], str)
+                    or not value["analyzer_version"]
+                    or any(not isinstance(value[name], str) or
+                           not _SHA256_RE.fullmatch(value[name])
+                           for name in ("input_sha", "evidence_sha"))):
+                raise ArtifactContractError("invalid autonomy intervention fields")
+        else:
+            required = {"schema", "measured_at", "window_days", "window_start",
+                        "window_end", "groups", "source_coverage",
+                        "supported_interventions", "telemetry", "interventions"}
+            if set(value) != required:
+                raise ArtifactContractError("invalid autonomy impact shape")
+            _timestamp(value["measured_at"])
+            _timestamp(value["window_start"])
+            _timestamp(value["window_end"])
+            if (type(value["window_days"]) is not int or value["window_days"] < 1
+                    or type(value["supported_interventions"]) is not int
+                    or value["supported_interventions"] < 0
+                    or not isinstance(value["groups"], list)
+                    or not isinstance(value["source_coverage"], list)
+                    or not isinstance(value["interventions"], list)
+                    or not isinstance(value["telemetry"], dict)):
+                raise ArtifactContractError("invalid autonomy impact fields")
+            if path.stem != value["measured_at"][:10]:
+                raise ArtifactContractError("autonomy impact date mismatch")
+            for group in value["groups"]:
+                if not isinstance(group, dict) or not {"source", "family",
+                        "detector_version", "analyzer_version", "current_version",
+                        "eligible_opportunities", "terminal_known", "terminal_unknown",
+                        "candidates", "supported_findings", "unknown_unassessed",
+                        "adjudicated_precision", "adjudicated_abstention"} <= set(group):
+                    raise ArtifactContractError("invalid autonomy impact group")
+                for field in ("eligible_opportunities", "terminal_known",
+                              "terminal_unknown", "supported_findings", "unknown_unassessed"):
+                    if type(group[field]) is not int or group[field] < 0:
+                        raise ArtifactContractError("invalid autonomy impact count")
+                for field in ("terminal_coverage", "supported_rate",
+                              "adjudicated_precision", "adjudicated_abstention"):
+                    rate = group.get(field)
+                    if rate is not None and (type(rate) not in (float, int) or not 0 <= rate <= 1):
+                        raise ArtifactContractError("invalid autonomy impact rate")
 
 
 def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
@@ -920,12 +972,14 @@ def _name_only_paths(output: str) -> tuple[str, ...]:
 
 
 def _expand_namespace_paths(root: Path, paths: Sequence[str]) -> tuple[str, ...]:
-    """Expand git's ``?? namespace/`` record into its actual files."""
+    """Expand git's collapsed untracked artifact directories into files."""
 
     expanded: list[str] = []
     for path in paths:
         namespace = path.rstrip("/")
-        if namespace not in (*ARTIFACT_DIRS, "autonomy") or not (root / namespace).is_dir():
+        parts = Path(namespace).parts
+        if (not parts or parts[0] not in (*ARTIFACT_DIRS, "autonomy")
+                or not path.endswith("/") or not (root / namespace).is_dir()):
             expanded.append(path)
             continue
         for candidate in sorted((root / namespace).rglob("*")):

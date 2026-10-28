@@ -301,6 +301,7 @@ class DigestReport:
     retirements: tuple[twill_rules.RetirementProposal, ...] = ()
     trend: twill_trend.TrendReport | None = None
     autonomy_review: tuple[dict[str, str], ...] = ()
+    autonomy_impact: dict[str, object] | None = None
 
     @property
     def week_id(self) -> str:
@@ -962,6 +963,7 @@ def build_digest(
     cross_host_previous: dict[str, dict[str, object]] = {}
     cross_host_freshness_as_of: str | None = None
     autonomy_review: tuple[dict[str, str], ...] = ()
+    autonomy_impact: dict[str, object] | None = None
     try:
         source.execute("BEGIN")
         autonomy_tables = {row[0] for row in source.execute(
@@ -970,6 +972,9 @@ def build_digest(
         )}
         if artifacts_root is not None and len(autonomy_tables) == 5:
             from twill_autonomy_review import inspect
+            import twill_autonomy_impact
+            autonomy_impact = twill_autonomy_impact.summarize(
+                source, artifacts_root, start, end)
             # Candidate review remains a separate lane; no item here is
             # counted as an established lesson finding.
             candidates = inspect(source, artifacts_root, state,
@@ -1232,6 +1237,7 @@ def build_digest(
         retirements=retirements,
         trend=trend_report,
         autonomy_review=autonomy_review,
+        autonomy_impact=autonomy_impact,
     )
 
 
@@ -1305,6 +1311,7 @@ def render_data(report: DigestReport) -> dict[str, object]:
         ],
         "retirements": [proposal.as_dict() for proposal in report.retirements],
         "autonomy_review": list(report.autonomy_review),
+        "autonomy_impact": report.autonomy_impact,
         "reproduction_command": report.command,
     }
 
@@ -1385,6 +1392,11 @@ def render_text(report: DigestReport) -> str:
         lines.append(_line(f"autonomy candidates for review: {len(report.autonomy_review)}", report.command))
         for item in report.autonomy_review:
             lines.append(_line(f"  A-{item['candidate_id']} {item['family']} {item['disposition']}", report.command))
+    if report.autonomy_impact is not None:
+        impact = report.autonomy_impact
+        lines.append(_line(
+            f"autonomy coverage: {impact['supported_interventions']} distinct supported intervention(s); "
+            f"{len(impact['groups'])} source/version cell(s)", report.command))
     if report.trend is not None:
         for warning in report.trend.warnings:
             lines.append(_line(f"trend warning: {warning}", report.command))

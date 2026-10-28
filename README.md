@@ -162,6 +162,14 @@ existing bounded call; routing defaults to `retrieval_only` unless structured
 evidence proves a stronger prevention point. Review-only cases appear in a
 separate weekly digest section.
 
+`twill autonomy intervention ID --at 2026-10-28T12:00:00Z --reason TEXT`
+records a dated change in the private artifact repository. `twill measure`
+then writes a private daily autonomy impact snapshot alongside the unchanged
+lesson measurement stream. `twill trend --json` and `twill digest --json`
+replay the same source and version coverage. Unknown terminal state,
+unreviewed candidates, and missing exchange telemetry remain explicit; the
+before/after comparison is observational.
+
 Use `--settle 0` for a deliberately controlled fixture, `--file PATH` to select one session, or
 `--state-dir PATH` and `--source PATH` for an isolated run. The initial walking skeleton did not
 implement ranking, coverage, LLM explanation, measurement, or timers; cursor and schema support now

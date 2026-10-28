@@ -32,6 +32,9 @@ RESOLUTION_AFTER_DAYS = 21
 MEASURABLE_STATES = frozenset(
     {"accepted"} | {f"applied:{layer}" for layer in twill_lessons.ROUTING_LAYERS}
 )
+AUTONOMY_FAMILIES = frozenset(
+    detector.detector_id for detector in twill_detectors.AUTONOMY_DETECTORS
+)
 _DETECTOR_ID_RE = re.compile(r"^D-\d{2,}@\d+$")
 _TIMESTAMP_FORMATS = ("%Y-%m-%d",)
 
@@ -199,6 +202,7 @@ class MeasurementReport:
     skipped: tuple[str, ...] = ()
     resolved: tuple[str, ...] = ()
     covered_clusters: tuple[CoveredClusterMeasurement, ...] = ()
+    autonomy_impact: dict[str, object] | None = None
 
     @property
     def points(self) -> tuple[Measurement, ...]:
@@ -217,6 +221,7 @@ class MeasurementReport:
             "skipped": list(self.skipped),
             "resolved": list(self.resolved),
             "covered_clusters": [item.as_dict() for item in self.covered_clusters],
+            "autonomy_impact": self.autonomy_impact,
         }
 
 
@@ -648,6 +653,10 @@ def evaluate_resolutions(
     for lesson in sorted(lessons, key=lambda item: item.id):
         if not lesson.state.startswith("applied:"):
             continue
+        if lesson.detector.split("@", 1)[0] in AUTONOMY_FAMILIES:
+            # Historical six-field points have no assessment-coverage proof.
+            # They cannot establish 21 verified-zero days for autonomy.
+            continue
         raw_applied_at = lesson.routing.get("applied_at")
         if not isinstance(raw_applied_at, str):
             continue
@@ -1054,6 +1063,12 @@ def measure_lessons(
     database_history = _read_database(connection)
     mirror_history = read_measurements(artifacts_root, repo_root=repo_root)
     history = _merge_history(database_history, mirror_history)
+    autonomy_coverage = None
+    if any(record.detector.split("@", 1)[0] in AUTONOMY_FAMILIES
+           for record in records):
+        import twill_autonomy_impact
+        autonomy_coverage = twill_autonomy_impact.summarize(
+            connection, artifacts_root, window_start, measured_at)
     points: list[Measurement] = []
     skipped: list[str] = []
     for lesson in records:
@@ -1067,6 +1082,20 @@ def measure_lessons(
             window_start_utc=window_start,
             window_days=window_days,
         )
+        if (lesson.detector.split("@", 1)[0] in AUTONOMY_FAMILIES
+                and point.sessions == 0 and point.events == 0):
+            cells = [cell for cell in autonomy_coverage["groups"]
+                     if cell["family"] == lesson.detector.split("@", 1)[0]
+                     and cell["current_version"]]
+            assessed = [cell for cell in cells if cell["eligible_opportunities"]]
+            covered = bool(assessed) and all(
+                cell["terminal_known"] == cell["eligible_opportunities"] ==
+                cell["assessed_eligible"] and
+                not cell["unknown_unassessed"] and
+                not cell["opportunities_unknown"] for cell in cells)
+            if not covered:
+                skipped.append(lesson.id)
+                continue
         points.append(
             Measurement(
                 lesson_id=point.lesson_id,
@@ -1103,6 +1132,11 @@ def measure_lessons(
         _cleanup_staged(staged)
         raise
     resolved: list[str] = []
+    autonomy_impact = None
+    if lesson_id is None:
+        import twill_autonomy_impact
+        autonomy_impact = twill_autonomy_impact.measure(
+            connection, artifacts_root, current, window_days, autonomy_coverage)
     for candidate in evaluate_resolutions(records, history.values(), as_of=current):
         twill_lessons.resolve_lesson(
             artifacts_root,
@@ -1118,6 +1152,7 @@ def measure_lessons(
         skipped=tuple(skipped),
         resolved=tuple(resolved),
         covered_clusters=covered_clusters,
+        autonomy_impact=autonomy_impact,
     )
 
 

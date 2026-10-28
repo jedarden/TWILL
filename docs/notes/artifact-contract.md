@@ -161,8 +161,28 @@ regular files without symlinks. The sidecar inventories only
 `autonomy/assessments/A-<32 lowercase hex>.jsonl`
 (`twill-autonomy-assessment/v1`), daily `autonomy/impact/YYYY-MM-DD.json`
 (`twill-autonomy-impact/v1`) and `autonomy/interventions.jsonl`
-(`twill-autonomy-intervention/v1`). The latter two payload kinds are reserved
-for Phase 9E.
+(`twill-autonomy-intervention/v1`). `twill measure` writes one impact snapshot
+per UTC day. Each snapshot carries a half-open seven-day window, source and
+detector/analyzer version cells, eligible and unknown opportunity counts,
+terminal coverage, candidates by disposition, current supported findings,
+explicit restart/approval exchanges, and adjudicated precision/abstention.
+The global `supported_interventions` count deduplicates families by episode.
+Rates are null for zero or unassessed denominators. The source coverage list
+reports retained interactions, cap omissions, truncation, and missing summaries.
+Recorded exchange-to-terminal timestamps yield observational elapsed intervals.
+Token/cost values remain null without matching per-exchange telemetry;
+whole-session usage is never assigned to an exchange.
+
+`twill autonomy intervention ID --at TIMESTAMP --reason TEXT` appends an
+explicitly dated private intervention. The next impact snapshot includes
+before/after windows keyed by the recorded candidate and marks a comparison
+comparable only after the later full window is observed with matching covered
+source/version cells. All comparisons remain observational and make no causal
+claim. The original six-field `twill-measurement/v1` row is unchanged.
+An autonomy lesson receives no verified-zero point when opportunity or
+assessment coverage is unknown. Legacy six-field autonomy zero rows cannot
+alone qualify a lesson for automatic resolution because they carry no coverage
+proof; the accepted lesson remains immutable.
 
 An assessment journal appends monotonically revisioned decisions with a
 redacted reason, source references, supersession link, detector/analyzer

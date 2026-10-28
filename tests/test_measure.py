@@ -119,6 +119,31 @@ class MeasurementTests(unittest.TestCase):
             },
         )
 
+    def test_autonomy_unknown_coverage_never_becomes_a_zero_or_resolution(self):
+        path = self.lesson("L-00000001", state="applied:environment")
+        path.write_text(path.read_text().replace("detector: D-01", "detector: D-12")
+                        .replace("command-not-found:sqlite3",
+                                 "autonomy:D-12:build:report"))
+        original = path.read_bytes()
+        connection = twill_schema.connect(self.state)
+        self.addCleanup(connection.close)
+        report = twill_measure.measure_lessons(
+            connection, self.artifacts, now="2026-10-25T12:00:00Z")
+        self.assertEqual(report.measurements, ())
+        self.assertIn("L-00000001", report.skipped)
+        self.assertEqual(connection.execute(
+            "SELECT count(*) FROM measurement").fetchone()[0], 0)
+        self.assertEqual(path.read_bytes(), original)
+
+        # Legacy zero rows have no attached assessment-coverage denominator.
+        lesson = twill_lessons.load_lesson(path)
+        points = tuple(twill_measure.Measurement(
+            lesson_id=lesson.id, detector_id="D-12@2",
+            measured_at=f"2026-10-{day:02d}T12:00:00Z", window_days=7,
+            sessions=0, events=0) for day in range(1, 22))
+        self.assertEqual(twill_measure.evaluate_resolutions(
+            (lesson,), points, as_of="2026-10-25T12:00:00Z"), ())
+
     def test_measure_exposes_covered_and_omits_uncovered_cluster_snapshots(self):
         rule = self.root / "rules" / "AGENTS.md"
         rule.parent.mkdir()
