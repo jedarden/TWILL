@@ -242,6 +242,10 @@ def rescan_redaction(
                 )
                 rows_changed += 1
                 fields_changed += 1
+        # Assertions are a derived projection of the redacted interaction
+        # fields. Never retain pre-rescan text or support hashes.
+        import twill_episodes
+        twill_episodes.project_all(connection)
     return {
         "rows_scanned": rows_scanned,
         "rows_changed": rows_changed,

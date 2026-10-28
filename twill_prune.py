@@ -9,6 +9,7 @@ from datetime import datetime, timedelta, timezone
 from typing import Sequence
 
 import twill_detectors
+import twill_episodes
 from twill_config import DEFAULT_RETENTION_SECONDS
 from twill_contract import EXIT_SUCCESS
 
@@ -149,6 +150,11 @@ def _delete_expired(connection: sqlite3.Connection, cutoff: datetime) -> None:
                 "DELETE FROM interaction WHERE interaction_id = ?",
                 expired_interactions,
             )
+        changed_sessions = [row[0] for row in connection.execute(
+            "SELECT session_key FROM interaction_summary WHERE retained != "
+            "(SELECT count(*) FROM interaction WHERE interaction.session_key = "
+            "interaction_summary.session_key)"
+        )]
         connection.execute(
             "UPDATE interaction_summary SET retained = "
             "(SELECT count(*) FROM interaction "
@@ -161,6 +167,8 @@ def _delete_expired(connection: sqlite3.Connection, cutoff: datetime) -> None:
             "history_confirmed = coalesce((SELECT sum(history_confirmed) FROM interaction "
             "WHERE interaction.session_key = interaction_summary.session_key), 0)"
         )
+        for session_key in changed_sessions:
+            twill_episodes.project_session(connection, session_key)
 
 
 def _seconds(value: object) -> float:

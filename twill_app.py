@@ -30,6 +30,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 import twill_detectors
 import twill_catalog
 import twill_denials
+import twill_episodes
 import twill_brief
 import twill_crosshost
 import twill_digest
@@ -1134,6 +1135,7 @@ class Store:
             _ensure_transcript_event_signature_columns(self.connection)
             _backfill_transcript_event_signatures(self.connection)
             self.connection.commit()
+            twill_episodes.ensure_current(self.connection)
 
     def close(self) -> None:
         snapshot = self._history_snapshot
@@ -1364,6 +1366,7 @@ class Store:
                 cursor_update=cursor_update,
                 now=now,
             )
+            twill_episodes.project_session(conn, key)
         return PersistResult(
             observations=observation_count,
             interactions=interaction_report.retained,

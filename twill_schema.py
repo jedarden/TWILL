@@ -475,6 +475,30 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
                 "history_adapter TEXT, ingested_at TEXT NOT NULL)",
             ),
         ),
+        Migration(
+            10,
+            "execution_episode_contract",
+            (
+                "CREATE TABLE IF NOT EXISTS execution_episode("
+                "episode_id TEXT PRIMARY KEY, session_key TEXT NOT NULL, "
+                "contract_version TEXT NOT NULL, input_sha TEXT NOT NULL, "
+                "start_ordinal INTEGER NOT NULL, end_ordinal INTEGER NOT NULL, "
+                "thread_id TEXT, objective TEXT, action_key TEXT, "
+                "authority_state TEXT NOT NULL, context_state TEXT NOT NULL, "
+                "historical_policy_state TEXT NOT NULL, "
+                "lifecycle TEXT NOT NULL, advice_only INTEGER NOT NULL DEFAULT 0)",
+                "CREATE INDEX IF NOT EXISTS execution_episode_session "
+                "ON execution_episode(session_key, start_ordinal)",
+                "CREATE TABLE IF NOT EXISTS episode_assertion("
+                "assertion_id TEXT PRIMARY KEY, episode_id TEXT NOT NULL "
+                "REFERENCES execution_episode(episode_id), "
+                "kind TEXT NOT NULL, value TEXT, strength TEXT NOT NULL, "
+                "source_ordinal INTEGER, source_line INTEGER, "
+                "related_ordinal INTEGER, detail TEXT)",
+                "CREATE INDEX IF NOT EXISTS episode_assertion_episode "
+                "ON episode_assertion(episode_id, kind)",
+            ),
+        ),
     )
 )
 
