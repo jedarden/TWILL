@@ -1618,12 +1618,18 @@ def _autonomy_queries(family: str) -> tuple[str, str, str, str]:
       WITH eligible AS (
         SELECT a.cluster_key AS key, i.session_id, a.assessed_at AS ts_utc
         FROM autonomy_assessment AS a
+        LEFT JOIN autonomy_adjudication AS j ON j.candidate_id=a.candidate_id
         JOIN execution_episode AS e ON e.episode_id=a.episode_id
         JOIN interaction AS i ON i.session_key=e.session_key
              AND i.ordinal=e.start_ordinal
-        WHERE a.family='{family}' AND a.detector_version=1
+        WHERE a.family='{family}' AND a.detector_version=2
           AND a.analyzer_version='autonomy-analyzer/v1'
-          AND a.input_sha=e.input_sha AND a.disposition='supported'
+          AND a.input_sha=e.input_sha
+          AND (CASE WHEN j.candidate_id IS NULL THEN a.disposition='supported'
+                    ELSE j.disposition='supported'
+                      AND j.detector_version=a.detector_version
+                      AND j.analyzer_version=a.analyzer_version
+                      AND j.input_sha=a.input_sha AND j.evidence_sha=a.evidence_sha END)
           AND a.assessed_at >= :window_start_utc
     """
     base = eligible + ")\n"
@@ -1642,7 +1648,7 @@ def _autonomy_queries(family: str) -> tuple[str, str, str, str]:
 
 
 AUTONOMY_DETECTORS = tuple(
-    Detector(family, 1, description, *_autonomy_queries(family))
+    Detector(family, 2, description, *_autonomy_queries(family))
     for family, description in (
         ("D-12", "Unnecessary handoff of an authorized pending action"),
         ("D-13", "Repeated approval request for a settled action"),

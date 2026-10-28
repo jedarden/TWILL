@@ -2866,8 +2866,9 @@ class DetectCliTests(unittest.TestCase):
                     set(item),
                     {"detector_id", "version", "full_id", "status", "clusters", "error", "reason"},
                 )
-                self.assertEqual(item["version"], 1)
-                self.assertEqual(item["full_id"], f"{item['detector_id']}@1")
+                expected_version = 2 if item["detector_id"] in {"D-12", "D-13", "D-14", "D-15", "D-16"} else 1
+                self.assertEqual(item["version"], expected_version)
+                self.assertEqual(item["full_id"], f"{item['detector_id']}@{expected_version}")
                 self.assertEqual(item["clusters"], 0)
                 self.assertIsNone(item["error"])
             # The throwaway HOME has no denial log, so D-04 skips the same

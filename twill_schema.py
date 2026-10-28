@@ -516,6 +516,18 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
                 "ON autonomy_assessment(family, disposition, cluster_key, session_key)",
             ),
         ),
+        Migration(
+            12,
+            "autonomy_adjudication_projection",
+            (
+                "CREATE TABLE IF NOT EXISTS autonomy_adjudication("
+                "candidate_id TEXT PRIMARY KEY, revision INTEGER NOT NULL, "
+                "disposition TEXT NOT NULL, reason TEXT NOT NULL, "
+                "detector_version INTEGER NOT NULL, analyzer_version TEXT NOT NULL, "
+                "input_sha TEXT NOT NULL, evidence_sha TEXT NOT NULL, "
+                "journal_sha TEXT NOT NULL)",
+            ),
+        ),
     )
 )
 

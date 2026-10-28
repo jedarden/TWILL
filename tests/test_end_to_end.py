@@ -343,7 +343,7 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
     def test_every_verb_exits_zero_with_the_archive_present(self):
         for step in ("ingest_first", "ingest_second", "detect", "rank", "digest", "measure"):
             result = self.run_a[step]
-            self.assertEqual(result.returncode, 0, f"{step}: {result.stderr}")
+            self.assertEqual(result.returncode, 0, f"{step}: {result.stderr}{result.stdout}")
 
     def test_only_configured_sources_reach_twill_state(self):
         sessions = dict(self.run_a["database"]["sessions"])
@@ -495,7 +495,7 @@ class FixtureCorpusEndToEndTests(unittest.TestCase):
 
         for step in ("ingest_first", "ingest_second", "detect", "rank", "digest", "measure"):
             result = run_b[step]
-            self.assertEqual(result.returncode, 0, f"{step}: {result.stderr}")
+            self.assertEqual(result.returncode, 0, f"{step}: {result.stderr}{result.stdout}")
         # The digest artifact was genuinely re-rendered by the degraded run,
         # not left over from the archive-present one.
         self.assertTrue(run_b["digest_path"].is_file())

@@ -6,6 +6,7 @@ import math
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from typing import Sequence
 
 import twill_detectors
@@ -257,6 +258,7 @@ def prune_observations(
     now: str | datetime | None = None,
     registry: Sequence[twill_detectors.Detector] | None = None,
     only: Sequence[str] | None = None,
+    artifacts_root: Path | None = None,
 ) -> PruneReport:
     """Delete expired observations and refresh detector-derived clusters.
 
@@ -309,6 +311,9 @@ def prune_observations(
                           "AND name='autonomy_assessment'").fetchone():
         import twill_autonomy
         twill_autonomy.project(connection)
+        if artifacts_root is not None:
+            import twill_autonomy_review
+            twill_autonomy_review.reconcile(connection, artifacts_root)
 
     detector_report = twill_detectors.run_detectors(
         connection,

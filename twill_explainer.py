@@ -24,6 +24,7 @@ from typing import Any, NoReturn, TypeGuard
 from twill_config import ConfigError, TwillConfig
 from twill_contract import ValidationError
 from twill_detectors import (
+    AUTONOMY_DETECTORS,
     MAX_ERROR_LENGTH,
     REGISTRY,
     DetectorContractError,
@@ -739,10 +740,29 @@ def _load_candidate_clusters(connection: sqlite3.Connection, top_k: int) -> tupl
         "last_seen, score, covered_by, state FROM cluster "
         "WHERE state = 'open' AND covered_by IS NULL "
         "AND detector_id NOT IN ('D-09', 'D-10', 'D-11') "
+        "AND (detector_id NOT IN ('D-12','D-13','D-14','D-15','D-16') OR sessions >= 2) "
         "ORDER BY score DESC, sessions DESC, events DESC, last_seen DESC, "
         "detector_id ASC, key ASC LIMIT ?",
-        (top_k,),
+        (top_k * 4,),
     ).fetchall()
+    autonomy_by_id = {detector.detector_id: detector for detector in AUTONOMY_DETECTORS}
+    live_cache: dict[tuple[str, int], dict[str, tuple[int, int, str, str]]] = {}
+    filtered = []
+    for row in rows:
+        detector = autonomy_by_id.get(str(row[0]))
+        if detector is not None:
+            days = int(row[2])
+            cache_key = (detector.detector_id, days)
+            if cache_key not in live_cache:
+                start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+                live_cache[cache_key] = read_clusters(
+                    connection, detector, window_start_utc=start, window_days=days)
+            current = live_cache[cache_key].get(str(row[1]))
+            if current is None or current[0] < 2:
+                continue
+        filtered.append(row)
+        if len(filtered) >= top_k:
+            break
     return tuple(
         RankedCluster(
             detector_id=str(row[0]),
@@ -756,7 +776,7 @@ def _load_candidate_clusters(connection: sqlite3.Connection, top_k: int) -> tupl
             covered_by=None if row[8] is None else str(row[8]),
             state=str(row[9]),
         )
-        for row in rows
+        for row in filtered
     )
 
 
@@ -941,6 +961,40 @@ def _load_evidence(connection: sqlite3.Connection, cluster: object) -> tuple[Pro
     key = _get(cluster, "key")
     if not isinstance(detector_id, str) or not isinstance(key, str):
         return ()
+    if detector_id in {"D-12", "D-13", "D-14", "D-15", "D-16"}:
+        rows = connection.execute(
+            "SELECT a.candidate_id, a.session_key, a.supporting_refs, s.session_id "
+            "FROM autonomy_assessment a "
+            "JOIN execution_episode e ON e.episode_id=a.episode_id "
+            "JOIN session s ON s.session_key=a.session_key "
+            "LEFT JOIN autonomy_adjudication j ON j.candidate_id=a.candidate_id "
+            "WHERE a.family=? AND a.cluster_key=? AND a.detector_version=2 "
+            "AND a.analyzer_version='autonomy-analyzer/v1' AND a.input_sha=e.input_sha "
+            "AND (CASE WHEN j.candidate_id IS NULL THEN a.disposition='supported' "
+            "ELSE j.disposition='supported' AND j.detector_version=a.detector_version "
+            "AND j.analyzer_version=a.analyzer_version AND j.input_sha=a.input_sha "
+            "AND j.evidence_sha=a.evidence_sha END) "
+            "AND a.assessed_at>=? AND a.assessed_at<=? "
+            "ORDER BY a.assessed_at, a.candidate_id LIMIT 64",
+            (detector_id, key, first, last),
+        ).fetchall()
+        if len({row[3] for row in rows}) < 2:
+            return ()
+        evidence = []
+        for candidate_id, session_key, refs_json, session_id in rows:
+            for ref in json.loads(refs_json)[:24]:
+                ordinal = ref.get("ordinal")
+                if ordinal is None:
+                    continue
+                item = connection.execute(
+                    "SELECT source_line, text FROM interaction WHERE session_key=? AND ordinal=?",
+                    (session_key, ordinal),
+                ).fetchone()
+                if item is None or not item[1]:
+                    continue
+                excerpt = f"{ref['kind']} at line {item[0]}: {item[1]}"
+                evidence.append(PromptExcerpt(f"{candidate_id}:{ordinal}", str(session_id), excerpt))
+        return tuple(evidence)
     membership = _membership_predicate(detector_id, key)
     if membership is None:
         return ()

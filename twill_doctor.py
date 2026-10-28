@@ -1569,7 +1569,7 @@ def _seed_selftest_fixture(connection: sqlite3.Connection, now: datetime) -> Non
             (episode_id, session_key),
         )
         connection.execute(
-            "INSERT INTO autonomy_assessment VALUES (?, ?, ?, ?, 1, "
+            "INSERT INTO autonomy_assessment VALUES (?, ?, ?, ?, 2, "
             "'autonomy-analyzer/v1', 'selftest-input', 'selftest-evidence', ?, "
             "'supported', 'selftest', '[]', '[]', '[]', 'captured', ?)",
             (f"selftest-candidate-{number}", episode_id, session_key, family,

@@ -24,7 +24,7 @@ tree=$(CDPATH= cd -- "$tree" 2>/dev/null && pwd -P) || {
 }
 
 status=0
-for artifact_dir in lessons digests measurements guards; do
+for artifact_dir in lessons digests measurements guards autonomy; do
   artifact_path="$tree/$artifact_dir"
 
   # A file or symlink at the artifact root is a published artifact too.

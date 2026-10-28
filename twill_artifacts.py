@@ -35,6 +35,13 @@ DIGEST_SCHEMA = "twill-digest/v1"
 MEASUREMENT_SCHEMA = "twill-measurement/v1"
 GUARD_SCHEMA = "twill-guard/v1"
 ARTIFACT_DIRS = ("lessons", "digests", "measurements", "guards")
+AUTONOMY_SCHEMA = "twill-autonomy-artifacts/v1"
+AUTONOMY_MANIFEST = "autonomy/manifest.json"
+AUTONOMY_ASSESSMENT_SCHEMA = "twill-autonomy-assessment/v1"
+AUTONOMY_IMPACT_SCHEMA = "twill-autonomy-impact/v1"
+AUTONOMY_INTERVENTION_SCHEMA = "twill-autonomy-intervention/v1"
+_AUTONOMY_ASSESSMENT_RE = re.compile(r"^A-[0-9a-f]{32}\.jsonl$")
+_AUTONOMY_IMPACT_RE = re.compile(r"^\d{4}-\d{2}-\d{2}\.json$")
 MANIFEST_FILE_MODE = 0o600
 MANIFEST_DIR_MODE = 0o700
 
@@ -187,6 +194,101 @@ def _schema_for(relative: Path) -> str:
     if namespace == "guards" and _GUARD_NAME_RE.fullmatch(name):
         return GUARD_SCHEMA
     raise ArtifactContractError(f"unrecognized artifact path: {relative}")
+
+
+def _autonomy_schema_for(relative: Path) -> str:
+    parts = relative.parts
+    if len(parts) == 3 and parts[:2] == ("autonomy", "assessments") and _AUTONOMY_ASSESSMENT_RE.fullmatch(parts[2]):
+        return AUTONOMY_ASSESSMENT_SCHEMA
+    if len(parts) == 3 and parts[:2] == ("autonomy", "impact") and _AUTONOMY_IMPACT_RE.fullmatch(parts[2]):
+        try:
+            date.fromisoformat(parts[2][:-5])
+        except ValueError as exc:
+            raise ArtifactContractError("invalid autonomy impact date") from exc
+        return AUTONOMY_IMPACT_SCHEMA
+    if parts == ("autonomy", "interventions.jsonl"):
+        return AUTONOMY_INTERVENTION_SCHEMA
+    raise ArtifactContractError(f"unrecognized autonomy path: {relative}")
+
+
+def _autonomy_inventory(root: Path) -> list[dict[str, object]]:
+    directory = root / "autonomy"
+    if not os.path.lexists(directory):
+        return []
+    if directory.is_symlink() or not directory.is_dir():
+        raise ArtifactContractError("autonomy namespace is not a regular directory")
+    entries = []
+    for path in sorted(directory.rglob("*")):
+        if path.is_symlink():
+            raise ArtifactContractError("autonomy artifact cannot be a symlink")
+        if path.is_dir():
+            if path.relative_to(directory).parts not in (("assessments",), ("impact",)):
+                raise ArtifactContractError("unknown autonomy directory")
+            continue
+        relative = path.relative_to(root)
+        if relative.as_posix() == AUTONOMY_MANIFEST:
+            continue
+        if not path.is_file():
+            raise ArtifactContractError("autonomy artifact must be a regular file")
+        schema = _autonomy_schema_for(relative)
+        content = path.read_bytes()
+        entries.append({"path": relative.as_posix(), "schema": schema,
+                        "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest()})
+    return entries
+
+
+def _validate_autonomy_payload(path: Path, schema: str) -> None:
+    """Validate the reserved impact/intervention envelopes without defining 9E metrics."""
+    content = path.read_bytes()
+    if len(content) > 1024 * 1024:
+        raise ArtifactContractError("autonomy payload exceeds one MiB")
+    try:
+        text = content.decode("utf-8")
+        values = [json.loads(line, object_pairs_hook=_reject_duplicate_json_keys)
+                  for line in text.splitlines() if line] if path.suffix == ".jsonl" else [
+                      json.loads(text, object_pairs_hook=_reject_duplicate_json_keys)]
+    except (UnicodeError, ValueError) as exc:
+        raise ArtifactContractError("autonomy payload is not valid UTF-8 JSON") from exc
+    if not values or any(not isinstance(value, dict) or value.get("schema") != schema for value in values):
+        raise ArtifactContractError("autonomy payload schema mismatch")
+    def walk(value: object) -> None:
+        if isinstance(value, str):
+            if len(value) > 240 or redact_text(value) != value:
+                raise ArtifactContractError("autonomy payload has an oversized or unredacted field")
+        elif isinstance(value, list):
+            for item in value:
+                walk(item)
+        elif isinstance(value, dict):
+            for key, item in value.items():
+                walk(key)
+                walk(item)
+    for value in values:
+        walk(value)
+
+
+def _atomic_json(path: Path, payload: Mapping[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True, mode=MANIFEST_DIR_MODE)
+    content = (json.dumps(payload, ensure_ascii=False, indent=2, sort_keys=True) + "\n").encode()
+    descriptor, name = tempfile.mkstemp(dir=path.parent, prefix=".manifest-", suffix=".tmp")
+    temporary = Path(name)
+    try:
+        os.fchmod(descriptor, MANIFEST_FILE_MODE)
+        with os.fdopen(descriptor, "wb") as handle:
+            descriptor = -1
+            handle.write(content)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(temporary, path)
+        os.chmod(path, MANIFEST_FILE_MODE)
+        fd = os.open(path.parent, os.O_RDONLY | getattr(os, "O_DIRECTORY", 0))
+        try:
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+    finally:
+        if descriptor >= 0:
+            os.close(descriptor)
+        temporary.unlink(missing_ok=True)
 
 
 def _inventory(root: Path) -> list[dict[str, object]]:
@@ -447,13 +549,32 @@ def _validate_snapshot_contents(
 def _manifest_payload(root: Path, generated_at: str | None) -> dict[str, object]:
     timestamp = generated_at or datetime.now(timezone.utc).isoformat().replace("+00:00", "Z")
     _timestamp(timestamp)
-    return {
+    payload = {
         "schema": CONTRACT_SCHEMA,
         "producer": "twill",
         "generated_at": timestamp,
         "paths": {name: dict(PATH_CONTRACT[name]) for name in ARTIFACT_DIRS},
         "artifacts": _inventory(root),
     }
+    if os.path.lexists(root / "autonomy"):
+        sidecar = root / AUTONOMY_MANIFEST
+        if sidecar.is_symlink() or not sidecar.is_file():
+            raise ArtifactContractError("autonomy namespace has no regular manifest")
+        content = sidecar.read_bytes()
+        payload["extensions"] = {"autonomy": {
+            "schema": AUTONOMY_SCHEMA, "manifest": AUTONOMY_MANIFEST,
+            "bytes": len(content), "sha256": hashlib.sha256(content).hexdigest(),
+        }}
+    return payload
+
+
+def write_autonomy_manifest(artifacts_root: Path, *, repo_root: Path | None = None) -> Path:
+    root = _root(artifacts_root, repo_root=repo_root)
+    path = root / AUTONOMY_MANIFEST
+    _atomic_json(path, {"schema": AUTONOMY_SCHEMA, "producer": "twill",
+                        "generated_at": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"),
+                        "artifacts": _autonomy_inventory(root)})
+    return path
 
 
 def write_manifest(
@@ -525,9 +646,13 @@ def manifest_after_write(
 
     root = _root(artifacts_root, repo_root=repo_root)
     unique_paths = tuple(dict.fromkeys(Path(path) for path in paths))
-    snapshots = tuple(_ArtifactSnapshot(path) for path in unique_paths)
+    extra = (root / AUTONOMY_MANIFEST, root / MANIFEST_FILENAME) if any(
+        root / "autonomy" in path.parents for path in unique_paths) else ()
+    snapshots = tuple(_ArtifactSnapshot(path) for path in dict.fromkeys((*unique_paths, *extra)))
     try:
         yield
+        if extra:
+            write_autonomy_manifest(root, repo_root=repo_root)
         write_manifest(root, repo_root=repo_root)
     except BaseException:
         for snapshot in reversed(snapshots):
@@ -621,6 +746,47 @@ def read_manifest(
             raise ArtifactContractError(f"manifest hash mismatch for {relative}")
     _validate_snapshot_contents(root, tuple(actual.values()), repo_root=repo_root)
     return payload
+
+
+def read_autonomy_manifest(artifacts_root: Path, *, repo_root: Path | None = None) -> dict[str, object]:
+    """Strictly validate the optional private autonomy namespace and its pointer."""
+    root = _root(artifacts_root, repo_root=repo_root)
+    manifest = read_manifest(root, repo_root=repo_root)
+    extension = manifest.get("extensions", {})
+    pointer = extension.get("autonomy") if isinstance(extension, dict) else None
+    if not isinstance(pointer, dict) or pointer.get("schema") != AUTONOMY_SCHEMA or pointer.get("manifest") != AUTONOMY_MANIFEST:
+        raise ArtifactContractError("autonomy extension is missing or unsupported")
+    path = root / AUTONOMY_MANIFEST
+    if path.is_symlink() or not path.is_file():
+        raise ArtifactContractError("autonomy sidecar is missing or linked")
+    content = path.read_bytes()
+    if pointer.get("bytes") != len(content) or pointer.get("sha256") != hashlib.sha256(content).hexdigest():
+        raise ArtifactContractError("autonomy sidecar pointer hash/size mismatch")
+    sidecar = _read_json(path, label=AUTONOMY_MANIFEST)
+    if not isinstance(sidecar, dict) or sidecar.get("schema") != AUTONOMY_SCHEMA or sidecar.get("producer") != "twill":
+        raise ArtifactContractError("autonomy sidecar schema/producer is invalid")
+    _timestamp(sidecar.get("generated_at"))
+    listed = sidecar.get("artifacts")
+    if not isinstance(listed, list):
+        raise ArtifactContractError("autonomy inventory must be an array")
+    actual = {entry["path"]: entry for entry in _autonomy_inventory(root)}
+    seen = set()
+    for entry in listed:
+        if not isinstance(entry, dict) or not isinstance(entry.get("path"), str):
+            raise ArtifactContractError("invalid autonomy inventory entry")
+        relative = entry["path"]
+        if relative in seen or relative not in actual or entry != actual[relative]:
+            raise ArtifactContractError("autonomy inventory mismatch")
+        seen.add(relative)
+        artifact = root / relative
+        if entry["schema"] == AUTONOMY_ASSESSMENT_SCHEMA:
+            from twill_autonomy_review import validate_journal
+            validate_journal(artifact)
+        elif entry["schema"] in (AUTONOMY_IMPACT_SCHEMA, AUTONOMY_INTERVENTION_SCHEMA):
+            _validate_autonomy_payload(artifact, entry["schema"])
+    if seen != set(actual):
+        raise ArtifactContractError("autonomy inventory is incomplete")
+    return sidecar
 
 
 def is_retrieval_eligible(lesson: object) -> bool:
@@ -759,7 +925,7 @@ def _expand_namespace_paths(root: Path, paths: Sequence[str]) -> tuple[str, ...]
     expanded: list[str] = []
     for path in paths:
         namespace = path.rstrip("/")
-        if namespace not in ARTIFACT_DIRS or not (root / namespace).is_dir():
+        if namespace not in (*ARTIFACT_DIRS, "autonomy") or not (root / namespace).is_dir():
             expanded.append(path)
             continue
         for candidate in sorted((root / namespace).rglob("*")):
@@ -769,7 +935,7 @@ def _expand_namespace_paths(root: Path, paths: Sequence[str]) -> tuple[str, ...]
 
 
 def _contract_path(path: str) -> bool:
-    if path == MANIFEST_FILENAME:
+    if path in (MANIFEST_FILENAME, AUTONOMY_MANIFEST):
         return True
     candidate = Path(path)
     if (
@@ -779,7 +945,10 @@ def _contract_path(path: str) -> bool:
     ):
         return False
     try:
-        _schema_for(candidate)
+        if candidate.parts[0] == "autonomy":
+            _autonomy_schema_for(candidate)
+        else:
+            _schema_for(candidate)
     except ArtifactContractError:
         return False
     return True
@@ -810,7 +979,7 @@ def _extract_archive(archive_path: Path, destination: Path) -> None:
                 and destination.resolve() not in target.parents
             ):
                 raise ArtifactPublicationError("git archive contains an unsafe path")
-            if member.name != MANIFEST_FILENAME and relative.parts[0] not in ARTIFACT_DIRS:
+            if member.name != MANIFEST_FILENAME and relative.parts[0] not in (*ARTIFACT_DIRS, "autonomy"):
                 continue
             if member.issym() or member.islnk() or member.isdev():
                 raise ArtifactPublicationError("git archive contains a link or device")
@@ -848,7 +1017,10 @@ def _validate_git_tree(
             raise ArtifactPublicationError(
                 "staged artifact tree does not contain the producer manifest"
             )
-        return read_manifest(checkout, repo_root=repo_root)
+        manifest = read_manifest(checkout, repo_root=repo_root)
+        if (checkout / "autonomy").exists() or "autonomy" in manifest.get("extensions", {}):
+            read_autonomy_manifest(checkout, repo_root=repo_root)
+        return manifest
 
 
 def read_committed_manifest(
@@ -904,6 +1076,8 @@ def publish_snapshot(
     root = _root(Path(artifacts_root), repo_root=repo_root)
     _git_repo(root, require_origin=push)
     read_manifest(root, repo_root=repo_root)
+    if (root / "autonomy").exists():
+        read_autonomy_manifest(root, repo_root=repo_root)
     manifest_bytes = (root / MANIFEST_FILENAME).read_bytes()
 
     branch_result = _git(root, ("symbolic-ref", "--quiet", "--short", "HEAD"), check=False)

@@ -394,7 +394,7 @@ class MigrationRunnerTests(unittest.TestCase):
     """Plan §8.4: additive-only, version-stamped, downgrade-tolerant migrations.
 
     The shipped registry carries the additive tables later phases add on top
-of the v1 baseline (currently version 11); the apply path beyond it is
+of the v1 baseline (currently version 12); the apply path beyond it is
     exercised by registering the kind of migrations those phases will add.
     """
 

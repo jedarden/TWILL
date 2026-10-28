@@ -62,7 +62,7 @@ class WritePolicyTests(unittest.TestCase):
 
     def test_write_under_each_in_tree_artifact_dir_is_denied(self):
         # Guard two of the artifact-containment guards (§10.2): the
-        # repository is writable, these four names inside it are not.
+        # repository is writable, these five names inside it are not.
         for name in openpath.ARTIFACT_DIRS:
             with self.subTest(artifact_dir=name):
                 violation = deny("write", str(ROOT / name / "L-0001.md"), "w", 0)
@@ -242,7 +242,7 @@ class HarnessInstallationTests(unittest.TestCase):
 
     def test_gitignore_and_the_harness_name_the_same_artifact_dirs(self):
         # Guard one (.gitignore) and guard two (this harness) must deny the
-        # same four names; a rename in either place alone is a hole.
+        # same five names; a rename in either place alone is a hole.
         gitignore = (ROOT / ".gitignore").read_text()
         ignored = {
             line.strip().rstrip("/")

@@ -146,8 +146,31 @@ the validated tree of one committed snapshot may replace the recall index.
 The existing containment boundary remains unchanged: `artifacts_root` is
 required, must resolve outside the public TWILL tree, and is the only place
 these four artifact namespaces may be written. The public checkout continues
-to gitignore all four namespaces, audit writes, reject secrets before
+to gitignore all five private namespaces, audit writes, reject secrets before
 persistence, and fail the published-tree check if any artifact leaks into it.
+
+## Phase 9 autonomy extension
+
+The root remains `twill-artifacts/v1` with the same four `paths`, original
+inventory and six-field measurement rows. When autonomy journals exist, an
+optional `extensions.autonomy` points to `autonomy/manifest.json` with
+`schema: twill-autonomy-artifacts/v1`, `bytes` and `sha256`. Older v1 readers
+ignore this namespace. A strict autonomy reader validates the pointer, the
+complete sidecar inventory, safe paths, hashes, payload schemas, redaction and
+regular files without symlinks. The sidecar inventories only
+`autonomy/assessments/A-<32 lowercase hex>.jsonl`
+(`twill-autonomy-assessment/v1`), daily `autonomy/impact/YYYY-MM-DD.json`
+(`twill-autonomy-impact/v1`) and `autonomy/interventions.jsonl`
+(`twill-autonomy-intervention/v1`). The latter two payload kinds are reserved
+for Phase 9E.
+
+An assessment journal appends monotonically revisioned decisions with a
+redacted reason, source references, supersession link, detector/analyzer
+versions and input/evidence hashes. The private journal and both manifests
+are validated and committed before the database projection changes. Rebuild
+reimports matching decisions; a stale version or hash cannot support a
+finding. The published-tree, open-path and ignore guards all reject
+`autonomy/` in this public checkout.
 
 ## Phase 7 extension
 

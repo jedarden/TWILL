@@ -300,6 +300,7 @@ class DigestReport:
     covered_escalations: tuple[CoveredEscalation, ...] = ()
     retirements: tuple[twill_rules.RetirementProposal, ...] = ()
     trend: twill_trend.TrendReport | None = None
+    autonomy_review: tuple[dict[str, str], ...] = ()
 
     @property
     def week_id(self) -> str:
@@ -317,6 +318,7 @@ class DigestReport:
             and not self.escalations
             and not self.covered_escalations
             and not self.retirements
+            and not self.autonomy_review
             and all(
                 detector.current_status == STATUS_OK
                 and detector.previous_status == STATUS_OK
@@ -959,8 +961,25 @@ def build_digest(
     cross_host_current: dict[str, dict[str, object]] = {}
     cross_host_previous: dict[str, dict[str, object]] = {}
     cross_host_freshness_as_of: str | None = None
+    autonomy_review: tuple[dict[str, str], ...] = ()
     try:
         source.execute("BEGIN")
+        autonomy_tables = {row[0] for row in source.execute(
+            "SELECT name FROM sqlite_master WHERE type='table' AND name IN "
+            "('autonomy_assessment','autonomy_adjudication','execution_episode','interaction','session')"
+        )}
+        if artifacts_root is not None and len(autonomy_tables) == 5:
+            from twill_autonomy_review import inspect
+            # Candidate review remains a separate lane; no item here is
+            # counted as an established lesson finding.
+            candidates = inspect(source, artifacts_root, state,
+                                 window_start=start)
+            autonomy_review = tuple(
+                {"candidate_id": item["candidate_id"], "family": item["family"],
+                 "disposition": item["disposition"], "reason": item["reason"]}
+                for item in candidates if item["assessed_at"] < end
+                and item["disposition"] in ("needs_review", "dismissed")
+            )
         if twill_crosshost.host_reports_imported(source):
             if not any(
                 detector.detector_id == twill_crosshost.DETECTOR_ID
@@ -1212,6 +1231,7 @@ def build_digest(
         covered_escalations=covered_escalations,
         retirements=retirements,
         trend=trend_report,
+        autonomy_review=autonomy_review,
     )
 
 
@@ -1284,6 +1304,7 @@ def render_data(report: DigestReport) -> dict[str, object]:
             proposal.as_dict() for proposal in report.covered_escalations
         ],
         "retirements": [proposal.as_dict() for proposal in report.retirements],
+        "autonomy_review": list(report.autonomy_review),
         "reproduction_command": report.command,
     }
 
@@ -1360,6 +1381,10 @@ def render_text(report: DigestReport) -> str:
             f"{report.trend.minimum_history_weeks} week(s)"
         )
     lines.append(_line(trend_text, report.command))
+    if report.autonomy_review:
+        lines.append(_line(f"autonomy candidates for review: {len(report.autonomy_review)}", report.command))
+        for item in report.autonomy_review:
+            lines.append(_line(f"  A-{item['candidate_id']} {item['family']} {item['disposition']}", report.command))
     if report.trend is not None:
         for warning in report.trend.warnings:
             lines.append(_line(f"trend warning: {warning}", report.command))

@@ -28,7 +28,7 @@ to the tests. The exact allowed write roots, in the order
 `is_allowed_write` decides them:
 
 1. **This repository** — except its top-level `lessons/`, `digests/`,
-   `measurements/` and `guards/` names, which are denied outright ("no
+   `measurements/`, `guards/` and `autonomy/` names, which are denied outright ("no
    lesson, digest, measurement or guard artifact is ever written inside this
    repository's tree", §8.3 again — guard two of §10.2's three
    artifact-containment guards). Top-level names only, mirroring the
@@ -62,10 +62,10 @@ and `ruff` remain development tools: the pytest runner has loaded before its
 `tests/`.
 
 Python-level network audit events are refused at socket and stdlib client
-boundaries. Explain's local `claude -p` invocation is the sole exception in
-the design; it is an external process, so its own network traffic is outside
-Python's audit-hook boundary. No other production code is permitted to spawn
-a network-capable child.
+boundaries. Production subprocesses are confined to Explain's local `claude
+-p`, the read-only ICG catalog export, and the private artifact publisher's
+Git helper with a working directory outside this public tree. The publisher
+commits an autonomy review before projecting it into the disposable database.
 
 ## One audit event covers both entry points
 

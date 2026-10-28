@@ -116,7 +116,7 @@ ARCHIVE_DIRNAME = "agent-transcript-archive"
 #: Top-level names only, mirroring the ``.gitignore`` block: an artifact
 #: writer names ``artifacts_root``, so a nested directory of the same name
 #: elsewhere in the tree is ordinary content, not a leak.
-ARTIFACT_DIRS = ("lessons", "digests", "measurements", "guards")
+ARTIFACT_DIRS = ("lessons", "digests", "measurements", "guards", "autonomy")
 
 #: Mode characters that intend mutation (§ of the ``open`` docs: any of
 #: w/a/x/+ writes or positions for writing; b/t/U are encoding flags).
@@ -238,6 +238,7 @@ def audit_hook(event: str, args: tuple) -> None:
             _check_subprocess(
                 executable,
                 command,
+                cwd=args[2] if len(args) > 2 else None,
                 allow_test_harness=_audit_event_came_from_subprocess(),
             )
         elif _is_network_event(event):
@@ -310,33 +311,55 @@ def check_subprocess(
 ) -> None:
     """Enforce the production child-process boundary.
 
-    ``cwd`` and ``env`` are accepted to mirror the four arguments carried by
-    the ``subprocess.Popen`` audit event, but neither is part of the allowlist:
-    the boundary is about the executable and argv. This public form is
-    intentionally strict; unlike the runtime hook, it never treats a test
-    caller's own subprocess as an exception.
+    ``cwd`` and ``env`` mirror the audit event. Git is allowed only from the
+    private artifact helper with a working directory outside this public tree.
+    This public form never treats a test caller's subprocess as an exception.
     """
 
-    del cwd, env
-    _check_subprocess(executable, command, allow_test_harness=False)
+    del env
+    _check_subprocess(executable, command, cwd=cwd, allow_test_harness=False)
 
 
 def _check_subprocess(
     executable: object,
     command: object,
     *,
+    cwd: object = None,
     allow_test_harness: bool,
 ) -> None:
     if _is_allowed_explain_child(executable, command):
         return
     if _is_allowed_catalog_child(executable, command):
         return
+    if _is_allowed_artifact_git(executable, command, cwd):
+        return
     if allow_test_harness and _called_from_test_harness():
         return
     raise SubprocessViolation(
-        "forbidden production child process; only the local claude -p "
-        "Explain invocation and icg catalog --json export are permitted"
+        "forbidden production child process; only Explain, catalog export "
+        "and the scoped private artifact publisher are permitted"
     )
+
+
+def _is_allowed_artifact_git(executable: object, command: object, cwd: object) -> bool:
+    """Allow only the existing publisher's git helper outside this public tree."""
+    if _subprocess_text(executable) != "git" or not isinstance(command, (list, tuple)):
+        return False
+    tokens = tuple(_subprocess_text(token) for token in command)
+    if not tokens or tokens[0] != "git" or cwd is None:
+        return False
+    try:
+        directory = Path(cwd).resolve()
+    except (TypeError, OSError, RuntimeError):
+        return False
+    if directory == REPO_TREE or _under(directory, REPO_TREE):
+        return False
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_code.co_name == "_git" and frame.f_globals.get("__name__") == "twill_artifacts":
+            return True
+        frame = frame.f_back
+    return False
 
 
 def _is_allowed_explain_child(executable: object, command: object) -> bool:

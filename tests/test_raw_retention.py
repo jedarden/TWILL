@@ -23,9 +23,10 @@ import twill_explainer  # noqa: E402
 
 # Keep the end-to-end CLI measurement inside its real trailing-seven-day
 # window, including when this suite runs months after the fixture was added.
-EVENT_AT = (datetime.now(timezone.utc) - timedelta(days=2)).replace(
-    hour=12, minute=0, second=0, microsecond=0
-)
+# Keep the event inside both the trailing-seven-day measurement window and
+# the last completed ISO week required by the artifact contract.
+_TODAY = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+EVENT_AT = _TODAY - timedelta(days=_TODAY.weekday() + 1) + timedelta(hours=23, minutes=59)
 WEEK = f"{EVENT_AT.isocalendar().year}-W{EVENT_AT.isocalendar().week:02d}"
 PROGRAM = "raw-retention-missing-tool"
 RAW_MARKER = "raw-jsonl-record-marker-7f2d"

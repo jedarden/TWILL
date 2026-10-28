@@ -17,7 +17,7 @@ from twill_episodes import action_key
 
 
 ANALYZER_VERSION = "autonomy-analyzer/v1"
-DETECTOR_VERSION = 1
+DETECTOR_VERSION = 2
 FAMILIES = ("D-12", "D-13", "D-14", "D-15", "D-16")
 MAX_REFERENCES = 24
 

@@ -29,6 +29,7 @@ from typing import Any, Callable, Iterator, Mapping, Sequence
 
 import twill_detectors
 import twill_autonomy
+import twill_autonomy_review
 import twill_catalog
 import twill_denials
 import twill_episodes
@@ -2117,6 +2118,7 @@ def rebuild_state_database(
     settle_seconds: float,
     content_fences: Sequence[str] = (),
     retention_seconds: float | None = None,
+    artifacts_root: Path | None = None,
 ) -> dict[str, object]:
     """Recreate the schema and reparse every session still on disk (§8.2).
 
@@ -2159,6 +2161,9 @@ def rebuild_state_database(
     )
     try:
         processed = [store.ingest_path(path) for path in files]
+        twill_autonomy.project(store.connection)
+        if artifacts_root is not None:
+            twill_autonomy_review.reconcile(store.connection, artifacts_root)
     finally:
         store.close()
     return {
@@ -2191,6 +2196,7 @@ def rebuild_command(args: argparse.Namespace) -> int:
         settle_seconds=args.settle if args.settle is not None else config.settle_window,
         content_fences=config.content_fences,
         retention_seconds=config.retention,
+        artifacts_root=config.require_artifacts_root(),
     )
     record_stage(
         state_dir,
@@ -2315,6 +2321,7 @@ def detect_command(args: argparse.Namespace) -> int:
         # independently of the detector selection so unresolved assessments
         # remain inspectable even when no supported cluster is emitted.
         twill_autonomy.project(connection)
+        twill_autonomy_review.reconcile(connection, load_config().require_artifacts_root())
         catalog_result, catalog_observation = twill_catalog.load_and_record(connection)
         # D-10 cannot degrade (plan §6.5): without a catalog it can read it
         # does not run transcript-only — it is skipped with the reason and
@@ -2533,6 +2540,14 @@ def rank_command(args: argparse.Namespace) -> int:
     started = perf_counter()
     connection = twill_schema.connect(state_dir)
     try:
+        twill_autonomy_review.assert_reconciled(connection, config.require_artifacts_root())
+        autonomy_refresh = twill_detectors.run_detectors(
+            connection, registry=twill_detectors.AUTONOMY_DETECTORS,
+            window_days=DEFAULT_DETECT_WINDOW_DAYS,
+        )
+        if autonomy_refresh.exit_code != EXIT_SUCCESS:
+            raise CliError(EXIT_RUNTIME_ERROR, "autonomy membership refresh failed",
+                           "run twill detect and inspect detector errors")
         result = twill_ranker.run_rank(
             connection,
             config.rule_globs,
@@ -2639,6 +2654,7 @@ def explain_command(args: argparse.Namespace) -> int:
         else twill_schema.connect(state_dir)
     )
     try:
+        twill_autonomy_review.assert_reconciled(connection, config.require_artifacts_root())
         candidates = twill_explainer.load_candidate_prompt_clusters(
             connection,
             top_k=top_k,
@@ -2707,6 +2723,52 @@ def explain_command(args: argparse.Namespace) -> int:
         print(f"drafted {len(paths)} lesson(s)")
         for path in paths:
             print(f"- {redact_text(path)}")
+    return EXIT_SUCCESS
+
+
+def autonomy_command(args: argparse.Namespace) -> int:
+    config = load_config()
+    state_dir = _state_dir(args.state_dir)
+    if args.autonomy_action == "review":
+        connection = twill_schema.connect(state_dir)
+        try:
+            result = twill_autonomy_review.review(
+                connection, config.require_artifacts_root(), args.candidate_id,
+                args.disposition, args.reason,
+            )
+            # Refresh only the autonomy detector families; this removes a
+            # reversed finding from ranking without changing the journal.
+            refreshed = twill_detectors.run_detectors(
+                connection, registry=twill_detectors.AUTONOMY_DETECTORS,
+                window_days=DEFAULT_DETECT_WINDOW_DAYS,
+            )
+            if refreshed.exit_code != EXIT_SUCCESS:
+                raise CliError(EXIT_RUNTIME_ERROR, "autonomy membership refresh failed",
+                               "run twill detect and inspect detector errors")
+        finally:
+            connection.close()
+        emit_success(result, json_mode=args.json)
+        if not args.json:
+            print(f"reviewed A-{result['candidate_id']} revision {result['revision']}: {result['disposition']}")
+        return EXIT_SUCCESS
+    days = DEFAULT_DETECT_WINDOW_DAYS if args.window is None else _window_days(args.window)
+    start = (datetime.now(timezone.utc) - timedelta(days=days)).isoformat()
+    connection = twill_schema.connect_read_only(state_dir)
+    try:
+        items = twill_autonomy_review.inspect(connection, config.require_artifacts_root(), state_dir,
+                                               window_start=start, state=args.state)
+    finally:
+        connection.close()
+    emit_success({"candidates": items, "count": len(items), "window_days": days}, json_mode=args.json)
+    if not args.json:
+        for item in items:
+            print(f"A-{item['candidate_id']} {item['family']} {item['disposition']}: {item['reason']}")
+            print(f"  authority: {item['authority_state']}; outcome: {item['lifecycle']}")
+            for evidence in item["evidence"]:
+                print(f"  {evidence['kind']} line {evidence['source_line']}: {evidence['text'] or '[missing]'}")
+            for missing in item["missing"]:
+                print(f"  missing: {missing}")
+            print(f"  reproduce: {item['reproduce']}")
     return EXIT_SUCCESS
 
 
@@ -2790,6 +2852,7 @@ def measure_command(args: argparse.Namespace) -> int:
     started = perf_counter()
     connection = twill_schema.connect(state_dir)
     try:
+        twill_autonomy_review.assert_reconciled(connection, artifacts_root)
         report = twill_measure.measure_lessons(
             connection,
             artifacts_root,
@@ -2858,6 +2921,7 @@ def prune_command(args: argparse.Namespace) -> int:
         report = twill_prune.prune_observations(
             connection,
             retention_seconds=retention,
+            artifacts_root=config.require_artifacts_root(),
         )
     except ValueError as exc:
         raise UsageError(str(exc)) from exc
@@ -3351,6 +3415,21 @@ def build_parser() -> argparse.ArgumentParser:
     )
     detect.set_defaults(handler=detect_command)
 
+    autonomy = subparsers.add_parser("autonomy", help="inspect private autonomy evidence or adjudicate a candidate")
+    autonomy.add_argument("--window", type=_parse_duration, default=None)
+    autonomy.add_argument("--state", choices=twill_autonomy_review.DISPOSITIONS)
+    autonomy.add_argument("--state-dir")
+    autonomy.add_argument("--json", action="store_true")
+    autonomy.set_defaults(handler=autonomy_command, autonomy_action="inspect")
+    autonomy_sub = autonomy.add_subparsers(dest="autonomy_action", parser_class=_ArgumentParser)
+    autonomy_review = autonomy_sub.add_parser("review", help="record an explicit private disposition")
+    autonomy_review.add_argument("candidate_id", metavar="ID")
+    autonomy_review.add_argument("--disposition", required=True, choices=twill_autonomy_review.DISPOSITIONS)
+    autonomy_review.add_argument("--reason", required=True)
+    autonomy_review.add_argument("--state-dir", default=argparse.SUPPRESS)
+    autonomy_review.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    autonomy_review.set_defaults(handler=autonomy_command)
+
     rank = subparsers.add_parser(
         "rank", help="refresh rule coverage and list new-lesson candidates"
     )
@@ -3583,7 +3662,8 @@ def main(argv: Sequence[str] | None = None) -> int:
         # mutating verb — a timer firing mid-recovery queues behind it.
         rebuilds_state = args.command == "doctor" and args.rebuild
         rescans_redaction = args.command == "doctor" and args.rescan_redaction
-        needs_lock = args.command in MUTATING_VERBS and not (
+        needs_lock = (args.command in MUTATING_VERBS or
+                      (args.command == "autonomy" and args.autonomy_action == "review")) and not (
             args.command == "explain" and args.dry_run
         )
         if needs_lock or writes_artifact or rebuilds_state or rescans_redaction:

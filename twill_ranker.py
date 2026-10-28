@@ -134,12 +134,17 @@ class RankedCluster:
             self.state == "open"
             and self.covered_by is None
             and self.sessions > 0
+            and (self.detector_id not in {"D-12", "D-13", "D-14", "D-15", "D-16"}
+                 or self.sessions >= 2)
             and self.detector_id not in NON_LESSON_DETECTORS
         )
 
     @property
     def escalation_candidate(self) -> bool:
         return self.sessions > 0 and (
+            self.detector_id not in {"D-12", "D-13", "D-14", "D-15", "D-16"}
+            or self.sessions >= 2
+        ) and (
             self.state == "escalation"
             or (self.state == "open" and self.covered and not self.rule_stale)
         )

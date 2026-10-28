@@ -107,8 +107,9 @@ The suite runs under the import, network, and open-path audit harness (§3,
 §8.3, §10.2): the startup hook rejects third-party imports in the core path,
 Python-level network calls, writes outside this repository (never its artifact
 directories), the state directory, `artifacts_root` and test scratch space,
-and any open under `~/agent-transcript-archive`. The local `claude -p` child
-is the sole sanctioned network-capable process. Every Python subprocess the
+and any open under `~/agent-transcript-archive`. The local `claude -p` Explain
+child, read-only ICG catalog export and scoped private artifact publisher are
+the allowed production child processes. Every Python subprocess the
 suite spawns — each CLI verb — installs the same hook, so the verbs themselves
 are policed. A bare `python3 -m unittest discover` skips the harness's startup
 and deliberately fails; run the suite through `make test` or pytest. See
@@ -137,6 +138,29 @@ After a successful artifact-producing run, `twill publish` validates the
 external v1 snapshot, commits the manifest and changed artifact files together,
 and pushes that commit to the configured private origin. Retrying after a
 transient push failure reuses the same local commit.
+
+## Autonomy evidence review
+
+`twill detect` derives conservative, source-linked candidates for D-12 through
+D-16. Inspect them with `twill autonomy --window 30d --json` or filter with
+`--state supported|needs_review|dismissed`. Each result includes captured
+authority and outcome state, supporting and disconfirming source references,
+missing context, at most 24 evidence records, and a reproduction command.
+An uncertain or single-session case remains inspectable without becoming a
+lesson draft.
+
+Record an operator decision with `twill autonomy review ID --disposition
+supported|needs_review|dismissed --reason TEXT`. The decision is revisioned
+in the private `artifacts_root` repository and committed there before TWILL
+updates its disposable database projection. `twill publish` pushes the private
+commit. Rebuild replays only reviews matching current detector, analyzer,
+input and evidence hashes. A changed source or reversal removes support; it
+does not rewrite an accepted lesson. Lesson acceptance remains a separate
+`twill accept` action. Only supported findings from at least two distinct
+sessions qualify for ranking and Explain. Explain drafts wording using its
+existing bounded call; routing defaults to `retrieval_only` unless structured
+evidence proves a stronger prevention point. Review-only cases appear in a
+separate weekly digest section.
 
 Use `--settle 0` for a deliberately controlled fixture, `--file PATH` to select one session, or
 `--state-dir PATH` and `--source PATH` for an isolated run. The initial walking skeleton did not
