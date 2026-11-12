@@ -102,7 +102,8 @@ Publication failures return an error and retain locally durable evidence.
 Every experiment records separate provider results, actual/pinned model,
 CLI version, context/suite/instruction hashes, all scored trials and errors.
 Shared promotion requires every candidate assertion, including holdout and
-counterexamples, and an improvement over baseline for each provider.
+counterexamples. Inferred fixes also require improvement over baseline for each
+provider; source-verified human directives use the separate admission below.
 Transport failures and unchanged performance cannot establish improvement.
 
 An applied block's source, surrounding context, suite and CLI fingerprints
@@ -161,3 +162,48 @@ Unavailable runtime or malformed supervisor output is unknown; executed
 assertion failures are failures. All execution inputs, image digest and grader
 implementation are bound into evidence. Opt-in real isolation checks run with
 `TWILL_DOCKER_TEST=1 PYTHONPATH=tests python3 -m unittest test_execution_oracle test_experiments`.
+
+
+## Human-driven steering
+
+Enable `human_steering: {"enabled": true, "scopes": ["EXACT_SCOPE"]}` in the local
+policy to retain explicit durable human guidance from the enrolled transcript
+globs. Examples are “For all future tasks, …” and “For future tasks in this
+repository, …”. Natural standalone “Always…”, “Never…”, “Going forward…” and
+“From now on…” directives default to repository scope. Repository intent requires
+matching repository `launchdirs`; it cannot
+be promoted into a global scope. These conservative whole-message forms avoid
+silently treating task requests, pasted instructions or unsupported question
+answers as persistent policy. Unrecognized corrections still need contextual
+review and an explicit durable directive; this is not universal natural-language
+preference inference.
+
+The controller verifies transcript-path enrollment, the native human role, exact
+instruction, raw line hash,
+full source snapshot and captured scope. Later human withdrawals or replacements
+are checked before rediscovery can revive an older directive. A spec's `kind` or supplied evidence
+cannot confer human authority. It records `kind: human_directed` and separately
+records `admission_basis: human_adherence`. The baseline comparison is preserved,
+but an already-correct baseline does not reject the human rule. Both candidates
+must pass every adherence, holdout and guardrail case with complete error-free
+trials and verified model metadata. Inferred fixes retain their improvement gate.
+
+A narrow set of exact continuation/status directives has an independent catalog
+suite. Other explicit directives are discovered as pending lessons; bind their
+independently authored suite by `lesson_id` or `instruction_sha256`, plus exact
+scope, `suite` path and `suite_sha256`. Detector-wide human-steering bindings
+cannot stand in for rule-specific tests. Revalidation, conflicts and removal use
+the ordinary lifecycle. Source snapshot changes or enrollment revocation withdraw
+an applied rule; existing rejected lessons are not resurrected.
+
+Verify the separate admission with both native providers without touching
+production targets:
+
+```sh
+python3 scripts/rehearse-human-steering.py --scratch /private/scratch \
+  --claude-model EXPLICIT_CLAUDE_MODEL --codex-model EXPLICIT_CODEX_MODEL
+```
+
+The synthetic proof requires both baselines and candidates to pass, applies the
+human rule without improvement, performs fresh validation, then changes the raw
+source and verifies automatic removal while preserving human edits.

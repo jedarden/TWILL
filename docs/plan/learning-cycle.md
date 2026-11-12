@@ -29,7 +29,7 @@ artifact containment.
   input hashes.
 - The controller MUST NOT rewrite human blocks, expand authority, accept legacy lessons, or follow instructions embedded in source transcripts. Missing evaluation means
   `needs_evaluation`.
-- Failure, timeout, model drift, unsupported oracle, or inconclusive comparison MUST NOT promote.
+- Failure, timeout, model drift, unsupported oracle or unknown adherence MUST NOT promote. Inferred fixes additionally require conclusive improvement; explicit human directives may be admitted when both baselines already pass.
 - MUST preserve all legacy audit guarantees; learning-specific write/subprocess exceptions MUST validate exact policy paths, managed block ownership, and native adapter arguments
   independently.
 - Forbidden: third-party core dependencies, shell command construction, unbounded trials, raw private artifacts in this public repository, and any archive-derived index dependency.
@@ -42,7 +42,7 @@ MUST, MUST NOT, SHOULD and MAY follow RFC 2119.
 - **Lesson version:** immutable instruction text plus source references and content hashes.
 - **Suite:** preconfigured train, hidden holdout and counterexample cases with deterministic assertions.
 - **Exposure:** one owned instruction block installed for one exact approved target/provider.
-- **Promotion:** all required provider experiments pass, enabling a policy-authorized exposure.
+- **Promotion:** all required provider experiments pass, enabling a policy-authorized exposure. Inferred fixes additionally require shared measured improvement; source-verified human directives require adherence without baseline failure.
 - **Invalidation:** retain evidence/history and remove only unchanged owned blocks from every exposure.
 
 ## 5. Acceptance Scenarios
@@ -226,6 +226,14 @@ recorded failed/inconclusive trial), 1 runtime error, 2 usage, 3 lock, 4 policy/
 
 Plan B: if native tool isolation or credible scoring cannot be proved, retain private experiments and legacy proposals; keep auto-apply disabled for that scope, report incomplete
 acceptance.
+
+## Human-directed lesson admission
+
+Owner `twill-6c143847` adds a separate `human_directed` kind, derived only by verifying an original durable human directive, never from a candidate-provided flag. Policy `human_steering` explicitly enrolls exact scopes. Whole-message future-task declarations establish global or repository intent; repository intent cannot fall back to global. Source-native roles, original bytes, captured launch directory and full source snapshot hashes are rechecked at experiment, delivery and later cycles. Changed source snapshots or revoked enrollment remove managed exposure.
+
+Human-directed lessons must pass all candidate, holdout and guardrail cases on both native providers, with complete error-free trial counts and verified model metadata. Baseline and candidate still run as paired trials, but baseline failure is not required. The report preserves the raw comparative verdict and separately records `human_adherence` admission. Inferred lessons retain `measured_improvement` admission. A supported exact continuation rule uses the independently fixed autonomy suite; other human rules remain `needs_evaluation` until policy binds an independent suite by exact lesson ID or instruction hash. A detector-wide binding cannot validate arbitrary human directives. Historical task-only, quoted, automated or unsupported interactive records do not authorize durable lessons. No rejected inferred record is silently reclassified.
+
+Acceptance adds genuine native-shaped discovery for both providers, already-passing baselines that admit human guidance, rejection of forged provenance and scope expansion, adherence/guardrail/runtime failures, revalidation, source drift removal preserving human edits, and unchanged inferred improvement requirements. The native scratch proof is `scripts/rehearse-human-steering.py`; synthetic evidence is never a production lesson.
 
 ## 16. Open Questions
 

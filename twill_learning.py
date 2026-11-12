@@ -8,6 +8,7 @@ transcripts, lesson text and model outputs cannot grant delivery authority.
 from __future__ import annotations
 
 import argparse
+import fnmatch
 import hashlib
 import json
 import os
@@ -15,6 +16,7 @@ import re
 import tempfile
 from datetime import datetime, timezone
 from pathlib import Path
+from functools import lru_cache
 
 from twill_lock import StateLock
 from twill_redactor import redact_text
@@ -91,11 +93,33 @@ def bounded_int(value: object, low: int, high: int, label: str) -> int:
     return value
 
 
+def enrolled_source(value: str, patterns: list[str]) -> bool:
+    """Match enrolled path components, including zero-directory **, without I/O."""
+    parts = Path(value).parts
+    for pattern in patterns:
+        expected = Path(pattern).expanduser().parts
+
+        @lru_cache(maxsize=4096)
+        def matches(index: int, position: int) -> bool:
+            if index == len(expected):
+                return position == len(parts)
+            if expected[index] == "**":
+                return matches(index + 1, position) or (position < len(parts) and matches(index, position + 1))
+            return (position < len(parts) and fnmatch.fnmatchcase(parts[position], expected[index])
+                    and matches(index + 1, position + 1))
+
+        if matches(0, 0):
+            return True
+    return False
+
+
 class Controller:
     def __init__(self, policy: dict):
         if policy.get("schema") != POLICY_SCHEMA or policy.get("enabled") is not True:
             raise LearningError("learning requires an enabled v1 policy")
         self.policy = policy
+        from twill_human_steering import validate_policy as validate_steering_policy
+        validate_steering_policy(policy)
         if policy.get("auto_evaluators"):
             from twill_learning_intake import validate_policy
             validate_policy(policy)
@@ -189,8 +213,34 @@ class Controller:
         if source.get("sha256") and source_sha != source["sha256"]:
             raise LearningError("source evidence hash mismatch")
         scope = spec.get("scope", "unassigned")
+        kind = "inferred"
+        evaluator = spec.get("evaluator")
+        source_evidence = spec.get("source_evidence", {})
+        # Provenance is established from the original human message, never
+        # from a candidate's kind flag, paraphrase or supplied evidence dict.
+        try:
+            source_payload = json.loads(source_path.read_text())
+        except ValueError:
+            source_payload = None
+        if isinstance(source_payload, dict) and source_payload.get("schema") == "twill-human-steering/v1":
+            from twill_human_steering import verify, resolve_scope, classify
+            source_evidence = verify(source_path, instruction)
+            if not source_evidence.get("complete"):
+                raise LearningError("human steering requires a verified durable human directive")
+            self.check_human_sources(source_evidence)
+            resolved = resolve_scope(source_evidence, self.policy)
+            if scope != "unassigned" and scope != resolved:
+                raise LearningError("human steering scope differs from captured intent and policy")
+            scope = resolved or "unassigned"
+            kind = "human_directed"
+            evaluator = classify(instruction)
+        if spec.get("kind", kind) != kind:
+            raise LearningError("lesson kind must match verified source provenance")
         version = digest({"instruction": instruction, "source_sha": source_sha, "scope": scope})
-        if spec.get("evaluator"):
+        if kind == "human_directed":
+            version = digest({"instruction": instruction, "source_sha": source_sha, "scope": scope,
+                              "kind": kind, "evaluator": evaluator, "evidence_sha": digest(source_evidence)})
+        elif spec.get("evaluator"):
             version = digest({"instruction": instruction, "source_sha": source_sha, "scope": scope,
                               "evaluator": spec["evaluator"], "evidence_sha": digest(spec.get("source_evidence", {}))})
             evidence = spec.get("source_evidence", {})
@@ -207,17 +257,24 @@ class Controller:
                              "legacy_id": source.get("legacy_id"),
                              "detector": source.get("detector")},
                   "scope": scope, "created_at": stamp(), "experiments": [],
-                  "evaluator": spec.get("evaluator"),
-                  "source_evidence": spec.get("source_evidence", {}),
+                  "kind": kind, "evaluator": evaluator,
+                  "source_evidence": source_evidence,
                   "application": None, "reason": "awaiting independent evaluation"}
         return self.save(record, "created")
 
     def suite(self, record: dict) -> dict:
+        human = record.get("kind") == "human_directed"
+        if human:
+            self.human_evidence(record)
         matches = [b for b in self.policy.get("bindings", [])
                    if b.get("scope") == record["scope"] and
                    (b.get("lesson_id") == record["id"] or
-                    (b.get("detector") and b["detector"] == record["source"].get("detector")))]
-        if not matches and record.get("evaluator"):
+                    (human and b.get("instruction_sha256") == record["instruction_sha"]) or
+                    (not human and b.get("detector") and b["detector"] == record["source"].get("detector")))]
+        if not matches and human and record.get("evaluator"):
+            from twill_learning_intake import catalog_suite
+            suite = catalog_suite(record["evaluator"])
+        elif not matches and record.get("evaluator"):
             from twill_learning_intake import catalog_suite, validate_catalog_admission
             validate_catalog_admission(record["evaluator"], record["scope"], self.policy,
                                        record["source"].get("detector"))
@@ -239,9 +296,32 @@ class Controller:
             raise LearningError("evaluation needs a training case")
         return suite
 
+    def human_evidence(self, record: dict) -> dict:
+        from twill_human_steering import verify, resolve_scope, classify
+        evidence = verify(Path(record["source"]["path"]), record["instruction"])
+        self.check_human_sources(evidence)
+        if (not evidence.get("complete") or resolve_scope(evidence, self.policy) != record["scope"]
+                or record["scope"] == "unassigned"
+                or evidence != record.get("source_evidence")
+                or classify(record["instruction"]) != record.get("evaluator")):
+            raise LearningError("human steering source, intent, scope or enrollment changed")
+        return evidence
+
+    def check_human_sources(self, evidence: dict) -> None:
+        sources = evidence.get("raw_sources", [])
+        if not sources or any(not enrolled_source(source["path"], self.policy.get("intervention_sources", []))
+                              for source in sources):
+            raise LearningError("human steering raw source is not enrolled")
+
     def source_current(self, record: dict) -> bool:
         path = Path(record["source"]["path"])
-        return path.is_file() and not path.is_symlink() and digest(path.read_bytes()) == record["source"]["sha256"]
+        current = path.is_file() and not path.is_symlink() and digest(path.read_bytes()) == record["source"]["sha256"]
+        if current and record.get("kind") == "human_directed":
+            try:
+                self.human_evidence(record)
+            except (LearningError, OSError, ValueError):
+                return False
+        return current
 
     def context(self, record: dict) -> dict:
         """Freeze actual surrounding guidance, excluding this owned lesson."""
@@ -279,6 +359,10 @@ class Controller:
         suite = self.suite(record)
         if receipt.get("suite_sha") != digest(suite):
             raise LearningError("evaluation suite changed since experiment")
+        if record.get("kind") == "human_directed":
+            import twill_human_steering
+            if receipt.get("steering_sha") != digest(Path(twill_human_steering.__file__).read_bytes()):
+                raise LearningError("human steering verifier changed since experiment")
         if any("oracle" in case for case in suite["cases"]):
             import twill_execution_oracle
             if receipt.get("execution_sha") != digest(Path(twill_execution_oracle.__file__).read_bytes()):
@@ -342,13 +426,18 @@ class Controller:
                                       "context_sha": digest(frozen_context),
                                       "adapter_sha": digest(Path(adapter_file).read_bytes()) if adapter_file else "test-adapter",
                                       "controller_sha": digest(Path(__file__).read_bytes()),
+                                      "admission_basis": "human_adherence" if record.get("kind") == "human_directed" else "measured_improvement",
                                       "suite_sha": digest(suite), "validation": validation})
+        if record.get("kind") == "human_directed":
+            import twill_human_steering
+            record["experiments"][-1]["steering_sha"] = digest(Path(twill_human_steering.__file__).read_bytes())
         if any("oracle" in case for case in suite["cases"]):
             import twill_execution_oracle
             record["experiments"][-1]["execution_sha"] = digest(Path(twill_execution_oracle.__file__).read_bytes())
         # A runtime error is unknown; only a complete candidate failure can invalidate.
         reports = result.get("providers", {})
         record["assessment"] = {"verdict": result.get("verdict"), "at": stamp(),
+                                "admission_basis": record["experiments"][-1]["admission_basis"],
                                 "providers": {name: {k: r.get(k) for k in
                                               ("verdict", "errors", "counts", "actual_model", "model_fingerprint")}
                                               for name, r in reports.items()}}
@@ -359,6 +448,29 @@ class Controller:
         record["assessment"]["unknown"] = bool(errors)
         passed = complete and all(r.get("candidate_passed") is True and
                                   r.get("holdout_passed") is True for r in reports.values())
+        human = record.get("kind") == "human_directed"
+        if human:
+            expected = len(suite["cases"]) * self.repetitions
+            # Human preferences need adherence and guardrails, not a contrived
+            # baseline failure. Missing/incomplete trials remain unknown.
+            for report in reports.values():
+                counts = report.get("counts", {})
+                for arm in ("baseline", "candidate"):
+                    arm_counts = counts.get(arm, {}) if isinstance(counts, dict) else {}
+                    if (set(arm_counts) != {"pass", "fail", "error"}
+                            or any(type(value) is not int or value < 0 for value in arm_counts.values())
+                            or sum(arm_counts.values()) != expected or arm_counts.get("error") != 0):
+                        errors = True
+                if not report.get("actual_model") or not report.get("model_fingerprint"):
+                    errors = True
+                if any(type(report.get(flag)) is not bool for flag in
+                       ("candidate_passed", "holdout_passed", "guardrails_passed")):
+                    errors = True
+            passed = passed and all(r.get("guardrails_passed") is True
+                                    and r.get("verdict") != "regressed"
+                                    and r.get("counts", {}).get("candidate", {}).get("pass") == expected
+                                    for r in reports.values())
+            record["assessment"]["unknown"] = bool(errors)
         if validation:
             record["last_validation"] = stamp()
             if not errors and not passed:
@@ -371,9 +483,10 @@ class Controller:
                 self.save(record, "validation_inconclusive")
                 return self.suspend(lesson_id, "revalidation unavailable; exposure suspended")
         else:
-            promote = not errors and passed and result.get("verdict") == "promote"
+            promote = not errors and passed and (human or result.get("verdict") == "promote")
             record.update(state="validated" if promote else "unvalidated",
-                          reason="both agents improved" if promote else "experiment did not establish improvement")
+                          reason=("verified human steering passed adherence and guardrails for both agents" if human
+                                  else "both agents improved") if promote else "experiment did not establish admission")
             # Complete unfavorable or redundant evidence is a disposition,
             # rather than an indefinitely retried unvalidated candidate.
             known_counts = complete and all(isinstance(r.get("counts"), dict) for r in reports.values())
@@ -603,15 +716,43 @@ class Controller:
 
     def import_sources(self) -> int:
         """Route verified role-bearing intervention extractions without a hand binding."""
-        if not self.policy.get("auto_evaluators"):
-            return 0
         from twill_learning_intake import resolve, catalog_instruction, discover_sources
-        discover_sources(self.policy, self.root)
+        if self.policy.get("auto_evaluators"):
+            discover_sources(self.policy, self.root)
+        from twill_human_steering import discover as discover_steering, verify, resolve_scope
+        discover_steering(self.policy, self.root)
         count = 0
         for path in sorted((self.store / "sources").glob("*.json")):
             if path.name.startswith("."):
                 continue
             payload = read_json(path)
+            if payload.get("schema") == "twill-human-steering/v1":
+                if self.policy.get("human_steering", {}).get("enabled") is not True:
+                    continue
+                evidence = verify(path)
+                if not evidence.get("complete"):
+                    # Existing versions are withdrawn by source_current below.
+                    continue
+                before = {r["id"] for r in self.records()}
+                record = self.create({"instruction": evidence["instruction"],
+                                      "scope": resolve_scope(evidence, self.policy) or "unassigned",
+                                      "source": {"path": str(path), "detector": "human-steering"}})
+                count += record["id"] not in before
+                if record["scope"] != "unassigned":
+                    for old in self.records():
+                        if (old["id"] != record["id"] and old.get("kind") == "human_directed"
+                                and old["scope"] == "unassigned" and old["source"] == record["source"]
+                                and old["state"] in {"draft", "needs_evaluation", "unvalidated"}):
+                            old.update(state="superseded", successor=record["id"],
+                                       reason="human directive now resolves to an enrolled exact scope")
+                            self.save(old, "superseded", successor=record["id"])
+                if record["state"] == "draft":
+                    try:
+                        self.suite(record)
+                    except LearningError as exc:
+                        record.update(state="needs_evaluation", reason=redact_text(str(exc))[:500])
+                        self.save(record, "evaluation_unavailable")
+                continue
             if payload.get("schema") != "twill-workflow-intervention/v1":
                 continue
             detector = payload.get("detector")
@@ -743,7 +884,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = controller.invalidate(args.id, args.reason)
             elif args.command in {"status", "doctor"}:
                 result = {"schema": SCHEMA, "lessons": [
-                    {k: r.get(k) for k in ("id", "state", "scope", "reason", "revision", "evaluator", "assessment")}
+                    {k: r.get(k) for k in ("id", "state", "scope", "kind", "reason", "revision", "evaluator", "assessment")}
                     for r in controller.records()]}
                 result["health"] = controller.health()
                 status_path = controller.store / "status.json"

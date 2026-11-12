@@ -18,5 +18,6 @@
   "auto_evaluators": [],
   "intervention_sources": [],
   "intervention_settle_seconds": 7200,
+  "human_steering": {"enabled": false, "scopes": []},
   "bindings": []
 }
