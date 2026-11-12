@@ -6,6 +6,7 @@ state.  Every test redirects ``HOME`` at a throwaway directory, so the target
 must resolve its paths from ``$(HOME)`` and never from anything global.
 """
 
+import json
 import os
 import shutil
 import subprocess
@@ -82,6 +83,27 @@ class InstallTests(unittest.TestCase):
             installed = self.user_units() / unit_name
             self.assertEqual(installed.read_text(), (SYSTEMD_SOURCE / unit_name).read_text())
             self.assertEqual(installed.stat().st_mode & 0o777, 0o644)
+
+    def test_optional_feed_install_is_disabled_and_preserves_operator_policy(self):
+        self.assertEqual(run_install(self.home).returncode, 0)
+        link = self.home / '.local/bin/twill-archive-feed'
+        self.assertTrue(link.is_symlink())
+        self.assertEqual(link.resolve(), ROOT / 'scripts/export-archive-transcripts.py')
+        self.assertTrue(os.access(link, os.X_OK))
+        policy = self.home / '.config/twill/archive-feed.json'
+        self.assertFalse(json.loads(policy.read_text())['enabled'])
+        self.assertEqual(policy.stat().st_mode & 0o777, 0o600)
+        for unit_name in ('twill-discover.service', 'twill-discover.timer',
+                          'twill-archive-feed.service', 'twill-archive-feed.timer'):
+            self.assertEqual((self.user_units() / unit_name).read_bytes(), (SYSTEMD_SOURCE / unit_name).read_bytes())
+        policy.write_text('{"enabled": true, "operator": "preserve"}\n')
+        self.assertEqual(run_install(self.home).returncode, 0)
+        self.assertEqual(json.loads(policy.read_text())['operator'], 'preserve')
+        policy.write_text('{"schema_version": "twill-archive-feed/v1", "enabled": false}\n')
+        result = subprocess.run([str(link), '--policy', str(policy)], cwd=self.home,
+                                env=dict(os.environ, HOME=str(self.home)), capture_output=True, text=True)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertFalse(json.loads(result.stdout)['enabled'])
 
     def test_hourly_timer_is_persistent_and_serializes_ingest_before_detect(self):
         self.assertEqual(run_install(self.home).returncode, 0)

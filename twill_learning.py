@@ -120,6 +120,17 @@ class Controller:
         self.policy = policy
         from twill_human_steering import validate_policy as validate_steering_policy
         validate_steering_policy(policy)
+        from twill_source_discovery import validate_limits
+        validate_limits(policy)
+        feed = policy.get("archive_feed", {})
+        if (not isinstance(feed, dict) or set(feed) - {"enabled", "status_path", "stale_seconds"}
+                or type(feed.get("enabled", False)) is not bool):
+            raise LearningError("archive_feed requires enabled, status_path and optional stale_seconds")
+        if feed.get("enabled") is True:
+            if not isinstance(feed.get("status_path"), str):
+                raise LearningError("enabled archive_feed needs an exact status_path")
+            safe_path(feed["status_path"])
+            bounded_int(feed.get("stale_seconds", 86400), 60, 604800, "archive feed freshness")
         if policy.get("auto_evaluators"):
             from twill_learning_intake import validate_policy
             validate_policy(policy)
@@ -829,6 +840,7 @@ class Controller:
                    "attempted": spent,
                    "experimented": sum(len(r["experiments"]) for r in self.records()) - before_experiments,
                    "results": results}
+        summary["input_coverage"] = self.input_coverage()
         summary["health"] = self.health(summary)
         if self.policy.get("require_fresh_sources"):
             from twill_learning_impact import snapshot
@@ -837,6 +849,27 @@ class Controller:
                 scopes=self.scopes)
         atomic(self.store / "status.json", canonical(summary))
         return summary
+
+    def discover(self) -> dict:
+        """Advance input backfill without making native model requests."""
+        imported = self.import_sources() + self.import_drafts()
+        summary = {"schema": SCHEMA, "at": stamp(), "imported": imported,
+                   "experimented": 0, "input_coverage": self.input_coverage(),
+                   "health": self.health()}
+        atomic(self.store / "discovery-status.json", canonical(summary))
+        return summary
+
+    def input_coverage(self) -> dict:
+        from twill_source_discovery import discovery_coverage
+        coverage = {"discovery": discovery_coverage(self.root)}
+        feed = self.policy.get("archive_feed", {})
+        if feed.get("enabled") is True:
+            path = safe_path(feed["status_path"])
+            try:
+                coverage["archive_feed"] = read_json(path)
+            except (OSError, ValueError):
+                coverage["archive_feed"] = {"status": "unavailable"}
+        return coverage
 
     def health(self, last_cycle: dict | None = None) -> dict:
         if last_cycle is None:
@@ -847,10 +880,25 @@ class Controller:
             from twill_status import read_status
             state = Path(self.policy.get("pipeline_state_dir", "~/.local/state/twill")).expanduser()
             pipeline = read_status(state).get("data", {})
-        return twill_learning_health.report(
+        result = twill_learning_health.report(
             self.records(), last_cycle,
             stale_seconds=self.limits.get("stale_cycle_seconds", 10800),
             pending_seconds=self.limits.get("pending_attention_seconds", 86400), pipeline=pipeline)
+        feed = self.policy.get("archive_feed", {})
+        if feed.get("enabled") is True:
+            observation = self.input_coverage().get("archive_feed", {})
+            when = observation.get("last_success") or observation.get("at")
+            try:
+                age = (datetime.now(timezone.utc) - datetime.fromisoformat(str(when).replace("Z", "+00:00"))).total_seconds()
+            except (ValueError, TypeError):
+                age = None
+            if (observation.get("status") not in {"healthy", "ok", "in_progress", "partial"}
+                    or observation.get("errors") or observation.get("cache_limit") or age is None
+                    or age > feed.get("stale_seconds", 86400)):
+                result["findings"].append({"kind": "archive_feed_unavailable_or_stale",
+                                           "action": "Inspect the optional archive feed service and its input coverage."})
+                result["status"] = "needs_attention"
+        return result
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -866,6 +914,7 @@ def main(argv: list[str] | None = None) -> int:
         if name == "invalidate":
             command.add_argument("--reason", required=True)
     sub.add_parser("cycle")
+    sub.add_parser("discover")
     sub.add_parser("status")
     sub.add_parser("doctor")
     # Accept --json in the familiar post-subcommand position too.
@@ -887,11 +936,14 @@ def main(argv: list[str] | None = None) -> int:
                     {k: r.get(k) for k in ("id", "state", "scope", "kind", "reason", "revision", "evaluator", "assessment")}
                     for r in controller.records()]}
                 result["health"] = controller.health()
+                result["input_coverage"] = controller.input_coverage()
                 status_path = controller.store / "status.json"
                 if status_path.exists():
                     result["last_cycle"] = read_json(status_path)
             elif args.command == "cycle":
                 result = controller.cycle()
+            elif args.command == "discover":
+                result = controller.discover()
             else:
                 result = getattr(controller, args.command)(args.id)
             if args.command not in {"status", "doctor"}:
@@ -903,7 +955,7 @@ def main(argv: list[str] | None = None) -> int:
             result = {k: result[k] for k in ("id", "state", "reason", "revision")}
         emit_success(result, json_mode=True)
         attention = result.get("health", {}).get("status") != "healthy" if "health" in result else False
-        return 4 if ((args.command in {"cycle", "doctor"} and attention)
+        return 4 if ((args.command in {"cycle", "doctor", "discover"} and attention)
                      or any(r.get("state") == "conflict" for r in result.get("results", []))) else 0
     except CliError as exc:
         emit_error(exc.code, exc.message, exc.hint, json_mode=True)

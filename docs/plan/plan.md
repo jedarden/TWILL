@@ -51,8 +51,8 @@ successfully` 10,930 times into every worker prompt.
 - **Not a transcript archive.** TWILL copies, retains, and backs up nothing. A separate archive
   pipeline owns durability; duplicating it would double both disk and the blast radius of a secrets
   leak, for no gain.
-- **No integration with that archive, and no reads of its derived index.** Operator decision,
-  2026-09-19. Ingest and learning have different cadences and failure modes; a distiller bug or a
+- **No core dependency on that archive, and no reads of its derived index.** Operator decision,
+  2026-09-19; the 2026-11-12 opt-in raw-input exception below preserves this core boundary. Ingest and learning have different cadences and failure modes; a distiller bug or a
   slow LLM pass must never stall capture, and learning must not fire per ingest event.
 - **No automatic edits by legacy `twill` to CLAUDE.md, memory files, hooks, skills, or any other repository.** The
   Reflect precedent is the rationale: an unsupervised writer degraded every prompt on the fleet for
@@ -1431,3 +1431,22 @@ triage-only summarization while routing stays manual.
 | 2026-10-16 | Open Question 4 resolved: other hosts are covered by host-local TWILL reporting up through the §7.3 artifacts transport, never by pulling transcripts; §2's fleet-wide line and Phase 7's delivery reworded to match. | gate audit (bead twill-05a4374a) |
 | 2026-10-23 | Authorized Phase 9 autonomy analysis: bounded interaction/authority evidence, five conservative detector families, private adjudication and impact measurement; added Scenarios 5-7 and a dependency-ordered worker boundary. Public mechanism and synthetic fixtures; private inputs and generated learnings. | operator request; planning bead twill-0ff526bc |
 | 2026-11-11 | Delegate the explicitly enabled native dual-agent lesson lifecycle to learning-cycle.md; preserve legacy proposes-only commands, acceptance and audit boundaries. | operator request; twill-bff7b510 |
+
+
+### Optional original-source feed decision (2026-11-12)
+
+User direction to use the centralized transcript corpus admits `twill-d5d27089`:
+an optional, separately scheduled producer may read original raw archive objects
+and materialize bounded verified JSONL snapshots into an explicitly private
+external feed. This extends the original source-enrollment decision and the
+host-local reporting decision for this opt-in controller only. It does not
+modify capture, depend on a graph/index, read the archive checkout from core,
+or relax the public/private, import, network or archive-open audit guards.
+The optional producer uses only LIST/GET, original-byte hash/size verification,
+explicit scoped credential files and complete observed artifact generations.
+Observed completeness never proves session/task completion. Stable current
+paths change or withdraw on newer observed generations; immutable byte objects
+and provenance remain private and bounded. Core parsing and learning keep
+working with local sources when this optional feed is absent. Discovery has a
+separate no-model cadence and fair resumable native-source queue. Concrete
+operation and limits are specified in [learning-operations.md](../notes/learning-operations.md).

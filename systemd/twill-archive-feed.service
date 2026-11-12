@@ -1,0 +1,15 @@
+[Unit]
+Description=Read verified raw transcript snapshots into an optional TWILL input feed
+ConditionPathExists=%h/.config/twill/archive-feed.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env %h/.local/bin/twill-archive-feed --policy %h/.config/twill/archive-feed.json
+MemoryMax=1G
+CPUQuota=100%
+TimeoutStartSec=3min
+TimeoutStopSec=15s
+KillMode=control-group
+UMask=0077
+StandardOutput=journal
+StandardError=journal

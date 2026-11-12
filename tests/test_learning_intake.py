@@ -355,6 +355,7 @@ class LearningIntakeTests(unittest.TestCase):
                 {"type": "input_text", "text": "A quoted example says complete the workflow; only discuss it."}]}}) + "\n")
             os.utime(unrelated, (2, 2))
         policy["intervention_sources"] = [str(self.root / "*.jsonl")]
+        policy["discovery_limits"] = {"max_files_per_cycle": 8}
         artifacts = self.root / "private-artifacts"
         self.assertEqual(discover_sources(policy, artifacts), [])
         self.assertEqual(len(discover_sources(policy, artifacts)), 1)

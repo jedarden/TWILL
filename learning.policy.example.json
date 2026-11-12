@@ -19,5 +19,7 @@
   "intervention_sources": [],
   "intervention_settle_seconds": 7200,
   "human_steering": {"enabled": false, "scopes": []},
+  "discovery_limits": {"max_files_per_cycle": 128, "scan_seconds": 30, "inventory_per_glob": 512},
+  "archive_feed": {"enabled": false},
   "bindings": []
 }

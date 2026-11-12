@@ -207,3 +207,64 @@ python3 scripts/rehearse-human-steering.py --scratch /private/scratch \
 The synthetic proof requires both baselines and candidates to pass, applies the
 human rule without improvement, performs fresh validation, then changes the raw
 source and verifies automatic removal while preserving human edits.
+
+
+## Centralized original transcripts and backfill
+
+The optional producer is `twill-archive-feed --policy PRIVATE_CONFIG`, installed
+by `make install`. The example `archive-feed.policy.example.json` is disabled.
+Configure a read-only object-store identity via a mode-600 credential JSON file
+with `access_key` and `secret_key`; values never belong in command arguments,
+logs or source control. Configure exact endpoint, bucket, reference/blob prefixes,
+canonical private feed/state roots and limits. The SDK dependency belongs only
+to the optional producer entry point. Core and its ordinary tests remain stdlib
+only, offline and independent of archive services and indexes.
+
+The producer uses LIST/GET only. It checks compressed and raw hashes/sizes,
+complete gzip and newline boundaries, artifact identity and contiguous ranges
+within one generation. A complete observed archived generation is not a claim
+that the original session ended. Unsettled, gapped, corrupt or unsupported input
+is unknown and cannot become a complete native transcript. Seeded pilot scopes
+are reported as partial rather than a full corpus sweep. Total cache size and
+per-run page/reference/session/byte/time budgets bound work; a storage limit
+requires explicit capacity management and never deletes archive data.
+
+Enroll only `FEED_ROOT/current/claude-code/**/*.jsonl` and
+`FEED_ROOT/current/codex/**/*.jsonl` in `intervention_sources`, alongside local
+sources. Immutable object-cache history must not be enrolled as fresh sessions.
+The producer atomically updates stable per-artifact current paths, so new source
+bytes or withdrawals invalidate older human-directed exposure. Feed files and
+sidecars stay private and outside this public repository; raw JSONL is never
+published as lesson evidence. The producer status is `STATE_ROOT/status.json`.
+Optionally enroll `archive_feed` in learning policy with `enabled:true`, exact
+`status_path`, and `stale_seconds`; missing/failed/stale feed health is actionable.
+Fresh bounded `in_progress`/`partial` coverage is visible without claiming the
+archive is exhausted.
+
+```sh
+systemctl --user daemon-reload
+systemctl --user enable --now twill-archive-feed.timer twill-discover.timer
+systemctl --user start twill-archive-feed.service
+systemctl --user start twill-discover.service
+twill-learning doctor --json
+```
+
+Discovery inventory and pending work are fair across every enrolled glob and
+provider. `discovery_limits` defaults to 128 files, 30 cooperative seconds and
+512 directory inventory entries per glob per run. The local private SQLite
+queue retains completed fingerprints and partial parser cursors beyond 4,096
+files; legacy JSON cursors migrate. It is rebuildable derived state, never the
+source of human authority. The five-minute discovery timer makes no model calls;
+the hourly learning timer retains experiment limits. `input_coverage` reports
+known/completed/pending/visited/error counts and backfill progress. Completed
+means the native scan finished, including unsupported or malformed input; it
+does not mean a lesson was accepted. An empty
+candidate queue never establishes an empty transcript corpus.
+
+Installation preserves existing policy files and does not enable optional timers
+automatically. Recovery can disable the optional timers and remove their source
+globs while keeping local learning operational. Keep the private source snapshots
+needed by active lessons; deleting or replacing current raw sources withdraws
+human exposures during reconciliation. Credential recovery uses the operator's
+original secret reference. Rebuilding queue metadata from enrolled originals
+does not require restoring a learned rule or weakening an audit guard.

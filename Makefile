@@ -11,8 +11,9 @@ CONFIG_FILE := $(CONFIG_DIR)/config.toml
 SKELETON := config.toml.skeleton
 LINK := $(BIN_DIR)/twill
 LEARNING_LINK := $(BIN_DIR)/twill-learning
+ARCHIVE_FEED_LINK := $(BIN_DIR)/twill-archive-feed
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
-SYSTEMD_UNITS := twill-ingest.service twill-ingest.timer twill-measure.service twill-measure.timer twill-digest.service twill-digest.timer twill-learning.service twill-learning.timer
+SYSTEMD_UNITS := twill-ingest.service twill-ingest.timer twill-measure.service twill-measure.timer twill-digest.service twill-digest.timer twill-learning.service twill-learning.timer twill-discover.service twill-discover.timer twill-archive-feed.service twill-archive-feed.timer
 
 # Unit tests under the import, network, and open-path audit gates (plan §3,
 # §8.3, §10.2).  Putting
@@ -31,6 +32,9 @@ test:
 .PHONY: install
 install:
 	@mkdir -p "$(BIN_DIR)" "$(CONFIG_DIR)"
+	@if [ -e "$(ARCHIVE_FEED_LINK)" ] && [ ! -L "$(ARCHIVE_FEED_LINK)" ]; then \
+		echo "twill: error: $(ARCHIVE_FEED_LINK) is not a symlink" >&2; exit 1; \
+	fi
 	@if [ -e "$(LEARNING_LINK)" ] && [ ! -L "$(LEARNING_LINK)" ]; then \
 		echo "twill: error: $(LEARNING_LINK) is not a symlink" >&2; exit 1; \
 	fi
@@ -40,8 +44,12 @@ install:
 	fi
 	@ln -sfn "$(CURDIR)/twill" "$(LINK)"
 	@ln -sfn "$(CURDIR)/twill-learning" "$(LEARNING_LINK)"
+	@ln -sfn "$(CURDIR)/scripts/export-archive-transcripts.py" "$(ARCHIVE_FEED_LINK)"
 	@if [ ! -e "$(CONFIG_DIR)/learning.json" ]; then \
 		install -m 600 learning.policy.example.json "$(CONFIG_DIR)/learning.json"; \
+	fi
+	@if [ ! -e "$(CONFIG_DIR)/archive-feed.json" ]; then \
+		install -m 600 archive-feed.policy.example.json "$(CONFIG_DIR)/archive-feed.json"; \
 	fi
 	@if [ -e "$(CONFIG_FILE)" ]; then \
 		echo "twill: keeping existing $(CONFIG_FILE)"; \

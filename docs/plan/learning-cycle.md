@@ -235,6 +235,36 @@ Human-directed lessons must pass all candidate, holdout and guardrail cases on b
 
 Acceptance adds genuine native-shaped discovery for both providers, already-passing baselines that admit human guidance, rejection of forged provenance and scope expansion, adherence/guardrail/runtime failures, revalidation, source drift removal preserving human edits, and unchanged inferred improvement requirements. The native scratch proof is `scripts/rehearse-human-steering.py`; synthetic evidence is never a production lesson.
 
+## Centralized source enrollment and fair discovery
+
+Owner `twill-d5d27089` connects an optional original-byte producer outside the
+archive repository to the existing native readers. The legacy engine does not
+open an archive checkout or derived index. A bounded SDK-only producer reads
+LIST/GET objects and verifies compressed/raw hashes, sizes and contiguous
+artifact/generation coverage before supplying canonical private JSONL. Stable
+current paths preserve source drift/withdrawal semantics. No captured snapshot
+is evidence of a completed task. Budgets, source provenance and incomplete
+backfill remain explicit in private status.
+
+A private SQLite discovery queue replaces first-glob truncation and the 4,096
+fingerprint rotation. Directory inventory and pending reads resume fairly across
+every enrolled glob/provider; completed fingerprints and partial parser cursors
+survive across large corpora. The existing JSON cursor state migrates without
+reclassifying evidence. `twill-learning discover` advances intake without native
+model calls on its own five-minute timer; experiment/admission remains hourly
+and retains its existing call budget. `input_coverage` exposes per-glob/provider
+counts and optional producer progress; operational health cannot treat a missing
+or failed explicitly enrolled feed as an empty corpus.
+
+Acceptance includes a first provider with more than 20,000 files without starving
+the second, persistence beyond 4,096 fingerprints, changed-source retry, bounded
+resumption and genuine raw Claude/Codex source evidence. Producer tests cover
+pagination, contiguous generations, corruption, limits, later withdrawal and
+private path/credential boundaries. Live acceptance reads verified originals for
+both native formats, supplies the external feed and observes both providers in
+the scheduled no-model backfill. Full repository gates and deployment receipts
+remain required; complete corpus backfill is measured separately from deployment.
+
 ## 16. Open Questions
 
 None requiring a human decision. Native CLI constraints are a Phase 0 empirical gate owned by the implementer; failure invokes Plan B rather than relaxing safety. N/A: HTTP API and

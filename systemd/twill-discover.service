@@ -1,0 +1,18 @@
+[Unit]
+Description=Advance bounded TWILL transcript discovery without model calls
+ConditionPathExists=%h/.config/twill/learning.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env %h/.local/bin/twill-learning discover
+# The hourly learning cycle holds the same lock during native experiments.
+# A busy tick makes no changes and retries on its next timer activation.
+SuccessExitStatus=3
+MemoryMax=2G
+CPUQuota=100%
+TimeoutStartSec=3min
+TimeoutStopSec=15s
+KillMode=control-group
+UMask=0077
+StandardOutput=journal
+StandardError=journal

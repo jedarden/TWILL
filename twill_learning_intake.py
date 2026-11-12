@@ -7,7 +7,6 @@ the lifecycle controller owns immutable versions, experiments, and delivery.
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import os
 import json
@@ -17,6 +16,8 @@ import tempfile
 import time
 from collections.abc import Mapping
 from pathlib import Path
+
+from twill_source_discovery import DiscoveryQueue, validate_limits
 
 
 CATALOG = {
@@ -45,6 +46,7 @@ def _sha(value: object) -> str:
 
 def validate_policy(policy: dict) -> None:
     """Reject unknown or ambiguous catalog enrollment before any intake."""
+    validate_limits(policy)
     entries = policy.get("auto_evaluators", [])
     if not isinstance(entries, list):
         raise ValueError("auto_evaluators must be a list")
@@ -283,13 +285,31 @@ def _interactive_boundary(raw: dict, known_tools: dict) -> bool:
     return boundary
 
 
+def _valid_workflow_cursor(cursor: object) -> bool:
+    if not isinstance(cursor, dict):
+        return False
+    fingerprint = cursor.get("fingerprint")
+    episode = cursor.get("episode", {})
+    tools = cursor.get("tools", {})
+    return (isinstance(fingerprint, list) and len(fingerprint) == 3 and
+            all(type(value) is int and value >= 0 for value in fingerprint) and
+            type(cursor.get("offset")) is int and 0 <= cursor["offset"] <= MAX_SOURCE_BYTES and
+            type(cursor.get("line")) is int and 0 <= cursor["line"] <= 2_000_000 and
+            type(cursor.get("done")) is bool and isinstance(episode, dict) and
+            (not episode or type(episode.get("stage")) is int and 1 <= episode["stage"] <= 4 and
+             isinstance(episode.get("refs"), list) and len(episode["refs"]) <= 24 and
+             all(isinstance(ref, dict) for ref in episode["refs"])) and
+            isinstance(tools, dict) and len(tools) <= 128 and
+            all(isinstance(k, str) and isinstance(v, str) for k, v in tools.items()) and
+            type(cursor.get("question_pending", False)) is bool)
+
+
 def discover_sources(policy: dict, artifacts_root: Path) -> list[Path]:
     """Discover settled workflow interventions with bounded resumable source reads.
 
-    Only explicitly configured globs are read. At most eight eligible files,
-    50,000 records per file, 128 MiB per file, and five seconds of cooperative
-    work are allowed per invocation. Offsets and the small source-reference
-    state machine survive budgets; unchanged completed files are skipped.
+    Only explicitly configured globs are read. Discovery limits bound fair
+    inventory and source selection; 50,000 records and 128 MiB remain the per-file
+    limits. Durable fingerprints and parser offsets survive cooperative budgets.
     """
     validate_policy(policy)
     if (not policy.get("intervention_sources") or
@@ -308,119 +328,92 @@ def discover_sources(policy: dict, artifacts_root: Path) -> list[Path]:
         if state_path.is_symlink() or state_path.stat().st_size > MAX_LINE_BYTES:
             raise ValueError("discovery state must be a bounded regular file")
         state = json.loads(state_path.read_text())
-        if state.get("schema") != "twill-intervention-discovery/v1":
-            raise ValueError("unknown discovery state schema")
-    started = time.monotonic()
-    deadline = started + 5
-    now = time.time()
-    candidates = {}
-    exhausted = False
-    for pattern in policy["intervention_sources"]:
-        for raw in glob.iglob(str(Path(pattern).expanduser()), recursive=True):
-            if time.monotonic() >= deadline or len(candidates) >= 20000:
-                exhausted = True
-                break
-            path = Path(raw)
+        if (not isinstance(state, dict) or state.get("schema") != "twill-intervention-discovery/v1" or
+                not isinstance(state.get("files"), dict) or not isinstance(state.get("outputs"), list) or
+                len(state["files"]) > 4096 or len(state["outputs"]) > 256 or
+                any(not isinstance(k, str) or not Path(k).is_absolute() or str(Path(k).resolve()) != k or
+                    not _valid_workflow_cursor(v) for k, v in state["files"].items()) or
+                any(not isinstance(n, str) or not re.fullmatch(r"auto-workflow-[0-9a-f]{24}\.json", n)
+                    for n in state["outputs"])):
+            raise ValueError("invalid workflow discovery state")
+    with DiscoveryQueue(root, "workflow", policy, MAX_SOURCE_BYTES) as queue:
+        queue.import_legacy(state)
+        deadline = time.monotonic() + queue.limits["scan_seconds"]
+        queue.inventory(deadline)
+        for value, fingerprint, previous in queue.pending(deadline):
+            path = Path(value)
+            current = previous if previous.get("fingerprint") == fingerprint else {
+                "fingerprint": fingerprint, "offset": 0, "line": 0, "episode": {}, "done": False}
+            outputs = []
             try:
-                stat = path.stat()
-                if (path.is_symlink() or not path.is_file() or path.absolute() != path.resolve() or
-                        stat.st_size > MAX_SOURCE_BYTES or now - stat.st_mtime < policy.get("intervention_settle_seconds", 7200)):
-                    continue
-                fingerprint = [stat.st_size, stat.st_mtime_ns, stat.st_ino]
-                previous = state["files"].get(str(path), {})
-                if previous.get("fingerprint") == fingerprint and previous.get("done"):
-                    continue
-                candidates[str(path)] = (stat.st_mtime_ns, fingerprint)
-            except OSError:
-                continue
-        if exhausted:
-            break
-    # Marked files leave this queue, so unrelated settled files cannot starve
-    # older supported episodes on subsequent cycles.
-    selected = sorted(candidates, key=lambda key: candidates[key][0], reverse=True)[:8]
-    for value in selected:
-        if time.monotonic() >= deadline:
-            break
-        path = Path(value)
-        fingerprint = candidates[value][1]
-        previous = state["files"].get(value, {})
-        current = previous if previous.get("fingerprint") == fingerprint else {
-            "fingerprint": fingerprint, "offset": 0, "line": 0, "episode": {}, "done": False}
-        outputs = []
-        try:
-            with path.open("rb") as stream:
-                stream.seek(current["offset"])
-                for _ in range(50000):
-                    if time.monotonic() >= deadline:
-                        break
-                    line = stream.readline(MAX_LINE_BYTES + 1)
-                    if not line:
-                        current["done"] = True
-                        break
-                    if len(line) > MAX_LINE_BYTES or not line.endswith(b"\n"):
-                        current["done"] = True
-                        current["episode"] = {}
-                        break
-                    current.update(offset=stream.tell(), line=current["line"] + 1)
-                    # Decode native role-bearing records for both providers;
-                    # tool answers remain excluded without known pairing.
-                    raw = json.loads(line)
-                    if not isinstance(raw, dict):
-                        continue
-                    if _interactive_boundary(raw, current.setdefault("tools", {})):
-                        current["episode"] = {}
-                        current["question_pending"] = True
-                        continue
-                    turn = _native_workflow_turn(raw, current["line"])
-                    if turn is None:
-                        continue
-                    if current.pop("question_pending", False):
-                        # A plain user reply can be the answer to a pending
-                        # question. Do not silently reinterpret it as authority.
-                        if turn["role"] == "user":
+                with path.open("rb") as stream:
+                    stream.seek(current["offset"])
+                    for _ in range(50000):
+                        if time.monotonic() >= deadline:
+                            break
+                        line = stream.readline(MAX_LINE_BYTES + 1)
+                        if not line:
+                            current["done"] = True
+                            break
+                        if len(line) > MAX_LINE_BYTES or not line.endswith(b"\n") or current["line"] >= 2_000_000:
+                            current["done"] = True
+                            current["episode"] = {}
+                            break
+                        current.update(offset=stream.tell(), line=current["line"] + 1)
+                        # Decode native role-bearing records for both providers;
+                        # tool answers remain excluded without known pairing.
+                        raw = json.loads(line)
+                        if not isinstance(raw, dict):
+                            continue
+                        if _interactive_boundary(raw, current.setdefault("tools", {})):
+                            current["episode"] = {}
+                            current["question_pending"] = True
+                            continue
+                        turn = _native_workflow_turn(raw, current["line"])
+                        if turn is None:
+                            continue
+                        if current.pop("question_pending", False):
+                            # A plain user reply can be the answer to a pending
+                            # question. Do not silently reinterpret it as authority.
+                            if turn["role"] == "user":
+                                current["episode"] = {}
+                                continue
+                        role, text = turn["role"], turn["text"]
+                        if len(text) > 8192:
+                            # Missing a role-bearing answer prevents claims based
+                            # on a sequence spanning unknown omitted authority.
                             current["episode"] = {}
                             continue
-                    role, text = turn["role"], turn["text"]
-                    if len(text) > 8192:
-                        # Missing a role-bearing answer prevents claims based
-                        # on a sequence spanning unknown omitted authority.
-                        current["episode"] = {}
-                        continue
-                    from twill_redactor import redact_text
-                    ref = {"source_path": value, "source_line": current["line"], "role": role,
-                           "sha256": hashlib.sha256(line).hexdigest(), "text": redact_text(text)}
-                    current["episode"], found = _advance_episode(current["episode"], ref, text)
-                    if found:
-                        outputs.append(found)
-                        # Publish at most one intervention per source file per
-                        # cycle; the offset resumes after this exact reply.
-                        break
-            # Never publish a source snapshot observed to change during read.
-            stat = path.stat()
-            if fingerprint != [stat.st_size, stat.st_mtime_ns, stat.st_ino]:
-                continue
-            state["files"][value] = current
-            for refs in outputs:
-                ident = _sha([{k: v for k, v in ref.items() if k != "text"} for ref in refs])
-                target = directory / f"auto-workflow-{ident[:24]}.json"
-                payload = {"schema": "twill-workflow-intervention/v1", "detector": "workflow-completion",
-                           "references": refs}
-                if not target.exists():
-                    _private_json(target, payload)
-                candidate = {"detector": "workflow-completion", "source": {"path": str(target)}}
-                if _workflow_evidence(candidate)["complete"] and target.name not in state["outputs"]:
-                    state["outputs"].append(target.name)
-        except (OSError, ValueError):
-            # Changed or malformed source is not a candidate. A subsequent
-            # source fingerprint permits another independent attempt.
-            current.update(done=True, episode={})
-            state["files"][value] = current
-    # Keep checkpoint bounded without discarding in-progress offsets. Old
-    # completed fingerprints may be rescanned after this large cache rotates.
-    if len(state["files"]) > 4096:
-        ordered = sorted(state["files"], key=lambda key: state["files"][key].get("done", False))
-        state["files"] = {key: state["files"][key] for key in ordered[:4096]}
-    state["outputs"] = state["outputs"][-256:]
+                        from twill_redactor import redact_text
+                        ref = {"source_path": value, "source_line": current["line"], "role": role,
+                               "sha256": hashlib.sha256(line).hexdigest(), "text": redact_text(text)}
+                        current["episode"], found = _advance_episode(current["episode"], ref, text)
+                        if found:
+                            outputs.append(found)
+                            # Publish at most one intervention per source file per
+                            # cycle; the offset resumes after this exact reply.
+                            break
+                # Never publish a source snapshot observed to change during read.
+                stat = path.stat()
+                if fingerprint != [stat.st_size, stat.st_mtime_ns, stat.st_ino]:
+                    continue
+                queue.save(value, current)
+                for refs in outputs:
+                    ident = _sha([{k: v for k, v in ref.items() if k != "text"} for ref in refs])
+                    target = directory / f"auto-workflow-{ident[:24]}.json"
+                    payload = {"schema": "twill-workflow-intervention/v1", "detector": "workflow-completion",
+                               "references": refs}
+                    if not target.exists():
+                        _private_json(target, payload)
+                    candidate = {"detector": "workflow-completion", "source": {"path": str(target)}}
+                    if _workflow_evidence(candidate)["complete"] and target.name not in state["outputs"]:
+                        queue.add_output(target.name)
+            except (OSError, ValueError):
+                # Changed or malformed source is not a candidate. A subsequent
+                # source fingerprint permits another independent attempt.
+                current.update(done=True, episode={})
+                queue.save(value, current, error=True)
+        state = queue.finish(state)
     _private_json(state_path, state)
     return [directory / name for name in state["outputs"] if (directory / name).is_file()]
 

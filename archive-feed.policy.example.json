@@ -1,0 +1,19 @@
+{
+  "schema_version": "twill-archive-feed/v1",
+  "enabled": false,
+  "endpoint_url": "https://archive.example.invalid",
+  "bucket": "operator-configured-bucket",
+  "refs_prefix": "raw/refs/",
+  "blobs_prefix": "raw/blobs/sha256/",
+  "credentials_file": "/SET_PRIVATE_CANONICAL_PATH/reader.json",
+  "feed_root": "/SET_PRIVATE_CANONICAL_PATH/feed",
+  "state_root": "/SET_PRIVATE_CANONICAL_PATH/state",
+  "include_agents": ["claude-code", "codex"],
+  "settle_seconds": 7200,
+  "max_pages": 16,
+  "max_refs": 16000,
+  "max_sessions": 64,
+  "max_bytes": 268435456,
+  "max_seconds": 120,
+  "max_cache_bytes": 4294967296
+}

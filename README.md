@@ -29,8 +29,9 @@ here: a one-off error is noise, the same one across six hundred sessions is a le
 
 ## What it is not
 
-- **Not a transcript archive.** A separate pipeline owns capture and durability. TWILL copies and
-  retains nothing.
+- **Not a transcript archive.** A separate pipeline owns capture and durability. The legacy core copies and
+  retains nothing. An optional read-only producer can supply bounded private raw snapshots
+  to the separately scheduled learning controller; see [operations](docs/notes/learning-operations.md).
 - **Not part of that pipeline.** TWILL has its own repo, its own schedule, its own cursor and its
   own state. Ingest never calls it, it never reads the archive's derived index, and it keeps working
   when the archive is stopped or deleted.

@@ -6,12 +6,13 @@ nor extracted scope metadata supplies authority or an evaluation oracle.
 
 from __future__ import annotations
 
-import glob
 import hashlib
 import json
 import re
 import time
 from pathlib import Path
+
+from twill_source_discovery import DiscoveryQueue
 
 from twill_learning_intake import (MAX_LINE_BYTES, MAX_SOURCE_BYTES,
                                    _interactive_boundary, _native_workflow_turn,
@@ -316,91 +317,69 @@ def discover(policy: dict, artifacts_root: Path) -> list[Path]:
                 any(not isinstance(n, str) or not re.fullmatch(r"auto-human-steering-[0-9a-f]{24}\.json", n)
                     for n in state["outputs"])):
             raise ValueError("invalid steering discovery state")
-    deadline, now, candidates = time.monotonic() + 5, time.time(), {}
-    for pattern in policy["intervention_sources"]:
-        for value in glob.iglob(str(Path(pattern).expanduser()), recursive=True):
-            if time.monotonic() >= deadline or len(candidates) >= 20000:
-                break
+    with DiscoveryQueue(root, "human-steering", policy, MAX_SOURCE_BYTES) as queue:
+        queue.import_legacy(state)
+        deadline = time.monotonic() + queue.limits["scan_seconds"]
+        queue.inventory(deadline)
+        for value, fingerprint, previous in queue.pending(deadline):
             path = Path(value)
+            current = previous if previous.get("fingerprint") == fingerprint else {
+                "fingerprint": fingerprint, "offset": 0, "line": 0, "tools": {}, "pending": False, "done": False}
+            found = []
             try:
-                if not _regular(path, MAX_SOURCE_BYTES) or now - path.stat().st_mtime < policy.get("intervention_settle_seconds", 7200):
+                snapshot = _full_hash(path, deadline)
+                with path.open("rb") as stream:
+                    stream.seek(current["offset"])
+                    for _ in range(50000):
+                        if time.monotonic() >= deadline:
+                            break
+                        line = stream.readline(MAX_LINE_BYTES + 1)
+                        if not line:
+                            current["done"] = True
+                            break
+                        if len(line) > MAX_LINE_BYTES or not line.endswith(b"\n") or current["line"] >= MAX_RECORDS:
+                            raise ValueError("unbounded native record")
+                        current.update(offset=stream.tell(), line=current["line"] + 1)
+                        raw = json.loads(line)
+                        if not isinstance(raw, dict):
+                            raise ValueError("native record must be a mapping")
+                        if _interactive_boundary(raw, current["tools"]):
+                            current["pending"] = True
+                            continue
+                        turn = _native_workflow_turn(raw, current["line"])
+                        if turn and turn["role"] == "user" and current["pending"]:
+                            current["pending"] = False
+                            continue
+                        human = _human_turn(raw, current["line"])
+                        if human is None or extract_directive(human["text"]) is None:
+                            continue
+                        found.append({"source_path": value, "source_line": current["line"],
+                                      "sha256": hashlib.sha256(line).hexdigest(), "role": "user"})
+                        if len(found) >= 16:
+                            break
+                if fingerprint != _fingerprint(path):
                     continue
-                fingerprint = _fingerprint(path)
-                previous = state["files"].get(str(path), {})
-                if previous.get("fingerprint") == fingerprint and previous.get("done"):
-                    continue
-                candidates[str(path)] = fingerprint
-            except OSError:
-                continue
-        if time.monotonic() >= deadline or len(candidates) >= 20000:
-            break
-    for value in sorted(candidates, key=lambda n: candidates[n][1], reverse=True)[:8]:
-        if time.monotonic() >= deadline:
-            break
-        path, fingerprint = Path(value), candidates[value]
-        previous = state["files"].get(value, {})
-        current = previous if previous.get("fingerprint") == fingerprint else {
-            "fingerprint": fingerprint, "offset": 0, "line": 0, "tools": {}, "pending": False, "done": False}
-        found = []
-        try:
-            snapshot = _full_hash(path, deadline)
-            with path.open("rb") as stream:
-                stream.seek(current["offset"])
-                for _ in range(50000):
+                queue.save(value, current)
+                for ref in found:
                     if time.monotonic() >= deadline:
+                        # Do not advance past an unpublished directive when the
+                        # cooperative budget expires during this source scan.
+                        queue.save(value, {"fingerprint": fingerprint, "offset": 0, "line": 0,
+                                           "tools": {}, "pending": False, "done": False})
                         break
-                    line = stream.readline(MAX_LINE_BYTES + 1)
-                    if not line:
-                        current["done"] = True
-                        break
-                    if len(line) > MAX_LINE_BYTES or not line.endswith(b"\n") or current["line"] >= MAX_RECORDS:
-                        raise ValueError("unbounded native record")
-                    current.update(offset=stream.tell(), line=current["line"] + 1)
-                    raw = json.loads(line)
-                    if not isinstance(raw, dict):
-                        raise ValueError("native record must be a mapping")
-                    if _interactive_boundary(raw, current["tools"]):
-                        current["pending"] = True
-                        continue
-                    turn = _native_workflow_turn(raw, current["line"])
-                    if turn and turn["role"] == "user" and current["pending"]:
-                        current["pending"] = False
-                        continue
-                    human = _human_turn(raw, current["line"])
-                    if human is None or extract_directive(human["text"]) is None:
-                        continue
-                    found.append({"source_path": value, "source_line": current["line"],
-                                  "sha256": hashlib.sha256(line).hexdigest(), "role": "user"})
-                    if len(found) >= 16:
-                        break
-            if fingerprint != _fingerprint(path):
-                continue
-            state["files"][value] = current
-            for ref in found:
-                if time.monotonic() >= deadline:
-                    # Do not advance past an unpublished directive when the
-                    # cooperative budget expires during this source scan.
-                    state["files"].pop(value, None)
-                    break
-                payload = {"schema": SCHEMA, "references": [ref], "raw_sources": [{"path": value, "sha256": snapshot}]}
-                ident = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
-                target = directory / f"auto-human-steering-{ident}.json"
-                _private_json(target, payload)
-                evidence = verify(target)
-                if resolve_scope(evidence, policy) is not None and target.name not in state["outputs"]:
-                    state["outputs"].append(target.name)
-        except TimeoutError:
-            break
-        except (OSError, ValueError, TypeError, AttributeError, UnicodeError, RecursionError):
-            current["done"] = True
-            state["files"][value] = current
-    if len(state["files"]) > 4096:
-        keys = sorted(state["files"], key=lambda k: state["files"][k].get("done", False))[:4096]
-        state["files"] = {key: state["files"][key] for key in keys}
-    state["outputs"] = state["outputs"][-256:]
-    # Long source names cannot make the next bounded state read impossible.
-    while len(json.dumps(state, sort_keys=True).encode()) >= MAX_LINE_BYTES and state["files"]:
-        completed = next((key for key, cursor in state["files"].items() if cursor["done"]), None)
-        state["files"].pop(completed or next(iter(state["files"])))
+                    payload = {"schema": SCHEMA, "references": [ref], "raw_sources": [{"path": value, "sha256": snapshot}]}
+                    ident = hashlib.sha256(json.dumps(payload, sort_keys=True).encode()).hexdigest()[:24]
+                    target = directory / f"auto-human-steering-{ident}.json"
+                    _private_json(target, payload)
+                    evidence = verify(target)
+                    if resolve_scope(evidence, policy) is not None and target.name not in state["outputs"]:
+                        queue.add_output(target.name)
+            except TimeoutError:
+                queue.budget("source_time")
+                break
+            except (OSError, ValueError, TypeError, AttributeError, UnicodeError, RecursionError):
+                current["done"] = True
+                queue.save(value, current, error=True)
+        state = queue.finish(state)
     _private_json(checkpoint, state)
     return [directory / name for name in state["outputs"] if (directory / name).is_file()]
