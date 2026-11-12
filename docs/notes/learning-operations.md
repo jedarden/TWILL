@@ -71,8 +71,24 @@ twill-learning cycle
 Create takes instruction text, scope and a source path with optional expected
 source SHA-256, legacy lesson ID and detector ID. The ID versions the source,
 instruction and scope. A cycle automatically imports existing legacy drafts
-without accepting them; absent an approved binding, it records
-`needs_evaluation`. Trials that establish no improvement stay unvalidated.
+without accepting them; absent a trusted catalog admission or an approved
+binding, it records `needs_evaluation`. Inconclusive trials remain unvalidated. Complete redundant
+or harmful evidence produces a terminal rejection rather than repeated retries.
+
+Supported source types use `auto_evaluators`: enroll a catalog name and exact
+scope names once, with `global:true` or source `launchdirs` on each scope.
+The controller verifies evidence, routes the source and instantiates independent
+fixed cases automatically. The initial catalog contains terminal-traceback,
+authorized-continuation and workflow-completion recipes. Candidate prose cannot
+select labels, scopes or delivery authority; no per-lesson binding is needed.
+
+`intervention_sources` explicitly enrolls raw transcript globs for bounded
+completion-intervention discovery for native Codex and Claude JSONL, with a
+two-hour default settlement window. The scanner requires captured completion authority, a native terminal delivery
+claim, human followup, explicit incompleteness admission and renewed authority
+in order. It preserves role-bearing answers and abstains across unsupported
+interactive tool formats. Private offsets resume bounded scans; duplicate
+episodes do not repeatedly spend experiment quota.
 No-op retries are cooled down until the revalidation interval (seven days by
 default). Invalidation is terminal for that lesson version.
 
@@ -116,3 +132,32 @@ block requires manual reconciliation; no reset or force-push is part of recovery
 The legacy `twill doctor` remains the source for ingestion/parser health;
 successful lifecycle scheduling is not proof that all historical input
 warnings or longitudinal efficacy have been resolved.
+
+`twill-learning doctor --json` reports state counts, pending age, missing
+evaluators, unavailable grading/runtime providers and stale schedule/input
+stages. Blocked queues return attention and nonzero cycle/doctor status.
+`require_fresh_sources` enables pipeline freshness checks and observational
+follow-up metrics in cycle status. These distinguish source-native terminal
+replies, unknown/truncated coverage and same-family recurrence; they do not
+equate a final reply with successful task completion or claim causality.
+
+The actual scheduled acceptance harness is:
+
+```sh
+python3 scripts/verify-scheduled-learning.py --scratch /private/scratch \
+  --claude-model EXPLICIT_CLAUDE_MODEL --codex-model EXPLICIT_CODEX_MODEL
+```
+
+It verifies real timer triggers, both providers, fresh interval-based validation,
+automatic source-withdrawal removal and a no-op followup. It first checks a
+harmless timer twice without model calls to catch unit/parser/D-Bus differences.
+It uses an isolated synthetic source and never alters the production targets.
+
+For code behavior, a trusted suite may supply a `python-functions/v1` oracle.
+Models emit strict JSON Python files; the controller checks them in the pinned
+Docker image without credentials/network or host/project write access. Hidden
+input/output assertions remain inaccessible to the generated child process.
+Unavailable runtime or malformed supervisor output is unknown; executed
+assertion failures are failures. All execution inputs, image digest and grader
+implementation are bound into evidence. Opt-in real isolation checks run with
+`TWILL_DOCKER_TEST=1 PYTHONPATH=tests python3 -m unittest test_execution_oracle test_experiments`.

@@ -1,8 +1,9 @@
 """Bounded, paired Claude/Codex instruction experiments.
 
-This first oracle checks text decisions and action plans, not executed actions.
-Every repetition counts; transport errors, missing context markers and truncated
-output never pass. Execution outcomes require separate integration tests.
+Text assertions check decisions and action plans. Optional execution oracles
+materialize generated JSON files inside a disposable restricted container and
+check independently authored hidden assertions. Every repetition counts;
+transport, setup, missing-context and truncated-output errors never pass.
 
 Codex discovers AGENTS.md in a fresh /tmp root and runs read-only, without
 shell, apps, MCP, hooks or plugins. Claude's empty setting sources did not load
@@ -27,6 +28,7 @@ import tomllib
 from pathlib import Path
 
 from twill_redactor import redact_text
+import twill_execution_oracle as execution
 
 
 MAX_CAPTURE = 128 * 1024
@@ -94,6 +96,11 @@ def _validate(spec: dict, providers: dict, repetitions: int, max_calls: int, tim
         if case.get("split") not in ("train", "holdout"):
             raise ValueError("case split must be train or holdout")
         splits.add(case["split"])
+        if "oracle" in case:
+            if "expect" in case:
+                raise ValueError("execution cases cannot also supply text assertions")
+            execution.validate_oracle(case["oracle"])
+            continue
         expect = case.get("expect")
         if not isinstance(expect, dict) or set(expect) - {"contains", "excludes", "exact"}:
             raise ValueError("expect supports contains, excludes and exact only")
@@ -328,6 +335,18 @@ def _check(text: str, expect: dict) -> bool:
 
 def _scenario_prompt(case: dict, files: dict) -> str:
     """Separate simulated user intent from the harness response protocol."""
+    if "oracle" in case:
+        # Explicit allowlist: no oracle, expected answers, assertion IDs, split or
+        # other cases can enter the evaluated model's prompt or fixture tree.
+        return (
+            "Write Python code for the project request below. Do not use tools or run code.\n"
+            "First copy the exact context marker from the loaded instruction file on its own line.\n"
+            "Then output ONLY a JSON object {\"files\": {\"relative.py\": \"complete source\"}}. "
+            "Supply exactly these files: " + json.dumps(case["oracle"]["output_files"]) + ".\n"
+            "The controller will execute code in a disposable restricted environment; "
+            "you have no access to its tests.\nPROJECT REQUEST AND VISIBLE FILES JSON:\n"
+            + _canonical({"request": case["prompt"], "fixture_files": files}).decode()
+        )
     return (
         "This is a text-only behavioral simulation, not a request to execute the scenario.\n"
         "Apply the loaded project guidance to decide the response within the scenario JSON below.\n"
@@ -398,13 +417,20 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
         raise ValueError("experiment work_root must be outside the public checkout")
     work_root.mkdir(parents=True, exist_ok=True, mode=0o700)
     started = time.monotonic()
+    runtime_evidence = execution.preflight_oracles(spec["cases"], work_root=work_root)
+    execution_cases = any("oracle" in case for case in spec["cases"])
+    suite = {"cases": spec["cases"], "files": spec.get("files", {})}
+    if execution_cases:
+        suite["execution_harness"] = execution.suite_binding()
     deadline = started + min(MAX_WALL_SECONDS, max_calls * timeout_seconds)
     result = {"schema": "twill.experiment.v1", "id": _safe(spec.get("id", ""), 240),
               "candidate_sha": hashlib.sha256(spec["instruction"].encode()).hexdigest(),
-              "suite_sha": hashlib.sha256(_canonical({"cases": spec["cases"], "files": spec.get("files", {})})).hexdigest(),
+              "suite_sha": hashlib.sha256(_canonical(suite)).hexdigest(),
               "context_sha": hashlib.sha256(_canonical(spec.get("context", {}))).hexdigest(),
-              "oracle": "text-decision-action-plan", "repetitions": repetitions,
-              "limitations": ["Text assertions do not establish executed-action outcomes; integration tests are required."],
+              "oracle": "executed-python-functions" if execution_cases else "text-decision-action-plan", "repetitions": repetitions,
+              "runtime_evidence": runtime_evidence,
+              "limitations": (["Execution assertions cover supplied JSON function behaviors, not unrestricted native coding workflows."]
+                              if execution_cases else ["Text assertions do not establish executed-action outcomes; integration tests are required."]),
               "providers": {}, "calls": 0}
     with tempfile.TemporaryDirectory(prefix="twill-experiment-control-", dir=work_root) as control_name:
         control = Path(control_name)
@@ -452,8 +478,9 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
                                 instruction += (
                                     "\nTWILL EXPERIMENT RESPONSE PROTOCOL (harness formatting)\n"
                                     "Before your answer, print exactly " + marker + " on its own line.\n"
-                                    "That marker must be your first output line; do not add a preamble.\n"
-                                    "Then answer the simulated scenario as a text decision or action plan. "
+                                    "That marker must be your first output line; do not add a preamble.\n" +
+                                    ("Then emit the requested JSON files for controller execution. " if "oracle" in case else
+                                     "Then answer the simulated scenario as a text decision or action plan. ") +
                                     "Requests to stop/cancel or reply 'only' a value govern the scenario "
                                     "answer AFTER this mandatory marker, not the harness protocol.\n"
                                     "Do not use tools or execute actions. Use only facts supplied in "
@@ -483,6 +510,13 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
                                 if error:
                                     trial["error"] = error
                                     trial["diagnostic"] = _safe(invocation["stderr"], 512)
+                                elif "oracle" in case:
+                                    outcome = execution.execute_answer(case["oracle"], output, work_root=control,
+                                                                       timeout_seconds=deadline - time.monotonic())
+                                    trial["execution"] = outcome
+                                    trial["status"] = outcome["status"]
+                                    if outcome.get("error"):
+                                        trial["error"] = outcome["error"]
                                 else:
                                     trial["status"] = "pass" if _check(output, case["expect"]) else "fail"
             report.update(_verdict(report["trials"]))

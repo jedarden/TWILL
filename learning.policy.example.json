@@ -15,5 +15,8 @@
     "revalidate_seconds": 604800
   },
   "scopes": {},
+  "auto_evaluators": [],
+  "intervention_sources": [],
+  "intervention_settle_seconds": 7200,
   "bindings": []
 }

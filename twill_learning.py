@@ -19,6 +19,7 @@ from pathlib import Path
 from twill_lock import StateLock
 from twill_redactor import redact_text
 from twill_contract import CliError, emit_error, emit_success
+import twill_learning_health
 
 
 SCHEMA = "twill-learning/v1"
@@ -95,6 +96,9 @@ class Controller:
         if policy.get("schema") != POLICY_SCHEMA or policy.get("enabled") is not True:
             raise LearningError("learning requires an enabled v1 policy")
         self.policy = policy
+        if policy.get("auto_evaluators"):
+            from twill_learning_intake import validate_policy
+            validate_policy(policy)
         self.root = safe_path(policy["artifacts_root"])
         # Reuse the engine's public/private boundary, also for explicit policies.
         from twill_lessons import lessons_dir
@@ -127,6 +131,8 @@ class Controller:
         self.timeout = bounded_int(self.limits.get("timeout_seconds", 90), 5, 180, "timeout")
         self.max_lessons = bounded_int(self.limits.get("max_lessons_per_cycle", 1), 1, 1, "max lessons")
         self.interval = bounded_int(self.limits.get("revalidate_seconds", 604800), 60, 2592000, "revalidation interval")
+        bounded_int(self.limits.get("stale_cycle_seconds", 10800), 60, 604800, "stale cycle interval")
+        bounded_int(self.limits.get("pending_attention_seconds", 86400), 60, 2592000, "pending attention interval")
         self.providers = policy.get("providers", {})
         if set(self.providers) != {"claude", "codex"}:
             raise LearningError("both Claude and Codex providers are required")
@@ -184,6 +190,14 @@ class Controller:
             raise LearningError("source evidence hash mismatch")
         scope = spec.get("scope", "unassigned")
         version = digest({"instruction": instruction, "source_sha": source_sha, "scope": scope})
+        if spec.get("evaluator"):
+            version = digest({"instruction": instruction, "source_sha": source_sha, "scope": scope,
+                              "evaluator": spec["evaluator"], "evidence_sha": digest(spec.get("source_evidence", {}))})
+            evidence = spec.get("source_evidence", {})
+            if (spec["evaluator"] == "workflow-completion/v1" and evidence.get("complete")
+                    and evidence.get("references")):
+                version = digest({"instruction": instruction, "scope": scope,
+                                  "evaluator": spec["evaluator"], "episode": evidence["references"][-1]})
         lesson_id = "LC-" + version[:16]
         if self.path(lesson_id).exists():
             return self.load(lesson_id)
@@ -193,6 +207,8 @@ class Controller:
                              "legacy_id": source.get("legacy_id"),
                              "detector": source.get("detector")},
                   "scope": scope, "created_at": stamp(), "experiments": [],
+                  "evaluator": spec.get("evaluator"),
+                  "source_evidence": spec.get("source_evidence", {}),
                   "application": None, "reason": "awaiting independent evaluation"}
         return self.save(record, "created")
 
@@ -201,13 +217,19 @@ class Controller:
                    if b.get("scope") == record["scope"] and
                    (b.get("lesson_id") == record["id"] or
                     (b.get("detector") and b["detector"] == record["source"].get("detector")))]
-        if len(matches) != 1:
+        if not matches and record.get("evaluator"):
+            from twill_learning_intake import catalog_suite, validate_catalog_admission
+            validate_catalog_admission(record["evaluator"], record["scope"], self.policy,
+                                       record["source"].get("detector"))
+            suite = catalog_suite(record["evaluator"], record.get("source_evidence", {}))
+        elif len(matches) != 1:
             raise LearningError("exactly one policy-bound independent suite is required")
-        binding = matches[0]
-        path = safe_path(binding["suite"])
-        suite = read_json(path)
-        if digest(path.read_bytes()) != binding.get("suite_sha256"):
-            raise LearningError("independent suite drifted; update policy explicitly")
+        else:
+            binding = matches[0]
+            path = safe_path(binding["suite"])
+            suite = read_json(path)
+            if digest(path.read_bytes()) != binding.get("suite_sha256"):
+                raise LearningError("independent suite drifted; update policy explicitly")
         cases = suite.get("cases", [])
         if not cases or not any(c.get("split") == "holdout" for c in cases):
             raise LearningError("evaluation needs holdout cases")
@@ -254,6 +276,13 @@ class Controller:
         if not record["experiments"]:
             raise LearningError("no passing experiment evidence")
         receipt = record["experiments"][-1]
+        suite = self.suite(record)
+        if receipt.get("suite_sha") != digest(suite):
+            raise LearningError("evaluation suite changed since experiment")
+        if any("oracle" in case for case in suite["cases"]):
+            import twill_execution_oracle
+            if receipt.get("execution_sha") != digest(Path(twill_execution_oracle.__file__).read_bytes()):
+                raise LearningError("execution grader changed since experiment")
         import twill_experiments
         adapter_file = getattr(twill_experiments, "__file__", None)
         adapter_sha = digest(Path(adapter_file).read_bytes()) if adapter_file else "test-adapter"
@@ -276,7 +305,7 @@ class Controller:
             if record["state"] != "active":
                 raise LearningError("validation requires an active applied lesson")
             self.verify_application(record)
-        if record["state"] in {"invalidated", "rejected", "conflict", "applying", "removing"}:
+        if record["state"] in {"invalidated", "rejected", "superseded", "conflict", "applying", "removing"}:
             raise LearningError("lesson is not eligible for an experiment")
         if record["state"] == "active" and not validation:
             raise LearningError("use validate for an applied lesson")
@@ -290,11 +319,20 @@ class Controller:
         import twill_experiments
         from twill_experiments import run_experiment
         adapter_file = getattr(twill_experiments, "__file__", None)
-        result = run_experiment({"id": lesson_id, "instruction": record["instruction"],
-                                 "context": frozen_context, "cases": suite["cases"],
-                                 "files": suite.get("files", {})}, work_root=self.work,
-                                providers=self.providers, timeout_seconds=self.timeout,
-                                repetitions=self.repetitions, max_calls=self.calls)
+        try:
+            result = run_experiment({"id": lesson_id, "instruction": record["instruction"],
+                                     "context": frozen_context, "cases": suite["cases"],
+                                     "files": suite.get("files", {})}, work_root=self.work,
+                                    providers=self.providers, timeout_seconds=self.timeout,
+                                    repetitions=self.repetitions, max_calls=self.calls)
+        except (RuntimeError, OSError) as exc:
+            record["assessment"] = {"verdict": "inconclusive", "at": stamp(),
+                                    "setup_error": redact_text(str(exc))[:500], "providers": {}}
+            record["reason"] = "experiment runtime unavailable; no behavioral result established"
+            if not validation:
+                record["state"] = "unvalidated"
+            self.save(record, "experiment_setup_error")
+            return self.suspend(lesson_id, record["reason"]) if validation else record
         result_id = digest(result)
         report_path = self.store / "experiments" / f"{result_id}.json"
         atomic(report_path, canonical(result))
@@ -305,12 +343,20 @@ class Controller:
                                       "adapter_sha": digest(Path(adapter_file).read_bytes()) if adapter_file else "test-adapter",
                                       "controller_sha": digest(Path(__file__).read_bytes()),
                                       "suite_sha": digest(suite), "validation": validation})
+        if any("oracle" in case for case in suite["cases"]):
+            import twill_execution_oracle
+            record["experiments"][-1]["execution_sha"] = digest(Path(twill_execution_oracle.__file__).read_bytes())
         # A runtime error is unknown; only a complete candidate failure can invalidate.
         reports = result.get("providers", {})
+        record["assessment"] = {"verdict": result.get("verdict"), "at": stamp(),
+                                "providers": {name: {k: r.get(k) for k in
+                                              ("verdict", "errors", "counts", "actual_model", "model_fingerprint")}
+                                              for name, r in reports.items()}}
         complete = set(reports) == {"claude", "codex"}
         errors = (not complete or result.get("candidate_sha") != record["instruction_sha"]
                   or self.context(record) != frozen_context or not self.source_current(record)
                   or any(r.get("errors", 0) for r in reports.values()))
+        record["assessment"]["unknown"] = bool(errors)
         passed = complete and all(r.get("candidate_passed") is True and
                                   r.get("holdout_passed") is True for r in reports.values())
         if validation:
@@ -328,6 +374,19 @@ class Controller:
             promote = not errors and passed and result.get("verdict") == "promote"
             record.update(state="validated" if promote else "unvalidated",
                           reason="both agents improved" if promote else "experiment did not establish improvement")
+            # Complete unfavorable or redundant evidence is a disposition,
+            # rather than an indefinitely retried unvalidated candidate.
+            known_counts = complete and all(isinstance(r.get("counts"), dict) for r in reports.values())
+            if not errors and not promote and known_counts:
+                baseline_correct = all(r["counts"].get("baseline", {}).get("fail", 0) == 0
+                                       and r["counts"].get("baseline", {}).get("pass", 0) > 0
+                                       for r in reports.values())
+                if baseline_correct and passed:
+                    record.update(state="rejected", reason="redundant: both agent baselines already pass the independent suite")
+                elif not passed:
+                    record.update(state="rejected", reason="candidate failed independent behavioral checks")
+                elif any(r.get("verdict") != "improved" for r in reports.values()):
+                    record.update(state="rejected", reason="no demonstrated shared improvement across both agents")
             if promote:
                 record["validated_policy_sha"] = digest(self.policy)
         return self.save(record, "validated" if validation else "experimented", result=result_id)
@@ -382,6 +441,7 @@ class Controller:
         """Remove stale exposure without treating missing evidence as harm."""
         record = self.load(lesson_id)
         record["removal_state"] = "unvalidated"
+        record["reevaluate_after_drift"] = True
         record["reason"] = reason
         record["state"] = "removing"
         self.save(record, "suspend_intent")
@@ -480,7 +540,7 @@ class Controller:
     def publish(self) -> dict:
         """Publish only this controller's durable private evidence files."""
         inventory = []
-        for namespace in ("records", "history", "experiments"):
+        for namespace in ("records", "history", "experiments", "sources"):
             for path in sorted((self.store / namespace).rglob("*.json")):
                 if path.is_symlink() or path.absolute() != path.resolve():
                     raise LearningError("private evidence path cannot be redirected")
@@ -512,19 +572,75 @@ class Controller:
             matches = [b for b in self.policy.get("bindings", [])
                        if b.get("detector") == lesson.detector]
             scope = matches[0]["scope"] if len(matches) == 1 else "unassigned"
+            resolution = None
+            if scope == "unassigned" and self.policy.get("auto_evaluators"):
+                from twill_learning_intake import resolve
+                resolution = resolve(lesson, self.policy)
+                scope = resolution.get("scope") or "unassigned"
             instruction = lesson.summary
             before = len(self.records())
-            self.create({"instruction": instruction, "scope": scope,
-                         "source": {"path": str(lesson.path), "legacy_id": lesson.id,
-                                    "detector": lesson.detector}})
+            record = self.create({"instruction": instruction, "scope": scope,
+                                  "evaluator": resolution.get("evaluator") if resolution else None,
+                                  "source_evidence": resolution.get("source_evidence", {}) if resolution else {},
+                                  "source": {"path": str(lesson.path), "legacy_id": lesson.id,
+                                             "detector": lesson.detector}})
+            if resolution and record["state"] in {"draft", "needs_evaluation"}:
+                disposition = resolution.get("disposition")
+                if disposition in {"rejected", "needs_evaluation"}:
+                    record.update(state=disposition, reason=resolution.get("reason", "intake assessment"))
+                    self.save(record, "intake_disposition", evaluator=record.get("evaluator"))
+            # Assigning a supported scope creates a new immutable version;
+            # keep the unassigned predecessor as an explicit supersession.
+            for old in self.records():
+                if (old["id"] != record["id"] and old["scope"] == "unassigned"
+                        and old["source"] == record["source"]
+                        and old["state"] in {"draft", "needs_evaluation", "unvalidated"}
+                        and scope != "unassigned"):
+                    old.update(state="superseded", successor=record["id"], reason="automatically routed to an admitted evaluator and scope")
+                    self.save(old, "superseded", successor=record["id"])
             count += len(self.records()) > before
         return count
 
+    def import_sources(self) -> int:
+        """Route verified role-bearing intervention extractions without a hand binding."""
+        if not self.policy.get("auto_evaluators"):
+            return 0
+        from twill_learning_intake import resolve, catalog_instruction, discover_sources
+        discover_sources(self.policy, self.root)
+        count = 0
+        for path in sorted((self.store / "sources").glob("*.json")):
+            if path.name.startswith("."):
+                continue
+            payload = read_json(path)
+            if payload.get("schema") != "twill-workflow-intervention/v1":
+                continue
+            detector = payload.get("detector")
+            result = resolve({"detector": detector, "source": {"path": str(path)}}, self.policy)
+            evaluator = result.get("evaluator")
+            if not evaluator:
+                continue
+            old_ids = {r["id"] for r in self.records()}
+            record = self.create({"instruction": catalog_instruction(evaluator),
+                                  "scope": result.get("scope") or "unassigned",
+                                  "evaluator": evaluator, "source_evidence": result.get("source_evidence", {}),
+                                  "source": {"path": str(path), "detector": detector}})
+            if record["id"] not in old_ids:
+                count += 1
+            if record["state"] in {"draft", "needs_evaluation"} and result.get("disposition"):
+                record.update(state=result["disposition"], reason=result["reason"])
+                self.save(record, "intake_disposition", evaluator=evaluator)
+        return count
+
     def cycle(self) -> dict:
-        imported = self.import_drafts()
+        started_at = stamp()
+        imported = self.import_sources() + self.import_drafts()
         results = []
         spent = 0
-        for record in self.records():
+        records = sorted(self.records(), key=lambda r: (
+            0 if r["state"] in {"active", "applying", "removing"} else 1,
+            r["experiments"][-1]["at"] if r["experiments"] else "", r["created_at"], r["id"]))
+        before_experiments = sum(len(r["experiments"]) for r in records)
+        for record in records:
             try:
                 lesson_id = record["id"]
                 if record["state"] in {"applying", "removing"}:
@@ -549,12 +665,14 @@ class Controller:
                     record = self.apply(lesson_id)
                 elif record["state"] in {"draft", "unvalidated", "needs_evaluation"} and spent < self.max_lessons:
                     # Do not repeatedly spend quota on unchanged inconclusive runs.
-                    if record["experiments"]:
+                    if record["experiments"] and not record.get("reevaluate_after_drift"):
                         age = (datetime.now(timezone.utc) - datetime.fromisoformat(record["experiments"][-1]["at"])).total_seconds()
                         if age < self.interval:
                             results.append({"id": lesson_id, "state": record["state"], "cooldown": True})
                             continue
                     self.suite(record)
+                    if record.pop("reevaluate_after_drift", False):
+                        self.save(record, "drift_retest")
                     record = self.experiment(lesson_id)
                     spent += 1
                     if record["state"] == "validated":
@@ -566,10 +684,32 @@ class Controller:
                     self.save(record, "evaluation_unavailable")
                 results.append({"id": record["id"], "state": record["state"],
                                 "attention": redact_text(str(exc))[:500]})
-        summary = {"schema": SCHEMA, "at": stamp(), "imported": imported,
-                   "experimented": spent, "results": results}
+        summary = {"schema": SCHEMA, "started_at": started_at, "at": stamp(), "imported": imported,
+                   "attempted": spent,
+                   "experimented": sum(len(r["experiments"]) for r in self.records()) - before_experiments,
+                   "results": results}
+        summary["health"] = self.health(summary)
+        if self.policy.get("require_fresh_sources"):
+            from twill_learning_impact import snapshot
+            summary["observed_impact"] = snapshot(
+                self.records(), state_dir=Path(self.policy.get("pipeline_state_dir", "~/.local/state/twill")).expanduser(),
+                scopes=self.scopes)
         atomic(self.store / "status.json", canonical(summary))
         return summary
+
+    def health(self, last_cycle: dict | None = None) -> dict:
+        if last_cycle is None:
+            path = self.store / "status.json"
+            last_cycle = read_json(path) if path.exists() else None
+        pipeline = None
+        if self.policy.get("require_fresh_sources"):
+            from twill_status import read_status
+            state = Path(self.policy.get("pipeline_state_dir", "~/.local/state/twill")).expanduser()
+            pipeline = read_status(state).get("data", {})
+        return twill_learning_health.report(
+            self.records(), last_cycle,
+            stale_seconds=self.limits.get("stale_cycle_seconds", 10800),
+            pending_seconds=self.limits.get("pending_attention_seconds", 86400), pipeline=pipeline)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -586,6 +726,7 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--reason", required=True)
     sub.add_parser("cycle")
     sub.add_parser("status")
+    sub.add_parser("doctor")
     # Accept --json in the familiar post-subcommand position too.
     for command in sub.choices.values():
         command.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
@@ -600,10 +741,11 @@ def main(argv: list[str] | None = None) -> int:
                 result = controller.experiment(args.id, validation=True)
             elif args.command == "invalidate":
                 result = controller.invalidate(args.id, args.reason)
-            elif args.command == "status":
+            elif args.command in {"status", "doctor"}:
                 result = {"schema": SCHEMA, "lessons": [
-                    {k: r[k] for k in ("id", "state", "scope", "reason", "revision")}
+                    {k: r.get(k) for k in ("id", "state", "scope", "reason", "revision", "evaluator", "assessment")}
                     for r in controller.records()]}
+                result["health"] = controller.health()
                 status_path = controller.store / "status.json"
                 if status_path.exists():
                     result["last_cycle"] = read_json(status_path)
@@ -611,7 +753,7 @@ def main(argv: list[str] | None = None) -> int:
                 result = controller.cycle()
             else:
                 result = getattr(controller, args.command)(args.id)
-            if args.command != "status":
+            if args.command not in {"status", "doctor"}:
                 publication = controller.publish()
                 if "id" not in result:
                     result["publication"] = publication
@@ -619,7 +761,9 @@ def main(argv: list[str] | None = None) -> int:
         if "id" in result:
             result = {k: result[k] for k in ("id", "state", "reason", "revision")}
         emit_success(result, json_mode=True)
-        return 4 if any(r.get("state") == "conflict" for r in result.get("results", [])) else 0
+        attention = result.get("health", {}).get("status") != "healthy" if "health" in result else False
+        return 4 if ((args.command in {"cycle", "doctor"} and attention)
+                     or any(r.get("state") == "conflict" for r in result.get("results", []))) else 0
     except CliError as exc:
         emit_error(exc.code, exc.message, exc.hint, json_mode=True)
         return exc.code

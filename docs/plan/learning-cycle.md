@@ -1,7 +1,7 @@
 # TWILL dual-agent learning lifecycle
 > Evidence-gated instruction maintenance for native Claude and Codex.
 **Type:** Improvement
-**Status:** Implementation plan; owning bead `twill-bff7b510`
+**Status:** Production completion; owning bead `twill-73f5b935` (extends `twill-bff7b510`)
 **Last updated:** 2026-11-11
 
 ## 1. Mission & North Star
@@ -13,10 +13,10 @@ removes harmful or obsolete instructions without changing unrelated rules. Legac
 
 - No NEEDLE kernel rewrite: extend the running TWILL pipeline; an unfinished rewrite delays the loop.
 - No WARP export/recall service or cluster deployment: neither is necessary for this local lifecycle.
-- No arbitrary tool execution by evaluated agents: first release measures text decisions/action plans.
+- Evaluated agents have no host execution authority. Trusted execution oracles may check generated files inside a pinned isolated container.
 - No global system prompt replacement, authority expansion, or edits to human-maintained rule text: lessons supplement existing instructions only inside policy-approved managed
   blocks.
-- Broader live coding benchmarks and new routing layers are held until this lifecycle is accepted.
+- Unrestricted native coding sessions and new authority layers remain outside the enrolled experiment envelope.
 ## What We're NOT Changing
 
 Legacy ingest/detect/explain/accept/apply/measure semantics, human acceptance of legacy lessons, archive independence, stdlib core, credential redaction, and external private
@@ -69,12 +69,24 @@ Existing `twill_app.py` records human acceptance/application; `twill_measure.py`
 `tests/openpath.py` enforces legacy write/network/import boundaries. Missing: native experiments, policy-controlled exposure/removal, versioned evidence and an independent
 scheduled lifecycle. New modules below are implementation work.
 
+### Production completion acceptance
+
+1. Automatically process the stranded real draft from source verification to a disposition; supersede its old unassigned version.
+2. Process a real role- and hash-linked human intervention through both native providers on baseline, candidate, holdout and counterexamples. Already-correct baselines justify rejection.
+3. Discover future supported interventions from explicitly enrolled settled transcripts. Preserve human answers; abstain across unsupported interactive formats.
+4. Run timer-triggered import, paired experiment, application, interval-based fresh validation and automatic source-withdrawal removal, then prove idempotence. Direct mutation commands cannot substitute for a stage.
+5. Execute generated code against hidden fixed assertions in a credential-free, network-disabled, read-only pinned container. Runtime absence is unknown, never candidate success.
+6. Expose stage counts, pending age, evaluator/runtime failures and stale input/schedule health. Entirely blocked queues must not report healthy merely because a process exited.
+7. Observe subsequent eligible source telemetry with explicit coverage and unknowns; terminal replies never prove task success or causal improvement.
+
 ## 6. Architecture
 ### 6.1 Component Overview
 
 `twill-learning`/`twill_learning.py`: policy parsing, CLI, private record store, lifecycle and intents. `twill_experiments.run_experiment`: native Claude/Codex subprocess adapters
 and deterministic scoring. Existing `twill_config`, `twill_redactor`, `twill_contract` supply path, redaction and output patterns. New systemd user service/timer invokes cycle;
 legacy ingest remains independently scheduled.
+
+`twill_learning_intake` owns trusted evaluator recipes and bounded source discovery; candidate text cannot author expected answers or policy. `twill_execution_oracle` owns hidden Python function assertions and the isolated runner. `twill_learning_health` owns stage health; `twill_learning_impact` reads existing source telemetry without changing it.
 ### 6.2 Data Flow
 
 Redacted source reference → immutable lesson → approved suite → isolated baseline/candidate trials for each provider → fixed scoring → promotion evidence → managed target blocks →
@@ -115,6 +127,8 @@ are authoritative for conflicts.
 - EC-04: provider failure or budget exhaustion → inconclusive, no promotion; expired evidence disables exposure until fresh evidence passes. Baseline and candidate use identical
   frozen configuration.
 - EC-05: no approved hidden suite → needs_evaluation, no autonomous promotion or auto-generated oracle.
+- EC-06: enrolled catalog recipes instantiate independent fixed oracles from verified metadata without per-lesson hand binding; candidate/model-authored oracles remain untrusted.
+- EC-07: redundant candidate or inadequate source → terminal rejection. Transport/sandbox setup failures → unknown with retry/attention, never rejection as evidence of harm.
 ### 8.2 Failure Modes & Recovery
 
 | Failure | Detection | Recovery | Data safety |
@@ -171,6 +185,10 @@ Cases/assertions and evidence stay private; synthetic safety fixtures public.
 Per-change check: `timeout 180s env PYTHONPATH=tests python3 -m unittest discover -s tests -p 'test_learning*.py'`. Budget three minutes; timeout fails rather than counts as pass.
 Full gate once per release/change set.
 
+Scheduled oracle: `python3 scripts/verify-scheduled-learning.py --scratch /private/scratch --claude-model PIN --codex-model PIN`. It records raw D-Bus timer/service timestamps and linkage, retains units while reading completion evidence, preserves private receipts and cleans up only owned units. Real no-model timer preflight precedes native calls; provider executables are absolute pins.
+
+Execution gate: `TWILL_DOCKER_TEST=1 PYTHONPATH=tests python3 -m unittest test_execution_oracle test_experiments`. Models see tasks/output filenames, never hidden expected values. A root supervisor evaluates generated code in separate uid65534 children without capabilities, network, credentials or project/root writes. Candidate exits cannot forge passed reports. Runtime uses `twill_execution_oracle.IMAGE` and never pulls implicitly.
+
 ## 11. Security & Threat Model
 
 Untrusted source/candidate injection: text-only adapters, no tools/network tools, fixed oracle and policy; test malicious authority-expansion text. Path substitution: reject
@@ -195,7 +213,7 @@ reconcile intent, then remove matching blocks before restoring prior installed v
 ## 14. API / Interface Design
 
 `--policy PATH [--json]` plus `create` (source-linked lesson/spec), import from a source-linked legacy lesson, `experiment ID`, `apply ID`, `validate ID`, `invalidate ID`, `cycle`,
-`status`. Create returns lesson ID; mutations return outcome and evidence/exposure references. JSON follows `twill_contract` envelope. Error contract: 0 completed (including
+`status`, `doctor`. Automatic catalog enrollment is policy `auto_evaluators`; discovery uses `intervention_sources` and a settlement window. Create returns lesson ID; mutations return outcome and evidence/exposure references. JSON follows `twill_contract` envelope. Error contract: 0 completed (including
 recorded failed/inconclusive trial), 1 runtime error, 2 usage, 3 lock, 4 policy/validation/conflict; machine outcome never inferred from exit.
 
 ## 15. Risk Register & Plan B
@@ -217,3 +235,5 @@ data migration, because this is a separate local CLI with additive private recor
 ## 17. Revision History
 
 2026-11-11: concrete opt-in improvement plan under `twill-bff7b510`; legacy default retained.
+
+2026-11-11: production closure under `twill-73f5b935`: verified automatic intake, trusted recipe instantiation, real dispositions, executed oracles, timer-driven withdrawal proof and stage-aware health/follow-up.

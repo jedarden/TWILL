@@ -335,6 +335,8 @@ def _check_subprocess(
         return
     if _is_allowed_experiment_child(executable, command, cwd):
         return
+    if _is_allowed_oracle_child(executable, command, cwd):
+        return
     if allow_test_harness and _called_from_test_harness():
         return
     raise SubprocessViolation(
@@ -383,6 +385,29 @@ def _is_allowed_experiment_child(executable: object, command: object, cwd: objec
     frame = sys._getframe(1)
     while frame is not None:
         if frame.f_globals.get("__name__") == "twill_experiments" and frame.f_code.co_name == "_run_process":
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _is_allowed_oracle_child(executable: object, command: object, cwd: object) -> bool:
+    """Only fixed no-network/read-only oracle containers and their own cleanup."""
+    if executable != "docker" or not isinstance(command, (list, tuple)) or cwd is None:
+        return False
+    tokens = tuple(command)
+    cleanup = (len(tokens) == 4 and tokens[:3] == ("docker", "rm", "--force")
+               and str(tokens[3]).startswith("twill-oracle-"))
+    execution = (tokens[:4] == ("docker", "run", "--rm", "--pull=never")
+                 and "--read-only" in tokens and "--network" in tokens
+                 and tokens[tokens.index("--network") + 1] == "none"
+                 and "no-new-privileges" in tokens and "--cap-drop" in tokens
+                 and tokens[tokens.index("--cap-drop") + 1] == "ALL"
+                 and tokens[-3:] == ("-I", "-S", "/trusted/runner.py"))
+    if not (cleanup or execution):
+        return False
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_globals.get("__name__") == "twill_execution_oracle" and frame.f_code.co_name == "_docker":
             return True
         frame = frame.f_back
     return False

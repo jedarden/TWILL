@@ -183,12 +183,12 @@ class LearningCycleTests(unittest.TestCase):
         with self.assertRaises(LearningError):
             self.controller.suite(record)
 
-    def test_active_surrounding_context_or_cli_drift_suspends_exposure(self):
+    def test_context_drift_requires_fresh_passing_experiment_before_reapplication(self):
         self.active()
         self.targets[0].write_text(self.targets[0].read_text() + "New surrounding rule.\n")
         result = self.controller.cycle()
-        self.assertEqual(result["results"][0]["state"], "unvalidated")
-        self.assertNotIn(self.record["instruction"], self.targets[0].read_text())
+        self.assertEqual(result["results"][0]["state"], "active")
+        self.assertEqual(len(self.controller.load(self.id)["experiments"]), 2)
         self.assertIn("New surrounding rule.", self.targets[0].read_text())
 
     def test_active_suite_drift_suspends_instead_of_leaving_stale_rules(self):

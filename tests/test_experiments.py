@@ -226,6 +226,69 @@ class ExperimentTests(unittest.TestCase):
         self.assertEqual(self.invocations, [])
         self.assertEqual(result["codex"]["fingerprint"], experiments._fingerprint("test-codex", "codex fixture-1"))
 
+    def execution_spec(self):
+        spec = copy.deepcopy(SPEC)
+        for case in spec["cases"]:
+            del case["expect"]
+            case["oracle"] = {"type": experiments.execution.TYPE, "image": experiments.execution.IMAGE,
+                              "output_files": ["solution.py"], "target_file": "solution.py",
+                              "function": "transform", "assertions": [
+                                  {"id": "hidden-assertion", "args": ["input"], "equals": "PRIVATE_EXPECTED_VALUE"}]}
+        return spec
+
+    def test_execution_schema_is_validated_before_first_model_call(self):
+        spec = self.execution_spec()
+        spec["cases"][1]["oracle"]["image"] = "python:latest"
+        with self.assertRaises(ValueError):
+            self.run_spec(spec)
+        self.assertEqual(self.invocations, [])
+
+    def test_execution_runtime_failure_prevents_all_native_calls(self):
+        with patch.object(experiments.execution, "preflight_oracles", side_effect=RuntimeError("runtime unavailable")):
+            with self.assertRaises(RuntimeError):
+                self.run_spec(self.execution_spec())
+        self.assertEqual(self.invocations, [])
+
+    def test_execution_prompts_hide_all_oracles_and_holdout_inputs(self):
+        spec = self.execution_spec()
+        spec["cases"][1]["prompt"] = "PRIVATE_HOLDOUT_REQUEST"
+        for case in spec["cases"]:
+            prompt = experiments._scenario_prompt(case, spec["files"])
+            self.assertNotIn("PRIVATE_EXPECTED_VALUE", prompt)
+            self.assertNotIn("hidden-assertion", prompt)
+            self.assertNotIn(experiments.execution.IMAGE, prompt)
+            self.assertNotIn('"split"', prompt)
+            self.assertIn("solution.py", prompt)
+        train = experiments._scenario_prompt(spec["cases"][0], spec["files"])
+        self.assertNotIn("PRIVATE_HOLDOUT_REQUEST", train)
+
+    def test_execution_outcomes_and_harness_are_bound_to_promotion(self):
+        spec = self.execution_spec()
+        def model(record, text):
+            marker = text.splitlines()[0]
+            return marker + "\n" + json.dumps({"files": {"solution.py": "candidate" if record["candidate"] else "baseline"}})
+        self.effect = model
+        def execute(oracle, output, **kwargs):
+            passed = json.loads(output)["files"]["solution.py"] == "candidate"
+            return {"status": "pass" if passed else "fail", "executed": True,
+                    "assertions": [{"id": "hidden-assertion", "passed": passed, "returncode": 0}], "returncode": 0 if passed else 1}
+        with patch.object(experiments.execution, "preflight_oracles", return_value={"runtime": "verified"}), \
+                patch.object(experiments.execution, "execute_answer", side_effect=execute) as execute_mock:
+            result = self.run_spec(spec)
+            self.assertEqual(result["verdict"], "promote")
+            self.assertEqual(execute_mock.call_count, 16)
+            self.assertEqual(result["oracle"], "executed-python-functions")
+            self.assertTrue(all(t["execution"]["executed"] for p in result["providers"].values() for t in p["trials"]))
+            with patch.object(experiments.execution, "suite_binding", return_value={"runner_sha256": "changed"}):
+                changed = self.run_spec(spec)
+            self.assertNotEqual(result["suite_sha"], changed["suite_sha"])
+        with patch.object(experiments.execution, "preflight_oracles", return_value={}), \
+                patch.object(experiments.execution, "execute_answer", return_value={"status": "error", "executed": False,
+                                                                                  "error": "sandbox_setup_failure"}):
+            result = self.run_spec(spec)
+        self.assertEqual(result["verdict"], "hold")
+        self.assertTrue(all(p["verdict"] == "inconclusive" for p in result["providers"].values()))
+
     def test_unexpected_codex_tool_event_is_an_error(self):
         text, _, error = experiments._response("codex", json.dumps({"type": "item.completed", "item": {"type": "file_change"}}))
         self.assertEqual(error, "unexpected_tool_call")
