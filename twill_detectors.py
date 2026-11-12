@@ -1214,7 +1214,7 @@ REDISCOVERY_WEEKLY_HIT_SQL = """
 
 REDISCOVERY = Detector(
     "D-07",
-    1,
+    2,
     "facts rediscovered through repeated unchanged file reads or exploratory commands",
     REDISCOVERY_SQL,
     session_hits_sql=REDISCOVERY_HIT_SQL,
@@ -1251,17 +1251,14 @@ STALE_RULE_SQL = """
     named_programs AS (
         SELECT a.program, d.path
         FROM absent_programs AS a
-        JOIN rule_doc AS d
-          ON d.stale = 0
-         AND d.path IS NOT NULL
-         AND trim(d.path) <> ''
-        WHERE a.program GLOB '*[0-9a-zA-Z]*'
-          AND EXISTS (
-              SELECT 1
-              FROM rule_fts AS f
-              WHERE f.path = d.path
-                AND f.text MATCH '"' || replace(a.program, '"', '""') || '"'
-          )
+        JOIN rule_fts AS f
+          ON f.text MATCH '"' || replace(a.program, '"', '""') || '"'
+        JOIN rule_doc AS d ON d.path = f.path
+        WHERE d.stale = 0
+          AND d.path IS NOT NULL
+          AND trim(d.path) <> ''
+          AND a.program GLOB '*[0-9a-zA-Z]*'
+        GROUP BY a.program, d.path
     ),
     silent_hosts AS (
         SELECT DISTINCT trim(host) AS host
@@ -1279,17 +1276,14 @@ STALE_RULE_SQL = """
     named_hosts AS (
         SELECT s.host, d.path, d.indexed_at
         FROM silent_hosts AS s
-        JOIN rule_doc AS d
-          ON d.stale = 0
-         AND d.path IS NOT NULL
-         AND trim(d.path) <> ''
-        WHERE s.host GLOB '*[0-9a-zA-Z]*'
-          AND EXISTS (
-              SELECT 1
-              FROM rule_fts AS f
-              WHERE f.path = d.path
-                AND f.text MATCH '"' || replace(s.host, '"', '""') || '"'
-          )
+        JOIN rule_fts AS f
+          ON f.text MATCH '"' || replace(s.host, '"', '""') || '"'
+        JOIN rule_doc AS d ON d.path = f.path
+        WHERE d.stale = 0
+          AND d.path IS NOT NULL
+          AND trim(d.path) <> ''
+          AND s.host GLOB '*[0-9a-zA-Z]*'
+        GROUP BY s.host, d.path, d.indexed_at
     ),
     binary_findings AS (
         SELECT 'stale-rule:binary:' || n.program || ':' || n.path AS key,
@@ -1342,17 +1336,14 @@ STALE_RULE_HIT_SQL = """
     named_programs AS (
         SELECT a.program, d.path
         FROM absent_programs AS a
-        JOIN rule_doc AS d
-          ON d.stale = 0
-         AND d.path IS NOT NULL
-         AND trim(d.path) <> ''
-        WHERE a.program GLOB '*[0-9a-zA-Z]*'
-          AND EXISTS (
-              SELECT 1
-              FROM rule_fts AS f
-              WHERE f.path = d.path
-                AND f.text MATCH '"' || replace(a.program, '"', '""') || '"'
-          )
+        JOIN rule_fts AS f
+          ON f.text MATCH '"' || replace(a.program, '"', '""') || '"'
+        JOIN rule_doc AS d ON d.path = f.path
+        WHERE d.stale = 0
+          AND d.path IS NOT NULL
+          AND trim(d.path) <> ''
+          AND a.program GLOB '*[0-9a-zA-Z]*'
+        GROUP BY a.program, d.path
     )
     SELECT substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240) AS key,
            c.session_id
@@ -1385,17 +1376,14 @@ STALE_RULE_WEEK_HIT_SQL = """
     named_programs AS (
         SELECT a.program, d.path
         FROM absent_programs AS a
-        JOIN rule_doc AS d
-          ON d.stale = 0
-         AND d.path IS NOT NULL
-         AND trim(d.path) <> ''
-        WHERE a.program GLOB '*[0-9a-zA-Z]*'
-          AND EXISTS (
-              SELECT 1
-              FROM rule_fts AS f
-              WHERE f.path = d.path
-                AND f.text MATCH '"' || replace(a.program, '"', '""') || '"'
-          )
+        JOIN rule_fts AS f
+          ON f.text MATCH '"' || replace(a.program, '"', '""') || '"'
+        JOIN rule_doc AS d ON d.path = f.path
+        WHERE d.stale = 0
+          AND d.path IS NOT NULL
+          AND trim(d.path) <> ''
+          AND a.program GLOB '*[0-9a-zA-Z]*'
+        GROUP BY a.program, d.path
     )
     SELECT substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240) AS key,
            strftime('%G-W%V', c.ts_utc) AS week
@@ -1429,17 +1417,14 @@ STALE_RULE_WEEKLY_HIT_SQL = """
     named_programs AS (
         SELECT a.program, d.path
         FROM absent_programs AS a
-        JOIN rule_doc AS d
-          ON d.stale = 0
-         AND d.path IS NOT NULL
-         AND trim(d.path) <> ''
-        WHERE a.program GLOB '*[0-9a-zA-Z]*'
-          AND EXISTS (
-              SELECT 1
-              FROM rule_fts AS f
-              WHERE f.path = d.path
-                AND f.text MATCH '"' || replace(a.program, '"', '""') || '"'
-          )
+        JOIN rule_fts AS f
+          ON f.text MATCH '"' || replace(a.program, '"', '""') || '"'
+        JOIN rule_doc AS d ON d.path = f.path
+        WHERE d.stale = 0
+          AND d.path IS NOT NULL
+          AND trim(d.path) <> ''
+          AND a.program GLOB '*[0-9a-zA-Z]*'
+        GROUP BY a.program, d.path
     )
     SELECT substr('stale-rule:binary:' || n.program || ':' || n.path, 1, 240) AS key,
            strftime('%G-W%V', c.ts_utc) AS week,
@@ -1454,7 +1439,7 @@ STALE_RULE_WEEKLY_HIT_SQL = """
 
 STALE_RULE = Detector(
     "D-08",
-    1,
+    2,
     "live rule documents naming a binary whose invocation keeps failing "
     "command-not-found, or a host no longer producing observations",
     STALE_RULE_SQL,
@@ -1494,9 +1479,13 @@ UNREAD_RULE_DOC_SQL = """
 
 UNREAD_RULE_DOC = Detector(
     "D-09",
-    1,
+    2,
     "live rule documents not read within the active trailing window",
     UNREAD_RULE_DOC_SQL,
+    # Findings describe unread documents and always carry zero activity.
+    # Their weekly series is empty; replaying 26 copies of the corpus just
+    # to discard every zero-count row produces the same empty result.
+    weekly_hits_sql="SELECT '' AS key, '' AS week, 0 AS sessions, 0 AS events WHERE 0",
 )
 
 
@@ -1813,7 +1802,15 @@ def _emitted_key(detector: Detector, raw: object) -> str:
         raise DetectorContractError(
             f"{detector.full_id} emitted a non-text or empty key: {raw!r}"
         )
-    key = redact_text(raw)[:MAX_KEY_LENGTH]
+    key = redact_text(raw)
+    if detector.detector_id == "D-07" and detector.version >= 2 and len(key) > MAX_KEY_LENGTH:
+        # Prefixing a bounded command/path can exceed the key limit. Keep
+        # distinct rediscovery evidence distinct across cluster, session and
+        # weekly queries, using only the already-redacted identity as input.
+        suffix = ":" + hashlib.sha256(key.encode("utf-8")).hexdigest()[:32]
+        key = key[:MAX_KEY_LENGTH - len(suffix)] + suffix
+    else:
+        key = key[:MAX_KEY_LENGTH]
     if not key.strip():
         raise DetectorContractError(
             f"{detector.full_id} emitted a key that redacts to nothing"

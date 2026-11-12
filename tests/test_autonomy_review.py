@@ -108,10 +108,12 @@ class AutonomyReviewCliTests(unittest.TestCase):
         self.assertIsNotNone(cluster_id)
         model_output = json.dumps({"lessons": [{"cluster_id": cluster_id.group(1),
             "summary": "Assistant stops authorized report work. Complete the pending report action."}]})
+        provider_output = json.dumps({"type": "result", "subtype": "success",
+                                      "is_error": False, "result": model_output})
         bin_dir = self.root / "bin"
         bin_dir.mkdir()
         fake = bin_dir / "claude"
-        fake.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(model_output) + "\n")
+        fake.write_text("#!/bin/sh\nprintf '%s\\n' " + shlex.quote(provider_output) + "\n")
         fake.chmod(0o700)
         self.extra_env["PATH"] = str(bin_dir) + os.pathsep + os.environ["PATH"]
         _, draft = self.cli("explain")

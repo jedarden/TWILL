@@ -71,9 +71,24 @@ DEFAULT_RULE_GLOBS = (
     "memory:~/.claude/projects/*/memory/MEMORY.md",
     "memory:~/.claude/projects/*/memory/*.md",
     "claude_md:~/CLAUDE.md",
+    "claude_md:~/.claude/CLAUDE.md",
+    "claude_md:~/*/CLAUDE.md",
+    "claude_md:~/*/*/CLAUDE.md",
+    "claude_md:~/*/*/*/CLAUDE.md",
+    "agents_md:~/AGENTS.md",
+    "agents_md:~/.codex/AGENTS.md",
+    "agents_md:~/.codex/AGENTS.override.md",
     "agents_md:~/*/AGENTS.md",
+    "agents_md:~/*/*/AGENTS.md",
+    "agents_md:~/*/*/*/AGENTS.md",
+    "agents_md:~/*/AGENTS.override.md",
+    "agents_md:~/*/*/AGENTS.override.md",
     "skill:~/.claude/skills/*/SKILL.md",
+    "skill:~/.codex/skills/*/SKILL.md",
+    "skill:~/.agents/skills/*/SKILL.md",
     "skill:~/*/.claude/skills/*/SKILL.md",
+    "skill:~/*/.codex/skills/*/SKILL.md",
+    "skill:~/*/.agents/skills/*/SKILL.md",
 )
 
 
@@ -319,6 +334,7 @@ def ingest_rule_reads(
     connection: sqlite3.Connection,
     *,
     manage_transaction: bool = True,
+    session_id: str | None = None,
 ) -> RuleReadReport:
     """Materialize file_read observations into hash-based read markers.
 
@@ -328,6 +344,9 @@ def ingest_rule_reads(
     live unindexed spelling is hashed from disk.  Every rule_doc row with
     that hash receives the newest timestamp, so duplicate live paths and
     stale rows preserve one shared read history.
+
+    Ingest supplies the changed ``session_id`` so one committed transcript
+    only replays its own reads. Other callers may replay the full corpus.
     """
 
     rows = connection.execute(
@@ -337,9 +356,14 @@ def ingest_rule_reads(
     latest_by_sha: dict[str, tuple[datetime, str]] = {}
     matched = 0
 
-    observations = connection.execute(
+    read_sql = (
         "SELECT path, cwd, launch_dir, ts_utc FROM observation "
         "WHERE kind = 'file_read' AND path IS NOT NULL"
+    )
+    if session_id is not None:
+        read_sql += " AND session_id = ?"
+    observations = connection.execute(
+        read_sql, () if session_id is None else (session_id,)
     ).fetchall()
     for path, cwd, launch_dir, timestamp in observations:
         sha: str | None = None

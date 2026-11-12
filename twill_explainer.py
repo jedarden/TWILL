@@ -660,7 +660,7 @@ def invoke_claude(prompt: str, *, model: str) -> str:
 
     try:
         completed = subprocess.run(
-            ["claude", "-p", "--model", model],
+            ["claude", "-p", "--model", model, "--output-format", "json"],
             input=prompt,
             env=child_env,
             text=True,
@@ -675,7 +675,25 @@ def invoke_claude(prompt: str, *, model: str) -> str:
         raise ClaudeInvocationError(
             f"claude -p failed with exit status {completed.returncode}"
         )
-    return completed.stdout
+    # The CLI transport is distinct from the lesson JSON. Only unwrap its
+    # documented successful result envelope; the inner output still passes
+    # the full lesson validator unchanged before any artifact is written.
+    try:
+        envelope = json.loads(
+            completed.stdout, object_pairs_hook=_strict_object,
+            parse_constant=_reject_json_constant,
+        )
+    except (ValueError, RecursionError):
+        raise ClaudeInvocationError("claude CLI returned an invalid JSON result envelope") from None
+    if (
+        not isinstance(envelope, dict)
+        or envelope.get("type") != "result"
+        or envelope.get("subtype") != "success"
+        or envelope.get("is_error") is not False
+        or not isinstance(envelope.get("result"), str)
+    ):
+        raise ClaudeInvocationError("claude CLI did not return a successful text result")
+    return envelope["result"]
 
 
 def _build(

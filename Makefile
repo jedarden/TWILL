@@ -10,8 +10,9 @@ CONFIG_DIR ?= $(HOME)/.config/twill
 CONFIG_FILE := $(CONFIG_DIR)/config.toml
 SKELETON := config.toml.skeleton
 LINK := $(BIN_DIR)/twill
+LEARNING_LINK := $(BIN_DIR)/twill-learning
 SYSTEMD_USER_DIR ?= $(HOME)/.config/systemd/user
-SYSTEMD_UNITS := twill-ingest.service twill-ingest.timer twill-measure.service twill-measure.timer twill-digest.service twill-digest.timer
+SYSTEMD_UNITS := twill-ingest.service twill-ingest.timer twill-measure.service twill-measure.timer twill-digest.service twill-digest.timer twill-learning.service twill-learning.timer
 
 # Unit tests under the import, network, and open-path audit gates (plan §3,
 # §8.3, §10.2).  Putting
@@ -30,11 +31,18 @@ test:
 .PHONY: install
 install:
 	@mkdir -p "$(BIN_DIR)" "$(CONFIG_DIR)"
+	@if [ -e "$(LEARNING_LINK)" ] && [ ! -L "$(LEARNING_LINK)" ]; then \
+		echo "twill: error: $(LEARNING_LINK) is not a symlink" >&2; exit 1; \
+	fi
 	@if [ -e "$(LINK)" ] && [ ! -L "$(LINK)" ]; then \
 		echo "twill: error: $(LINK) exists and is not a symlink; move it aside first" >&2; \
 		exit 1; \
 	fi
 	@ln -sfn "$(CURDIR)/twill" "$(LINK)"
+	@ln -sfn "$(CURDIR)/twill-learning" "$(LEARNING_LINK)"
+	@if [ ! -e "$(CONFIG_DIR)/learning.json" ]; then \
+		install -m 600 learning.policy.example.json "$(CONFIG_DIR)/learning.json"; \
+	fi
 	@if [ -e "$(CONFIG_FILE)" ]; then \
 		echo "twill: keeping existing $(CONFIG_FILE)"; \
 	else \

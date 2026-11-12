@@ -137,6 +137,8 @@ INDEX_CONTRACT = {
     "obs_sig": ("observation", ("sig_hash", "ts_utc")),
     "obs_kind_ts": ("observation", ("kind", "ts_utc")),
     "obs_session": ("observation", ("session_id",)),
+    "obs_rule_read_path": ("observation", ("kind", "path", "ts_utc")),
+    "rule_doc_content_paths": ("rule_doc", ("sha", "path")),
 }
 
 
@@ -394,7 +396,7 @@ class MigrationRunnerTests(unittest.TestCase):
     """Plan §8.4: additive-only, version-stamped, downgrade-tolerant migrations.
 
     The shipped registry carries the additive tables later phases add on top
-of the v1 baseline (currently version 12); the apply path beyond it is
+of the v1 baseline (currently version 14); the apply path beyond it is
     exercised by registering the kind of migrations those phases will add.
     """
 

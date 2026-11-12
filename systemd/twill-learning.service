@@ -1,0 +1,15 @@
+[Unit]
+Description=Experiment, validate and reconcile policy-scoped TWILL lessons
+ConditionPathExists=%h/.config/twill/learning.json
+
+[Service]
+Type=oneshot
+ExecStart=/usr/bin/env %h/.local/bin/twill-learning cycle
+MemoryMax=2G
+CPUQuota=100%
+TimeoutStartSec=35min
+TimeoutStopSec=15s
+KillMode=control-group
+UMask=0077
+StandardOutput=journal
+StandardError=journal

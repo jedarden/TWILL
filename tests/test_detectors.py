@@ -1867,7 +1867,8 @@ class HookDenialDetectorTests(unittest.TestCase):
             window_days=30,
             window_end_utc=window_end,
         )
-        self.assertEqual(list(weekly.values()), [(2, 2)])
+        self.assertEqual(sum(sessions for sessions, _ in weekly.values()), 2)
+        self.assertEqual(sum(events for _, events in weekly.values()), 2)
 
     def test_d04_is_registered_in_catalog_order(self):
         ids = [detector.detector_id for detector in twill_detectors.REGISTRY]
@@ -2202,6 +2203,24 @@ class RediscoveryDetectorTests(unittest.TestCase):
         self.connection = twill_schema.connect(self.state_dir)
         self.addCleanup(self.connection.close)
 
+    def test_d07_long_commands_keep_distinct_bounded_cluster_and_weekly_keys(self):
+        for suffix in ("a", "b"):
+            for session_id in ("first", "second"):
+                seed_observation(self.connection, session_id=session_id, kind="run",
+                                 command="q" * 239 + suffix, days_ago=1)
+        report = twill_detectors.run_detectors(
+            self.connection, registry=(twill_detectors.REDISCOVERY,))
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        rows = cluster_rows(self.connection, "D-07")
+        self.assertEqual(len(rows), 2)
+        keys = {row[1] for row in rows}
+        self.assertEqual({len(key) for key in keys}, {240})
+        self.assertEqual({row[3:5] for row in rows}, {(2, 2)})
+        self.assertEqual({row[0] for row in self.connection.execute(
+            "SELECT DISTINCT key FROM cluster_session WHERE detector_id='D-07'")}, keys)
+        self.assertEqual({row[0] for row in self.connection.execute(
+            "SELECT DISTINCT key FROM cluster_week WHERE detector_id='D-07'")}, keys)
+
     def test_d07_finds_repeated_files_and_commands_with_their_own_thresholds(self):
         for session_id, days_ago in (
             ("file-a", 8),
@@ -2278,7 +2297,7 @@ class RediscoveryDetectorTests(unittest.TestCase):
         self.assertEqual(report.exit_code, EXIT_SUCCESS)
         self.assertEqual(
             [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
-            [("D-07@1", "ok", 2)],
+            [("D-07@2", "ok", 2)],
         )
         rows = cluster_rows(self.connection, "D-07")
         self.assertEqual(
@@ -2424,7 +2443,7 @@ class UnreadRuleDocDetectorTests(unittest.TestCase):
         self.assertEqual(report.exit_code, EXIT_SUCCESS)
         self.assertEqual(
             [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
-            [("D-09@1", "ok", 2)],
+            [("D-09@2", "ok", 2)],
         )
         rows = cluster_rows(self.connection, "D-09")
         self.assertEqual(
@@ -2550,7 +2569,7 @@ class StaleRuleDetectorTests(unittest.TestCase):
         self.assertEqual(report.exit_code, EXIT_SUCCESS)
         self.assertEqual(
             [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
-            [("D-08@1", "ok", 1)],
+            [("D-08@2", "ok", 1)],
         )
         rows = cluster_rows(self.connection, "D-08")
         self.assertEqual(
@@ -2570,6 +2589,21 @@ class StaleRuleDetectorTests(unittest.TestCase):
             ).fetchall(),
             [("s1",), ("s2",)],
         )
+
+    def test_d08_duplicate_fts_rows_do_not_multiply_evidence(self):
+        for session_id in ("first", "second"):
+            seed_observation(self.connection, program="tool", session_id=session_id,
+                             days_ago=1, signature="tool: command not found")
+        self.seed_rule_doc("/rules/duplicate.md", "Use tool for the task")
+        self.connection.execute("INSERT INTO rule_fts(text, path) VALUES (?, ?)",
+                                ("Use tool for the task", "/rules/duplicate.md"))
+        self.connection.commit()
+        report = twill_detectors.run_detectors(
+            self.connection, registry=(twill_detectors.STALE_RULE,))
+        self.assertEqual(report.exit_code, EXIT_SUCCESS)
+        rows = cluster_rows(self.connection, "D-08")
+        self.assertEqual(len(rows), 1)
+        self.assertEqual(rows[0][3:5], (2, 2))
 
     def test_d08_requires_the_binary_threshold_and_a_naming_document(self):
         # `go` reaches the two-session command-not-found bar but no document
@@ -2663,7 +2697,7 @@ class StaleRuleDetectorTests(unittest.TestCase):
         self.assertEqual(report.exit_code, EXIT_SUCCESS)
         self.assertEqual(
             [(outcome.full_id, outcome.status, outcome.clusters) for outcome in report.outcomes],
-            [("D-08@1", "ok", 1)],
+            [("D-08@2", "ok", 1)],
         )
         rows = cluster_rows(self.connection, "D-08")
         self.assertEqual(
@@ -2866,7 +2900,7 @@ class DetectCliTests(unittest.TestCase):
                     set(item),
                     {"detector_id", "version", "full_id", "status", "clusters", "error", "reason"},
                 )
-                expected_version = 2 if item["detector_id"] in {"D-12", "D-13", "D-14", "D-15", "D-16"} else 1
+                expected_version = 2 if item["detector_id"] in {"D-07", "D-08", "D-09", "D-12", "D-13", "D-14", "D-15", "D-16"} else 1
                 self.assertEqual(item["version"], expected_version)
                 self.assertEqual(item["full_id"], f"{item['detector_id']}@{expected_version}")
                 self.assertEqual(item["clusters"], 0)
@@ -2908,8 +2942,8 @@ class DetectCliTests(unittest.TestCase):
             self.assertIn("D-04@1: skipped", human.stdout)
             self.assertIn("D-05@1: 0 cluster(s)", human.stdout)
             self.assertIn("D-06@1: 0 cluster(s)", human.stdout)
-            self.assertIn("D-07@1: 0 cluster(s)", human.stdout)
-            self.assertIn("D-09@1: 0 cluster(s)", human.stdout)
+            self.assertIn("D-07@2: 0 cluster(s)", human.stdout)
+            self.assertIn("D-09@2: 0 cluster(s)", human.stdout)
             self.assertIn("D-10@1:", human.stdout)
 
     def test_unknown_detector_flag_is_a_usage_error(self):

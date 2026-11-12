@@ -385,8 +385,25 @@ def _check_database_schema(
             required_tables.append("gate_gap")
         if expected >= 8:
             required_tables.append("hook_denial")
+        if expected >= 9:
+            required_tables.extend(("interaction", "interaction_summary"))
+        if expected >= 10:
+            required_tables.extend(("execution_episode", "episode_assertion"))
+        if expected >= 11:
+            required_tables.append("autonomy_assessment")
+        if expected >= 12:
+            required_tables.append("autonomy_adjudication")
         for table in required_tables:
             connection.execute(f"SELECT 1 FROM {table} LIMIT 1").fetchone()
+        if expected >= 13:
+            connection.execute(
+                "SELECT thread_id, contract_version, truncated_fields, history_confirmed "
+                "FROM interaction LIMIT 1"
+            ).fetchone()
+            connection.execute(
+                "SELECT omitted_first_ordinal, omitted_last_ordinal "
+                "FROM interaction_summary LIMIT 1"
+            ).fetchone()
     except Exception as exc:
         return _result(
             "db_schema",
@@ -1598,7 +1615,7 @@ def _selftest_fixture(now: datetime) -> sqlite3.Connection:
         for migration in twill_schema.MIGRATIONS:
             if migration.version >= 9:
                 for statement in migration.statements:
-                    connection.execute(statement)
+                    twill_schema._apply_statement(connection, statement)
         _seed_selftest_fixture(connection, now)
     except BaseException:
         connection.close()

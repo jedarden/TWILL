@@ -116,7 +116,7 @@ ARCHIVE_DIRNAME = "agent-transcript-archive"
 #: Top-level names only, mirroring the ``.gitignore`` block: an artifact
 #: writer names ``artifacts_root``, so a nested directory of the same name
 #: elsewhere in the tree is ordinary content, not a leak.
-ARTIFACT_DIRS = ("lessons", "digests", "measurements", "guards", "autonomy")
+ARTIFACT_DIRS = ("lessons", "digests", "measurements", "guards", "autonomy", "learning")
 
 #: Mode characters that intend mutation (§ of the ``open`` docs: any of
 #: w/a/x/+ writes or positions for writing; b/t/U are encoding flags).
@@ -333,6 +333,8 @@ def _check_subprocess(
         return
     if _is_allowed_artifact_git(executable, command, cwd):
         return
+    if _is_allowed_experiment_child(executable, command, cwd):
+        return
     if allow_test_harness and _called_from_test_harness():
         return
     raise SubprocessViolation(
@@ -357,6 +359,30 @@ def _is_allowed_artifact_git(executable: object, command: object, cwd: object) -
     frame = sys._getframe(1)
     while frame is not None:
         if frame.f_code.co_name == "_git" and frame.f_globals.get("__name__") == "twill_artifacts":
+            return True
+        frame = frame.f_back
+    return False
+
+
+def _is_allowed_experiment_child(executable: object, command: object, cwd: object) -> bool:
+    """Only the opt-in adapter's constrained native invocations, never a shell."""
+    if not isinstance(command, (list, tuple)) or cwd is None:
+        return False
+    tokens = tuple(_subprocess_text(token) for token in command)
+    if len(tokens) < 2 or Path(str(tokens[0])).name not in {"claude", "codex"}:
+        return False
+    name = Path(str(tokens[0])).name
+    version = tokens[1:] == ("--version",)
+    claude = (name == "claude" and tokens[1:4] == ("-p", "--tools", "")
+              and "--strict-mcp-config" in tokens and "--safe-mode" in tokens)
+    codex = (name == "codex" and tokens[1] == "exec" and "--ephemeral" in tokens
+             and "--ignore-user-config" in tokens and "read-only" in tokens
+             and "features.shell_tool=false" in tokens and "apps._default.enabled=false" in tokens)
+    if not (version or claude or codex):
+        return False
+    frame = sys._getframe(1)
+    while frame is not None:
+        if frame.f_globals.get("__name__") == "twill_experiments" and frame.f_code.co_name == "_run_process":
             return True
         frame = frame.f_back
     return False
@@ -527,6 +553,14 @@ def is_allowed_write(resolved: Path) -> bool:
             return True
     if _under(resolved, temp_root()):
         return True
+    # Native experiment fixtures use isolated /tmp ancestry, even when the
+    # host's configured tempfile root is beneath home and inherits guidance.
+    if resolved.parts[:2] == ("/", "tmp") and len(resolved.parts) > 2 and resolved.parts[2].startswith("twill-experiment-"):
+        frame = sys._getframe(1)
+        while frame is not None:
+            if frame.f_globals.get("__name__") == "twill_experiments":
+                return True
+            frame = frame.f_back
     return False
 
 

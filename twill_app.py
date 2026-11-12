@@ -1346,7 +1346,9 @@ class Store:
                     stored_launch_dir,
                     self.host,
                 )
-            twill_rulecorpus.ingest_rule_reads(conn, manage_transaction=False)
+            twill_rulecorpus.ingest_rule_reads(
+                conn, manage_transaction=False, session_id=stored_session_id
+            )
             if cursor_update is not None:
                 twill_cursor.upsert_cursor(
                     conn,

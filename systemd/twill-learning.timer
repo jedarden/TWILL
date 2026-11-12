@@ -1,0 +1,10 @@
+[Unit]
+Description=Hourly policy-scoped TWILL learning cycle
+
+[Timer]
+OnCalendar=*-*-* *:20:00
+Persistent=true
+Unit=twill-learning.service
+
+[Install]
+WantedBy=timers.target

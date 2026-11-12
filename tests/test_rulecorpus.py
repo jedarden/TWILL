@@ -104,6 +104,12 @@ class PatternGrammarTests(unittest.TestCase):
             layers, {"memory", "claude_md", "agents_md", "skill"},
         )
 
+    def test_defaults_include_both_agents_global_and_nested_guidance(self):
+        for entry in ("agents_md:~/.codex/AGENTS.md", "claude_md:~/.claude/CLAUDE.md",
+                      "agents_md:~/*/*/AGENTS.md", "claude_md:~/*/*/CLAUDE.md",
+                      "skill:~/.codex/skills/*/SKILL.md", "skill:~/.agents/skills/*/SKILL.md"):
+            self.assertIn(entry, DEFAULT_RULE_GLOBS)
+
 
 class DiscoveryTests(CorpusTestCase):
     def test_discovers_and_hashes_files(self):
@@ -299,6 +305,27 @@ class IndexTests(CorpusTestCase):
         ingest_rule_reads(self.connection)
         self.assertEqual(self.rule_row(first)[3], "2026-09-23T17:00:00+00:00")
         self.assertEqual(self.rule_row(second)[3], "2026-09-23T17:00:00+00:00")
+
+    def test_session_scoped_reads_skip_unrelated_sessions_and_keep_shared_hash_history(self):
+        first = self.write_doc("rules/first.md", MEMORY_TEXT)
+        copy = self.write_doc("rules/copy.md", MEMORY_TEXT)
+        unrelated = self.write_doc("rules/other.md", SKILL_TEXT)
+        index_corpus(self.connection, [f"memory:{self.root}/rules/*.md"], now=NOW)
+        self.connection.executemany(
+            "INSERT INTO observation(session_id, ts_utc, ts_local, kind, path) "
+            "VALUES (?, ?, ?, 'file_read', ?)",
+            [("changed", LATER, LATER, str(first)),
+             ("old", LATER, LATER, str(unrelated))],
+        )
+        self.connection.commit()
+        report = ingest_rule_reads(self.connection, session_id="changed")
+        self.assertEqual(report.matched, 1)
+        self.assertEqual(set(report.updated), {str(first.resolve()), str(copy.resolve())})
+        self.assertEqual(self.rule_row(first)[3], LATER)
+        self.assertEqual(self.rule_row(copy)[3], LATER)
+        self.assertIsNone(self.rule_row(unrelated)[3])
+        ingest_rule_reads(self.connection)
+        self.assertEqual(self.rule_row(unrelated)[3], LATER)
 
     def test_read_history_survives_move_stale_and_restored_path(self):
         old = self.write_doc("home/projects/p/memory/MEMORY.md", MEMORY_TEXT)
@@ -497,7 +524,7 @@ class IndexTests(CorpusTestCase):
         self.assertEqual(d09.exit_code, 0)
         self.assertEqual(
             [(outcome.full_id, outcome.status, outcome.clusters) for outcome in d09.outcomes],
-            [("D-09@1", "ok", 0)],
+            [("D-09@2", "ok", 0)],
         )
 
     def test_present_but_unglobbed_file_is_not_marked_stale(self):

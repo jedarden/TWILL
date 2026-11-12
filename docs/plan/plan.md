@@ -5,7 +5,7 @@
 
 **Type:** Greenfield
 **Status:** Draft
-**Last updated:** 2026-10-23
+**Last updated:** 2026-11-11
 
 ---
 
@@ -34,9 +34,15 @@ question, or declaring a blocker contradicted by recorded evidence. Phase 9 adds
 to the same detect, review and measure loop. The mechanism and synthetic fixtures are public;
 source conversations, evidence bundles, adjudications and generated learnings remain private.
 
-Two constraints shaped the design before any code: it must be **independent of transcript
+**Authorized extension (2026-11-11):** the opt-in dual-agent lifecycle is specified by
+[learning-cycle.md](learning-cycle.md), owned by `twill-bff7b510`. That improvement plan governs
+source-linked native experiments, exact-policy managed instruction blocks, scheduled revalidation
+and removal. Its narrow exceptions apply only to the separate `twill-learning` controller; all
+legacy `twill` commands retain the proposes-only, human-acceptance default.
+
+Two constraints shaped the legacy design before any code: it must be **independent of transcript
 ingestion** (a distiller failure must never touch capture, and learning must not be triggered by
-a transcript arriving), and it must **never write its own conclusions into agent context
+a transcript arriving), and the legacy pipeline must **never write its own conclusions into agent context
 unsupervised** — NEEDLE's Reflect strand did exactly that and reinforced `Read -> File read
 successfully` 10,930 times into every worker prompt.
 
@@ -48,9 +54,11 @@ successfully` 10,930 times into every worker prompt.
 - **No integration with that archive, and no reads of its derived index.** Operator decision,
   2026-09-19. Ingest and learning have different cadences and failure modes; a distiller bug or a
   slow LLM pass must never stall capture, and learning must not fire per ingest event.
-- **No automatic edits to CLAUDE.md, memory files, hooks, skills, or any other repository.** The
+- **No automatic edits by legacy `twill` to CLAUDE.md, memory files, hooks, skills, or any other repository.** The
   Reflect precedent is the rationale: an unsupervised writer degraded every prompt on the fleet for
-  weeks. TWILL proposes; a human accepts; the change lands through the normal path for that layer.
+  weeks. Legacy TWILL proposes; a human accepts; the change lands through the normal path for that layer.
+  The separately enabled controller may edit only policy-approved managed blocks as specified in
+  [learning-cycle.md §3 and §8](learning-cycle.md#3-hard-requirements-non-negotiable).
 - **No model-based summarization of whole sessions.** The Explain step sees only ranked, redacted
   clusters. Feeding raw transcripts to a model is both the expensive option and the one that turns
   third-party text pasted into a session into instructions.
@@ -59,8 +67,8 @@ successfully` 10,930 times into every worker prompt.
   belongs to **ICG** (`irreversible-command-gate`), which enforces it at the `PreToolUse` boundary.
   TWILL consumes that catalog and reports where an event got through anyway (a gate gap); a second
   copy of the list would drift from the one doing the enforcing.
-- **Delivery to agents is pull-only.** `twill brief <repo>` answers when asked. Nothing TWILL
-  produces is injected into a prompt, a rules file, or a system context by TWILL itself — that is
+- **Legacy delivery to agents is pull-only.** `twill brief <repo>` answers when asked. Nothing TWILL
+  produces is injected into a prompt, a rules file, or a system context by legacy `twill` itself — that is
   the Reflect failure mode, and it is what §2's no-auto-edit rule exists to prevent.
 - **No fleet-wide collection in v1.** codinghome only (`~/.claude/projects`, `~/.codex/sessions`).
   lab, bench, and agent-sandbox come in Phase 7 by host-local distillation reporting up through the
@@ -85,7 +93,8 @@ successfully` 10,930 times into every worker prompt.
   add any code, timer, hook, or configuration to, the transcript archive pipeline.
 - TWILL **MUST** be read-only with respect to everything outside its own repository, its state
   directory (`~/.local/state/twill`) and `artifacts_root`. Writes anywhere else are a bug, and are
-  tested for.
+  tested for. The opt-in controller has only the exact managed-target exceptions in
+  [learning-cycle.md](learning-cycle.md); the legacy write boundary is unchanged.
 - TWILL **MUST** write every distilled artifact under the configured `artifacts_root`, which
   **MUST** resolve outside this repository's working tree. There is no working default: an unset or
   in-tree `artifacts_root` is a startup error, not a fallback. This is the one setting that fails
@@ -104,7 +113,9 @@ successfully` 10,930 times into every worker prompt.
   WorkflowTemplate in `iad-ci`; `.github/workflows/*` is forbidden org-wide.
 - **Forbidden dependencies/patterns:** no reads of the archive's derived index or its materialized
   episodes; no network calls
-  except the local `claude` CLI invocation in the Explain step; no credential store access
+  except the local `claude` CLI invocation in the Explain step for legacy commands; the separate
+  opt-in controller may invoke constrained native Claude/Codex adapters under its own audit contract
+  ([learning-cycle.md §10](learning-cycle.md#10-testing-strategy--quality-gates)); no credential store access
   (TWILL needs none); no third-party Python packages in the core path beyond the standard library
   (see §6.4).
 
@@ -1170,6 +1181,12 @@ are implementation owners under the operator request, not unapproved discovery p
 | 9D | `twill-7c871049` | Expose private autonomy evidence review through the learning pipeline |
 | 9E | `twill-3c587c73` | Measure autonomy interventions with coverage and private adjudications |
 
+### Opt-in dual-agent lifecycle
+
+The separate improvement plan [learning-cycle.md](learning-cycle.md) owns all phases and acceptance
+for autonomous create/experiment/apply/validate/invalidate. It is not an implicit expansion of Phases
+5, 6 or 9. Its opt-in policy cannot accept legacy lessons or override human-maintained instructions.
+
 ## 10. Testing Strategy & Quality Gates
 
 ### 10.1 Test Levels
@@ -1194,12 +1211,14 @@ are implementation owners under the operator request, not unapproved discovery p
 - **Secret-fixture test is mandatory and non-skippable**; a skipped or xfail'd redaction test fails the build.
 - **Open-path test**: the whole test suite runs under an `open()`/`os.open` audit hook; any write
   outside this repository + the state dir + `artifacts_root`, or any read under the transcript
-  archive, fails the run.
+  archive, fails the run. Separate learning-controller tests permit only exact policy-approved
+  managed target writes and prove the legacy boundary still rejects those writes.
 - **Import audit**: the production tree may import only Python's standard library or modules in
   this repository; the runtime hook also rejects a third-party import made dynamically by a test
   or Python child.
 - **Network audit**: Python-level network events fail the run. The only sanctioned network-capable
-  process is the local `claude -p` Explain child.
+  process for legacy verbs is the local `claude -p` Explain child. The separate controller adds only
+  the constrained provider subprocess exceptions tested by [learning-cycle.md](learning-cycle.md).
 - **Artifact-containment gate** (three guards, because one is a promise and three are a mechanism):
   the engine repository `.gitignore`s the four artifact paths; the open-path harness fails on an
   artifact write *into* the repository tree; and `twill-ci` asserts the published tree contains no
@@ -1315,6 +1334,9 @@ Machine surface: every read verb accepts `--json` and emits a single JSON object
 redaction, or detector self-test). Errors never print a credential-shaped value, and `--json` errors
 are emitted as `{"error": {"code": N, "message": "...", "hint": "..."}}` so a caller never parses prose.
 
+The opt-in `twill-learning` command surface and error/outcome contract are specified separately in
+[learning-cycle.md §14](learning-cycle.md#14-api--interface-design); none changes the legacy verbs above.
+
 ## 15. Risk Register & Plan B
 
 | # | Risk | Likelihood | Impact | Mitigation |
@@ -1408,3 +1430,4 @@ triage-only summarization while routing stays manual.
 | 2026-09-24 | Locked the ordered seven-layer routing precedence, the conservative generic-error fallback, and the per-lesson `routing.reason` contract. | opencode (bead twill-dd6383a5) |
 | 2026-10-16 | Open Question 4 resolved: other hosts are covered by host-local TWILL reporting up through the §7.3 artifacts transport, never by pulling transcripts; §2's fleet-wide line and Phase 7's delivery reworded to match. | gate audit (bead twill-05a4374a) |
 | 2026-10-23 | Authorized Phase 9 autonomy analysis: bounded interaction/authority evidence, five conservative detector families, private adjudication and impact measurement; added Scenarios 5-7 and a dependency-ordered worker boundary. Public mechanism and synthetic fixtures; private inputs and generated learnings. | operator request; planning bead twill-0ff526bc |
+| 2026-11-11 | Delegate the explicitly enabled native dual-agent lesson lifecycle to learning-cycle.md; preserve legacy proposes-only commands, acceptance and audit boundaries. | operator request; twill-bff7b510 |

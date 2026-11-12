@@ -22,3 +22,5 @@ digests/
 measurements/
 guards/
 autonomy/
+# The opt-in lifecycle has its own private evidence namespace.
+learning/

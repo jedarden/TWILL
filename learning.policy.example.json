@@ -1,0 +1,19 @@
+{
+  "schema": "twill-learning-policy/v1",
+  "enabled": false,
+  "artifacts_root": "~/TWILL-lessons",
+  "work_root": "~/scratch/twill-learning",
+  "providers": {
+    "claude": {"model": "SET_EXPLICIT_MODEL"},
+    "codex": {"model": "SET_EXPLICIT_MODEL"}
+  },
+  "limits": {
+    "timeout_seconds": 90,
+    "repetitions": 2,
+    "max_calls_per_cycle": 36,
+    "max_lessons_per_cycle": 1,
+    "revalidate_seconds": 604800
+  },
+  "scopes": {},
+  "bindings": []
+}

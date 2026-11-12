@@ -1,5 +1,12 @@
 # TWILL
 
+An opt-in [complete learning controller](docs/notes/learning-operations.md)
+now supplements the legacy pipeline: paired Claude/Codex experiments,
+policy-scoped instruction application, fresh validation, drift suspension,
+and managed removal. Run `twill-learning --help`; `make install` lays down a
+disabled policy until operator enrollment. Legacy commands below retain
+their proposes-only behavior.
+
 **T**ranscripts **W**oven **I**nto **L**asting **L**essons.
 
 TWILL reads raw agent session transcripts and turns recurring friction into reviewed, routed,
@@ -27,7 +34,7 @@ here: a one-off error is noise, the same one across six hundred sessions is a le
 - **Not part of that pipeline.** TWILL has its own repo, its own schedule, its own cursor and its
   own state. Ingest never calls it, it never reads the archive's derived index, and it keeps working
   when the archive is stopped or deleted.
-- **Not an unsupervised writer.** It never edits CLAUDE.md, memory, hooks, skills, or another
+- **The legacy pipeline is proposes-only.** It never edits CLAUDE.md, memory, hooks, skills, or another
   repository. It proposes; a human accepts. (NEEDLE's Reflect strand is the cautionary precedent:
   left to write into prompts by itself, it reinforced `Read -> File read successfully` 10,930 times.)
 

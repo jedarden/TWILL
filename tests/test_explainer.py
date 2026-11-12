@@ -1364,7 +1364,8 @@ class ExplainerTestCase(unittest.TestCase):
         completed = subprocess.CompletedProcess(
             args=["claude", "-p", "--model", "claude-haiku-4-5"],
             returncode=0,
-            stdout='{"lesson":"ok"}',
+            stdout=json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                               "result": '{"lesson":"ok"}'}),
             stderr="",
         )
         parent_env = {
@@ -1387,7 +1388,7 @@ class ExplainerTestCase(unittest.TestCase):
             run.assert_called_once()
             self.assertEqual(
                 run.call_args.args[0],
-                ["claude", "-p", "--model", "claude-haiku-4-5"],
+                ["claude", "-p", "--model", "claude-haiku-4-5", "--output-format", "json"],
             )
             self.assertEqual(run.call_args.kwargs["input"], prompt)
             self.assertTrue(run.call_args.kwargs["text"])
@@ -1407,7 +1408,36 @@ class ExplainerTestCase(unittest.TestCase):
                 parent_env["CLAUDE_CODE_SESSION_ID"],
             )
 
-        self.assertEqual(output, completed.stdout)
+        self.assertEqual(output, '{"lesson":"ok"}')
+
+    def test_claude_transport_rejects_non_success_or_malformed_envelopes(self):
+        for envelope in (
+            'private provider prose',
+            '{"type":"result","type":"result","subtype":"success","is_error":false,"result":"private"}',
+            json.dumps({"type": "result", "subtype": "error_during_execution", "is_error": True,
+                        "result": "private provider detail"}),
+            json.dumps({"type": "result", "subtype": "success", "result": "private"}),
+            json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                        "result": {"lessons": []}}),
+            json.dumps({"lessons": []}),
+        ):
+            with self.subTest(envelope=envelope):
+                completed = subprocess.CompletedProcess(["claude"], 0, envelope, "")
+                with mock.patch.object(twill_explainer.subprocess, "run", return_value=completed):
+                    with self.assertRaises(twill_explainer.ClaudeInvocationError) as raised:
+                        twill_explainer.invoke_claude("prompt", model="test-model")
+                self.assertNotIn("private", str(raised.exception))
+
+    def test_claude_transport_does_not_repair_invalid_lesson_json(self):
+        text = '```json\n{"lessons": []}\n```'
+        envelope = json.dumps({"type": "result", "subtype": "success", "is_error": False,
+                               "result": text})
+        completed = subprocess.CompletedProcess(["claude"], 0, envelope, "")
+        with mock.patch.object(twill_explainer.subprocess, "run", return_value=completed):
+            output = twill_explainer.invoke_claude("prompt", model="test-model")
+        self.assertEqual(output, text)
+        with self.assertRaises(ValidationError):
+            twill_explainer.validate_explain_output(output, expected_cluster_ids=())
 
     def test_unavailable_claude_fails_closed_without_exposing_os_error(self):
         with mock.patch.object(

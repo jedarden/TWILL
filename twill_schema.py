@@ -528,6 +528,33 @@ MIGRATIONS: tuple[Migration, ...] = _validated(
                 "journal_sha TEXT NOT NULL)",
             ),
         ),
+        Migration(
+            13,
+            "interaction_historical_shape_convergence",
+            (
+                # Early deployed v9-v12 databases predate these additions
+                # to the interaction DDL. CREATE IF NOT EXISTS cannot extend
+                # them, and their existing version stamp skips migration 9.
+                # Keep all rows and append nullable/neutral fields; new ingest
+                # writes the full source-backed values explicitly.
+                "ALTER TABLE interaction ADD COLUMN thread_id TEXT",
+                "ALTER TABLE interaction ADD COLUMN contract_version "
+                "TEXT NOT NULL DEFAULT 'twill-interaction/v1'",
+                "ALTER TABLE interaction ADD COLUMN truncated_fields INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE interaction ADD COLUMN history_confirmed INTEGER NOT NULL DEFAULT 0",
+                "ALTER TABLE interaction_summary ADD COLUMN omitted_first_ordinal INTEGER",
+                "ALTER TABLE interaction_summary ADD COLUMN omitted_last_ordinal INTEGER",
+            ),
+        ),
+        Migration(
+            14,
+            "rule_read_lookup_indexes",
+            (
+                "CREATE INDEX IF NOT EXISTS obs_rule_read_path "
+                "ON observation(kind, path, ts_utc)",
+                "CREATE INDEX IF NOT EXISTS rule_doc_content_paths ON rule_doc(sha, path)",
+            ),
+        ),
     )
 )
 
@@ -605,6 +632,7 @@ def run_migrations(connection: sqlite3.Connection, db_path: Path) -> int:
     """
 
     current = _read_schema_version(connection, db_path)
+    previous = current
     newest = MIGRATIONS[-1].version if MIGRATIONS else BASELINE_VERSION
     if current > newest:
         return current
@@ -624,6 +652,11 @@ def run_migrations(connection: sqlite3.Connection, db_path: Path) -> int:
     except BaseException:
         connection.rollback()
         raise
+    if current > previous:
+        # New indexes need planner statistics before the first real query.
+        # Without them a correlated rule-read lookup can choose a full
+        # trailing-window scan per document despite the covering index.
+        connection.execute("PRAGMA optimize = 0x10002")
     return current
 
 
