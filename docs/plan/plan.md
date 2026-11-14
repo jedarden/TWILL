@@ -1512,6 +1512,9 @@ opaque output identities without candidate instructions, arm/provider labels or
 control answers. Both must classify every control correctly and agree on each
 trial; missing, malformed, uncertain or disagreeing assessments are errors that
 block admission. Concrete assertions remain additional gates where appropriate.
-Count both judge calls and bind the semantic harness in evidence freshness checks.
+Grade each case in a separate batch when trials are present; keep both judges
+blinded within each batch. Bind cited output-line identities to exact source text
+in the controller rather than asking judges to recreate quotations. Count every
+judge call and bind the semantic harness in evidence freshness checks.
 Exercise controls-only native calibration before spending the full trial budget.
 This establishes behavior on the supplied tasks, not general production benefit.

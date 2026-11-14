@@ -1,5 +1,6 @@
 """Blinded dual-judge calibration is a fail-closed experimental gate."""
 import copy
+import hashlib
 import json
 import tempfile
 import time
@@ -35,14 +36,16 @@ class SemanticOracleTests(unittest.TestCase):
         self.prompts.append((provider, prompt))
         items = json.loads(prompt.split("BLINDED ITEMS JSON:\n", 1)[1])
         rows = []
+        decoded = []
         for item in items:
-            output = item["output"]
+            output = "".join(line["text"] for line in item["output_lines"])
+            decoded.append(dict(item, output=output))
             verdict = "pass" if output in {self.good, self.paraphrase} else "fail"
             rows.append({"id": item["id"], "verdict": verdict, "rationale": "The response matches the rubric assessment.",
-                         "citations": [output] if output else []})
+                         "citations": [next(line["id"] for line in item["output_lines"] if line["text"].strip())] if output.strip() else []})
         value = {"schema": semantic.REPORT_SCHEMA, "judgments": rows}
         if self.change:
-            self.change(provider, value, items)
+            self.change(provider, value, decoded)
         return {"status": "ok", "provider": provider, "calls": 1, "context_verified": True,
                 "actual_model": config["model"], "model_fingerprint": metadata["fingerprint"], "output": json.dumps(value)}
 
@@ -60,7 +63,7 @@ class SemanticOracleTests(unittest.TestCase):
         self.assertEqual(set(result["judges"]), {"claude", "codex"})
         for _, prompt in self.prompts:
             items = json.loads(prompt.split("BLINDED ITEMS JSON:\n", 1)[1])
-            self.assertTrue(all(set(item) == {"id", "task", "rubric", "output"} for item in items))
+            self.assertTrue(all(set(item) == {"id", "task", "rubric", "output_lines"} for item in items))
             self.assertNotIn("positive_control", prompt)
             self.assertNotIn("candidate", prompt)
             self.assertNotIn("fixture-claude", prompt)
@@ -152,3 +155,69 @@ class SemanticOracleTests(unittest.TestCase):
         result = self.grade()
         self.assertFalse(result["calibrated"])
         self.assertEqual(result["trial_results"][0]["status"], "error")
+
+    def test_line_ids_resolve_to_immutable_verbatim_lines_and_hashes(self):
+        self.paraphrase = "  Opening evidence.\r\nFinal explanation. \n"
+        self.entries[0]["trial"]["output"] = self.paraphrase
+        result = self.grade()
+        self.assertTrue(result["calibrated"])
+        binding = next(b for b in result["bindings"] if b["kind"] == "trial")
+        row = result["batches"][0]["resolved_judgments"]["claude"][binding["id"]]
+        line = "  Opening evidence.\r\n"
+        self.assertEqual(row["resolved_citations"], [{"line_id": "L1", "text": line,
+                                                      "sha256": hashlib.sha256(line.encode()).hexdigest()}])
+        self.assertEqual(row["output_sha"], hashlib.sha256(self.paraphrase.encode()).hexdigest())
+        self.assertEqual(json.loads(result["judges"]["claude"]["output"])["judgments"][0]["citations"], ["L1"])
+
+    def test_unknown_whitespace_duplicate_and_copied_quote_citations_are_not_normalized(self):
+        for citations in (["L999"], [" L1 "], ["L1", "L1"], [self.good]):
+            self.change = lambda provider, value, items: value["judgments"][0].update(citations=citations)
+            with self.subTest(citations=citations):
+                result = self.grade()
+                self.assertFalse(result["calibrated"])
+                self.assertEqual(result["trial_results"][0]["status"], "error")
+        self.paraphrase = "\nActual evidence."
+        self.entries[0]["trial"]["output"] = self.paraphrase
+        self.change = lambda provider, value, items: [row.update(citations=["L1"]) for row, item in zip(value["judgments"], items) if item["output"] == self.paraphrase]
+        self.assertFalse(self.grade()["calibrated"])
+
+    def test_short_rationale_bound_is_strict(self):
+        self.change = lambda provider, value, items: value["judgments"][0].update(rationale="x" * 241)
+        self.assertFalse(self.grade()["calibrated"])
+
+    def three_case_grade(self, *, max_calls=6):
+        cases = [copy.deepcopy(self.case) for _ in range(3)]
+        for index, case in enumerate(cases):
+            case.update(id=f"case{index}", prompt=f"Task for case {index}.")
+        entries = [copy.deepcopy(self.entries[0]) for _ in cases]
+        for entry, case in zip(entries, reversed(cases)):
+            entry["trial"]["case_id"] = case["id"]
+        return semantic.grade(cases, entries, providers=self.providers, metadata=self.metadata, work_root=self.root,
+                              timeout_seconds=30, deadline=time.monotonic() + 60, max_calls=max_calls, run_analysis=self.judge)
+
+    def test_full_trials_are_blinded_per_case_with_global_bindings(self):
+        result = self.three_case_grade()
+        self.assertTrue(result["calibrated"])
+        self.assertEqual(result["calls"], 6)
+        self.assertEqual(len(result["batches"]), 3)
+        self.assertEqual({row["index"] for row in result["trial_results"]}, {0, 1, 2})
+        self.assertTrue(all(row["status"] == "pass" for row in result["trial_results"]))
+        for _, prompt in self.prompts:
+            items = json.loads(prompt.split("BLINDED ITEMS JSON:\n", 1)[1])
+            self.assertEqual(len({item["task"] for item in items}), 1)
+            self.assertEqual(len(items), 3)
+        self.prompts.clear()
+        self.assertEqual(self.three_case_grade(max_calls=5)["calls"], 0)
+        self.assertEqual(self.prompts, [])
+
+    def test_one_partial_or_failed_batch_prevents_overall_calibration(self):
+        def change(provider, value, items):
+            if provider == "codex" and items[0]["task"] == "Task for case 1.":
+                value["judgments"].pop()
+        self.change = change
+        result = self.three_case_grade()
+        self.assertFalse(result["calibrated"])
+        self.assertEqual(result["calls"], 6)
+        self.assertEqual([batch["calibrated"] for batch in result["batches"]], [True, False, True])
+        self.assertTrue(all(row["status"] == "error" for row in result["trial_results"]))
+        self.assertIn("validation_error", result["batches"][1]["judges"]["codex"])

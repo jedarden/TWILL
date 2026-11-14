@@ -380,3 +380,8 @@ disagreement remain inconclusive and block admission. Concrete assertions, when
 present, must pass too. Judge calls count toward the experiment budget, and
 semantic harness changes invalidate prior evidence. These checks establish only
 the tested behavior; track production impact separately.
+
+Full semantic trials use one case per judge batch. Judges cite supplied output
+line IDs, which the controller resolves to exact text and content hashes; invalid
+line IDs fail closed. This keeps batches bounded and preserves exact grounding
+without depending on a model reproducing punctuation or whitespace.

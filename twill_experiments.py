@@ -127,8 +127,8 @@ def _validate(spec: dict, providers: dict, repetitions: int, max_calls: int, tim
             raise ValueError("exact assertion must be a nonempty string")
     if splits != {"train", "holdout"}:
         raise ValueError("train and holdout cases are both required")
-    semantic_cases = any("semantic_oracle" in case for case in cases)
-    if 2 + len(cases) * repetitions * 4 + (2 if semantic_cases else 0) > max_calls:
+    semantic_cases = sum("semantic_oracle" in case for case in cases)
+    if 2 + len(cases) * repetitions * 4 + 2 * semantic_cases > max_calls:
         raise ValueError("experiment exceeds max_calls (including probes and semantic judges)")
     files = spec.get("files", {})
     if not isinstance(files, dict):
@@ -435,7 +435,7 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
     started = time.monotonic()
     runtime_evidence = execution.preflight_oracles(spec["cases"], work_root=work_root)
     execution_cases = any("oracle" in case for case in spec["cases"])
-    semantic_cases = any("semantic_oracle" in case for case in spec["cases"])
+    semantic_cases = sum("semantic_oracle" in case for case in spec["cases"])
     semantic_sha = hashlib.sha256(Path(semantic.__file__).read_bytes()).hexdigest() if semantic_cases else None
     suite = {"cases": spec["cases"], "files": spec.get("files", {})}
     if execution_cases:
@@ -573,10 +573,10 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
                     **({"error": "provider_metadata_failed"} if report.get("version_error") or report.get("metadata_error")
                        or report["actual_model"] != providers[name].get("model") else {})}
                     for name, report in result["providers"].items()}
-        judge_calls, judge_reports = 0, {}
+        judge_calls, judge_reports = 0, []
         def judge(prompt, **kwargs):
             nonlocal judge_calls
-            if judge_calls >= 2 or result["calls"] + judge_calls >= max_calls:
+            if judge_calls >= 2 * semantic_cases or result["calls"] + judge_calls >= max_calls:
                 raise ValueError("semantic native call budget exhausted")
             judge_calls += 1
             try:
@@ -584,7 +584,7 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
             except Exception as exc:
                 report = {"status": "error", "provider": kwargs["provider"], "calls": 1,
                           "error": _safe(str(exc), 500)}
-            judge_reports[kwargs["provider"]] = semantic._redacted(report)
+            judge_reports.append({"provider": kwargs["provider"], "report": semantic._redacted(report)})
             return report
         try:
             assessment = semantic.grade(spec["cases"], entries, work_root=work_root, providers=providers,
@@ -596,8 +596,11 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
             assessment = {"schema": semantic.SCHEMA, "calibrated": False, "error": _safe(str(exc), 500),
                           "trial_results": []}
         assessment["calls"] = judge_calls
-        for provider, report in judge_reports.items():
-            assessment.setdefault("judges", {}).setdefault(provider, report)
+        assessment["native_judge_reports"] = judge_reports
+        for provider in ("claude", "codex"):
+            reports = [entry["report"] for entry in judge_reports if entry["provider"] == provider]
+            if reports:
+                assessment.setdefault("judges", {}).setdefault(provider, reports[0] if len(reports) == 1 else reports)
         if (assessment.get("module_sha") != semantic_sha
                 or hashlib.sha256(Path(semantic.__file__).read_bytes()).hexdigest() != semantic_sha):
             assessment.update(calibrated=False, binding_error="semantic_grader_binding_changed")

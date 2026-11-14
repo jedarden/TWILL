@@ -98,24 +98,29 @@ class ExperimentTests(unittest.TestCase):
         self.assertNotIn('"arm"', prompt)
         self.assertNotIn('"provider"', prompt)
         self.assertNotIn('"expected"', prompt)
-        self.assertTrue(all(set(item) == {"id", "task", "rubric", "output"} for item in items))
+        self.assertTrue(all(set(item) == {"id", "task", "rubric", "output_lines"} for item in items))
         rows = []
         for item in items:
             expected = "STOP" if "STOP_GUARD" in item["task"] else "CONTINUE_AUTHORIZED_WORK"
-            rows.append({"id": item["id"], "verdict": "pass" if item["output"] == expected else "fail",
-                         "rationale": "Assessed the supplied synthetic decision.", "citations": [item["output"]] if item["output"] else []})
+            output = "\n".join(line["text"] for line in item["output_lines"])
+            rows.append({"id": item["id"], "verdict": "pass" if output == expected else "fail",
+                         "rationale": "Assessed the supplied synthetic decision.",
+                         "citations": [item["output_lines"][0]["id"]] if output else []})
         return {"status": "ok", "provider": provider, "calls": 1, "context_verified": True,
                 "actual_model": config["model"], "model_fingerprint": metadata["fingerprint"],
                 "output": json.dumps({"schema": semantic.REPORT_SCHEMA, "judgments": rows})}
 
-    def test_semantic_only_trials_share_two_blinded_judges_and_keep_admission_gates(self):
+    def test_semantic_only_trials_use_two_blinded_judges_per_case_and_keep_admission_gates(self):
         spec = self.semantic_spec()
         with patch.object(experiments, "run_analysis", side_effect=self.semantic_judge) as judge:
-            result = self.run_spec(spec, max_calls=28)
-        self.assertEqual(result["calls"], 28)
-        self.assertEqual(judge.call_count, 2)
+            result = self.run_spec(spec, max_calls=32)
+        self.assertEqual(result["calls"], 32)
+        self.assertEqual(judge.call_count, 6)
         self.assertTrue(result["semantic_evidence"]["calibrated"])
-        self.assertEqual(len(result["semantic_evidence"]["bindings"]), 30)
+        batches = result["semantic_evidence"]["batches"]
+        self.assertEqual({batch["case_id"] for batch in batches}, {"training", "unseen", "guard"})
+        self.assertEqual(sum(len(batch["bindings"]) for batch in batches), 30)
+        self.assertEqual(len(result["semantic_evidence"]["native_judge_reports"]), 6)
         self.assertEqual(result["verdict"], "promote")
         for report in result["providers"].values():
             self.assertEqual(report["counts"]["candidate"], {"pass": 6, "fail": 0, "error": 0})
@@ -130,7 +135,7 @@ class ExperimentTests(unittest.TestCase):
         spec = self.semantic_spec()
         spec["cases"][0]["expect"] = {"contains": ["CONCRETE_FACT_REQUIRED"]}
         with patch.object(experiments, "run_analysis", side_effect=self.semantic_judge):
-            result = self.run_spec(spec, max_calls=28)
+            result = self.run_spec(spec, max_calls=32)
         self.assertEqual(result["verdict"], "hold")
         trial = next(t for t in result["providers"]["claude"]["trials"] if t["case_id"] == "training" and t["arm"] == "candidate")
         self.assertEqual(trial["semantic"]["status"], "pass")
@@ -139,7 +144,7 @@ class ExperimentTests(unittest.TestCase):
     def test_semantic_setup_or_parse_errors_preserve_all_native_outputs(self):
         spec = self.semantic_spec()
         with patch.object(semantic, "grade", side_effect=RuntimeError("synthetic grading setup failure")):
-            result = self.run_spec(spec, max_calls=28)
+            result = self.run_spec(spec, max_calls=32)
         self.assertEqual(result["calls"], 26)
         self.assertEqual(result["verdict"], "hold")
         trials = [trial for report in result["providers"].values() for trial in report["trials"]]
@@ -147,26 +152,68 @@ class ExperimentTests(unittest.TestCase):
         self.assertTrue(all(trial["output"] and trial["status"] == "error" for trial in trials))
         self.assertIn("synthetic grading setup failure", result["semantic_evidence"]["error"])
 
-    def test_malformed_semantic_judge_retains_both_raw_reports_and_makes_errors(self):
+    def test_malformed_semantic_case_retains_all_raw_reports_and_makes_errors(self):
         spec = self.semantic_spec()
         def judge(prompt, **kwargs):
             report = self.semantic_judge(prompt, **kwargs)
-            if kwargs["provider"] == "codex":
+            if kwargs["provider"] == "codex" and "another reversible step" in prompt:
                 report["output"] = "malformed JSON"
             return report
         with patch.object(experiments, "run_analysis", side_effect=judge):
-            result = self.run_spec(spec, max_calls=28)
-        self.assertEqual(result["calls"], 28)
-        self.assertEqual(set(result["semantic_evidence"]["judges"]), {"claude", "codex"})
-        self.assertEqual(result["semantic_evidence"]["judges"]["codex"]["output"], "malformed JSON")
-        self.assertIn("validation_error", result["semantic_evidence"]["judges"]["codex"])
+            result = self.run_spec(spec, max_calls=32)
+        self.assertEqual(result["calls"], 32)
+        evidence = result["semantic_evidence"]
+        self.assertFalse(evidence["calibrated"])
+        self.assertEqual(len(evidence["batches"]), 3)
+        failed = next(batch for batch in evidence["batches"] if batch["case_id"] == "unseen")
+        self.assertFalse(failed["calibrated"])
+        native = evidence["native_judge_reports"]
+        self.assertEqual(len(native), 6)
+        self.assertEqual([entry["provider"] for entry in native], ["claude", "codex"] * 3)
+        self.assertEqual(sum(entry["report"]["output"] == "malformed JSON" for entry in native), 1)
         self.assertTrue(all(report["verdict"] == "inconclusive" for report in result["providers"].values()))
+
+    def test_semantic_partial_case_failure_preserves_earlier_and_current_raw_reports(self):
+        spec = self.semantic_spec()
+        def partial_grade(cases, entries, **kwargs):
+            for index, provider in enumerate(("claude", "codex", "claude")):
+                kwargs["run_analysis"](f"synthetic raw case report {index}", provider=provider,
+                    config=kwargs["providers"][provider], metadata=kwargs["metadata"][provider])
+            raise RuntimeError("synthetic failure partway through second case")
+        def raw_report(prompt, **kwargs):
+            return {"status": "ok", "provider": kwargs["provider"], "output": prompt}
+        with patch.object(semantic, "grade", side_effect=partial_grade), patch.object(experiments, "run_analysis", side_effect=raw_report):
+            result = self.run_spec(spec, max_calls=32)
+        self.assertEqual(result["calls"], 29)
+        evidence = result["semantic_evidence"]
+        self.assertIn("partway through second case", evidence["error"])
+        self.assertEqual([entry["report"]["output"] for entry in evidence["native_judge_reports"]],
+                         [f"synthetic raw case report {index}" for index in range(3)])
+        trials = [trial for report in result["providers"].values() for trial in report["trials"]]
+        self.assertEqual(len(trials), 24)
+        self.assertTrue(all(trial["output"] and trial["status"] == "error" for trial in trials))
+        self.assertEqual(result["verdict"], "hold")
+
+    def test_semantic_callback_cannot_exceed_two_judges_per_case_with_spare_budget(self):
+        spec = self.semantic_spec()
+        def extra_grade(cases, entries, **kwargs):
+            for index in range(7):
+                provider = "claude" if index % 2 == 0 else "codex"
+                kwargs["run_analysis"]("synthetic extra judge request", provider=provider,
+                    config=kwargs["providers"][provider], metadata=kwargs["metadata"][provider])
+        with patch.object(semantic, "grade", side_effect=extra_grade), patch.object(experiments, "run_analysis", return_value={"output": "synthetic raw report"}) as judge:
+            result = self.run_spec(spec, max_calls=40)
+        self.assertEqual(judge.call_count, 6)
+        self.assertEqual(result["calls"], 32)
+        self.assertEqual(len(result["semantic_evidence"]["native_judge_reports"]), 6)
+        self.assertIn("native call budget exhausted", result["semantic_evidence"]["error"])
+        self.assertEqual(result["verdict"], "hold")
 
     def test_semantic_oversize_never_truncates_or_accepts_native_answer(self):
         spec = self.semantic_spec()
         self.effect = lambda record, text: text.split("\n", 1)[0] + "\n" + "x" * 5000
         with patch.object(experiments, "run_analysis", side_effect=AssertionError("oversize batch must not call judges")):
-            result = self.run_spec(spec, max_calls=28)
+            result = self.run_spec(spec, max_calls=32)
         self.assertEqual(result["calls"], 26)
         self.assertEqual(result["verdict"], "hold")
         self.assertTrue(all(len(t["output"]) == 5000 and t["error"] == "semantic_output_limit"
@@ -175,10 +222,10 @@ class ExperimentTests(unittest.TestCase):
     def test_semantic_budget_and_execution_exclusivity_fail_before_native_calls(self):
         spec = self.semantic_spec()
         with self.assertRaises(ValueError):
-            self.run_spec(spec, max_calls=27)
+            self.run_spec(spec, max_calls=31)
         spec["cases"][0]["oracle"] = {}
         with self.assertRaises(ValueError):
-            self.run_spec(spec, max_calls=28)
+            self.run_spec(spec, max_calls=32)
         self.assertEqual(self.invocations, [])
 
     def test_both_providers_must_improve_and_every_repetition_counts(self):
