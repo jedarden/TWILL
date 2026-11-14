@@ -61,6 +61,9 @@ ALL_EVENT_KINDS = (
 )
 
 _INTERRUPT_SENTINEL = "[Request interrupted by user]"
+_GOAL_CONTEXT = re.compile(
+    r"\A\s*<codex_internal_context\s+source\s*=\s*(['\"])goal\1\s*>", re.I
+)
 
 # Codex has used both the Claude-compatible wording and shorter approval
 # wording in tool output.  These are intentionally bounded sentinels rather
@@ -753,6 +756,10 @@ class CodexRolloutLineParser:
             self._emit_prompt_interaction(
                 text, source_line, context, index=block_index
             )
+            if _GOAL_CONTEXT.match(text):
+                # A continuation injected by the harness cannot answer a
+                # pending correction or consume its next real human turn.
+                continue
             if stripped == _INTERRUPT_SENTINEL:
                 self._awaiting_correction = True
                 events.append(self._interrupt_event(source_line, context, len(events)))
@@ -791,6 +798,17 @@ class CodexRolloutLineParser:
 
         stripped = text.strip()
         sidechain = context["sidechain"] is True
+        if _GOAL_CONTEXT.match(text):
+            self._emit_interaction(
+                origin=ORIGIN_HARNESS,
+                actor=ACTOR_SYSTEM,
+                source_line=source_line,
+                context=context,
+                index=index,
+                text=text,
+                locator=f"response_item/user[{index}]",
+            )
+            return
         if stripped == _INTERRUPT_SENTINEL:
             self._emit_interaction(
                 origin=ORIGIN_HARNESS,

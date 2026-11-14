@@ -248,7 +248,6 @@ class Controller:
                 raise LearningError("interpreted lesson scope and kind must match verified source")
             kind = expected_kind
             source_evidence = self.interpreted_source_evidence(candidate)
-            self.check_human_sources(source_evidence)
             from twill_human_steering import classify
             evaluator = classify(instruction) if kind == "human_directed" else None
         elif isinstance(source_payload, dict) and source_payload.get("schema") == "twill-human-steering/v1":
@@ -330,7 +329,9 @@ class Controller:
     def interpreted_source_evidence(self, candidate: dict) -> dict:
         """Derive provenance from reverified native sources, never supplied flags."""
         from twill_intervention_mining import verify_episode
-        episode = verify_episode(Path(candidate["source_evidence"]["episode_path"]))
+        episode = verify_episode(Path(candidate["source_evidence"]["episode_path"]),
+                                 enrolled_sources=self.policy.get("intervention_sources", []))
+        self.check_human_sources({"raw_sources": episode["resolved_sources"]})
         evidence = dict(candidate["source_evidence"])
         sources = {ref["source_path"]: ref["file_sha256"] for ref in episode["turns"]}
         evidence.update(complete=True, raw_sources=[{"path": path, "sha256": sha} for path, sha in sorted(sources.items())],
@@ -340,8 +341,22 @@ class Controller:
 
     def interpreted_evidence(self, record: dict) -> dict:
         from twill_intervention_interpret import verified_candidate
-        owned_blocks = {entry["path"]: entry["addition"] for entry in (record.get("application") or {}).get("files", [])
-                        if self.block(record) in entry.get("addition", "")}
+        owned_blocks = {}
+        current = {owned["id"]: owned for owned in self.records()}
+        current[record["id"]] = record
+        for owned in current.values():
+            if not owned.get("application"):
+                continue
+            try:
+                self.verify_application(owned)
+            except LearningError:
+                # Missing or edited blocks cannot excuse any context drift.
+                continue
+            block = self.block(owned)
+            for entry in owned["application"]["files"]:
+                addition = entry.get("addition")
+                if addition in (block + "\n", "\n\n" + block + "\n"):
+                    owned_blocks.setdefault(entry["path"], []).append(addition)
         candidate = verified_candidate(Path(record["source"]["path"]), self.policy, owned_blocks=owned_blocks)
         if candidate is None:
             raise LearningError("interpreted source no longer verifies")
@@ -349,7 +364,6 @@ class Controller:
         from twill_human_steering import classify
         evaluator = classify(candidate["instruction"]) if kind == "human_directed" else None
         evidence = self.interpreted_source_evidence(candidate)
-        self.check_human_sources(evidence)
         if (record["instruction"] != candidate["instruction"].strip() or record["scope"] != candidate["scope"]
                 or record.get("kind") != kind or record.get("source_evidence") != evidence
                 or record.get("evaluator") != evaluator):
@@ -729,7 +743,7 @@ class Controller:
     def publish(self) -> dict:
         """Publish only this controller's durable private evidence files."""
         inventory = []
-        for namespace in ("records", "history", "experiments", "sources", "interventions", "interpretations", "intervention-reviews"):
+        for namespace in ("records", "history", "experiments", "sources", "interventions", "interpretations", "intervention-reviews", "evaluations"):
             for path in sorted((self.store / namespace).rglob("*.json")):
                 if path.is_symlink() or path.absolute() != path.resolve():
                     raise LearningError("private evidence path cannot be redirected")
@@ -849,10 +863,15 @@ class Controller:
                 self.save(record, "intake_disposition", evaluator=evaluator)
         return count
 
-    def import_interpretations(self) -> int:
-        from twill_intervention_interpret import verified_candidates
+    def import_interpretations(self, episode_ids: list[str] | None = None) -> int:
+        from twill_intervention_interpret import verified_candidate, verified_candidates
         count = 0
-        for candidate in verified_candidates(self.policy, self.root):
+        candidates = (verified_candidates(self.policy, self.root) if episode_ids is None else
+                      [verified_candidate(self.store / "interpretations" / (ident + ".json"), self.policy)
+                       for ident in episode_ids])
+        for candidate in candidates:
+            if candidate is None:
+                continue
             before = {r["id"] for r in self.records()}
             kind = "human_directed" if candidate["kind"] == "human_directed" else "inferred"
             record = self.create({"instruction": candidate["instruction"], "scope": candidate["scope"], "kind": kind,
@@ -866,11 +885,11 @@ class Controller:
                     self.save(record, "evaluation_unavailable")
         return count
 
-    def interpret(self, limit: int | None = None) -> dict:
+    def interpret(self, limit: int | None = None, episode_ids: list[str] | None = None) -> dict:
         """Run the explicitly enrolled contextual pass; no delivery side effects."""
         from twill_intervention_interpret import interpret
-        result = interpret(self.policy, self.root, self.work, self.providers, limit=limit)
-        result["imported"] = self.import_interpretations() if self.two_pass["enabled"] else 0
+        result = interpret(self.policy, self.root, self.work, self.providers, limit=limit, episode_ids=episode_ids)
+        result["imported"] = self.import_interpretations(episode_ids) if self.two_pass["enabled"] else 0
         atomic(self.store / "interpretation-status.json", canonical(result))
         # CLI summaries contain state/references, never private instruction prose.
         result["candidates"] = [{key: candidate[key] for key in ("interpretation_id", "episode_id", "scope", "kind", "assessment")}
@@ -1028,6 +1047,8 @@ def main(argv: list[str] | None = None) -> int:
     sub.add_parser("discover")
     interpret_command = sub.add_parser("interpret")
     interpret_command.add_argument("--limit", type=int)
+    interpret_command.add_argument("--episode", dest="episode_ids", action="append",
+                                   help="interpret only this canonical episode ID (repeatable, at most 32)")
     sub.add_parser("status")
     sub.add_parser("doctor")
     # Accept --json in the familiar post-subcommand position too.
@@ -1058,7 +1079,7 @@ def main(argv: list[str] | None = None) -> int:
             elif args.command == "discover":
                 result = controller.discover()
             elif args.command == "interpret":
-                result = controller.interpret(args.limit)
+                result = controller.interpret(args.limit, episode_ids=args.episode_ids)
             else:
                 result = getattr(controller, args.command)(args.id)
             if args.command not in {"status", "doctor"}:

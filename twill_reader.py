@@ -324,6 +324,7 @@ class ClaudeCodeLineParser:
         self._last_assistant: dict[bool, int | None] = {False: None, True: None}
         self._question_by_tool_use_id: dict[str, int] = {}
         self._record_ordinal: dict[str, int] = {}
+        self._seen_queued_command_ids: set[tuple[str | None, str, str]] = set()
 
     @property
     def usage(self) -> tuple[MessageUsage, ...]:
@@ -488,6 +489,8 @@ class ClaudeCodeLineParser:
             return self._parse_assistant(record, source_line, context)
         if record_type == "user":
             return self._parse_user(record, source_line, context)
+        if record_type == "attachment":
+            return self._parse_queued_command(record, source_line, context)
         return []
 
     def finish(self) -> list[NormalizedEvent]:
@@ -643,6 +646,54 @@ class ClaudeCodeLineParser:
         )
 
     # -- user records --------------------------------------------------------
+
+    def _parse_queued_command(
+        self,
+        record: dict[str, object],
+        source_line: int,
+        context: _RecordContext,
+    ) -> list[NormalizedEvent]:
+        """Recover an explicitly human message delivered during a running turn.
+
+        Queue enqueue/remove records and rendered system reminders are copies,
+        not additional requests. Both native identifiers remain source-linked;
+        either one identifies a replay of the same delivered command.
+        """
+        attachment = record.get("attachment")
+        if not isinstance(attachment, dict):
+            return []
+        origin = attachment.get("origin")
+        text = attachment.get("prompt")
+        source_id = _first_string(attachment.get("source_uuid"))
+        delivery_id = _first_string(attachment.get("delivery_id"))
+        if (attachment.get("type") != "queued_command"
+                or attachment.get("humanTurn") is not True
+                or not isinstance(origin, dict) or origin.get("kind") != "human"
+                or (attachment.get("commandMode") is not None
+                    and attachment.get("commandMode") != "prompt")
+                or record.get("isMeta") is True
+                or not isinstance(text, str) or not text.strip()
+                or not source_id or not delivery_id):
+            return []
+        identities = {(context.session_id, "source", source_id),
+                      (context.session_id, "delivery", delivery_id)}
+        duplicate = bool(identities & self._seen_queued_command_ids)
+        self._seen_queued_command_ids.update(identities)
+        if duplicate:
+            return []
+        event = self._classify_user_text(
+            text, source_line, index=0, context=context, is_meta=False
+        )
+        start = len(self._interactions)
+        self._emit_user_text_interaction(
+            text, source_line, context, index=0, is_meta=False
+        )
+        for index in range(start, len(self._interactions)):
+            self._interactions[index] = replace(
+                self._interactions[index], message_id=source_id,
+                locator=f"attachment/queued_command[{delivery_id}]",
+            )
+        return [event] if event is not None else []
 
     def _parse_user(
         self,

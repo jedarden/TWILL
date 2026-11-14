@@ -14,11 +14,19 @@ short entry cannot expose the suffix of a longer fenced name.
 | GitHub fine-grained token (`github_pat_`) | `<redacted:github-token>` |
 | AWS access key (`AKIA` or `ASIA` followed by 16 uppercase alphanumerics) | `<redacted:aws-access-key>` |
 | `Bearer` followed by a token-like value | `Bearer <redacted:bearer-token>` |
+| Compact JWT-shaped value with an encoded JSON header (`eyJ`), three base64url segments, and at least 40 token-shaped characters; padded segments are accepted | `<redacted:jwt>` |
 | OpenAI-style `sk-` token-shaped value | `<redacted:api-key>` |
 | Slack `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-`, or `xoxs-` token | `<redacted:slack-token>` |
+| Vault/OpenBao service token (`hvs.` with 90–120 base64url characters), batch token (`hvb.` with 138–300), or legacy service token (`s.` with 24 alphanumerics) | `<redacted:vault-token>` |
+| A 32-character hexadecimal `_forward_auth_csrf` cookie or quoted assignment | `<redacted:csrf-token>` |
 | A value assigned to `api_key`, `access_token`, `auth_token`, `client_secret`, `secret_key`, `access_key`, `private_key`, `refresh_token`, `password`, `secret`, or `token` (including quoted JSON keys and underscore/hyphen variants) | `<redacted:secret>` |
 | PEM private-key block | `<redacted:private-key>` |
 
 Patterns are deliberately applied to all transcript-derived strings that are
 bound to SQLite statements, including identifiers and paths. Excerpt fields
 are capped at 240 characters only after this replacement pass.
+
+JWT recognition includes standalone values, quoted strings, paths, escaped
+newlines and percent-encoded separators. Ordinary dotted names stay intact.
+Bearer and secret-assignment contexts retain their existing canonical markers;
+redacting an already redacted value leaves its marker unchanged.

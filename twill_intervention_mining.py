@@ -165,7 +165,7 @@ def _parse(path: Path, deadline: float):
             if parser is None:
                 if record.get("type") in {"session_meta", "turn_context", "response_item", "event_msg"}:
                     parser = CodexRolloutLineParser()
-                elif record.get("type") in {"user", "assistant", "summary", "system"}:
+                elif record.get("type") in {"user", "assistant", "summary", "system", "attachment"}:
                     parser = ClaudeCodeLineParser()
                 else:
                     continue
@@ -270,13 +270,23 @@ def _authority_updates(interactions, index, path, hashes, file_hash) -> list[dic
 
 def _episode(interactions, index, events, path, hashes, provider, file_hash, config) -> dict:
     human = interactions[index]
-    previous = [i for i in interactions[:index] if not i.sidechain and
+    behavior = [i for i in interactions[:index] if not i.sidechain and
                 i.origin in {"assistant_text", "tool_call", "tool_result", "question"}][-6:]
+    # Classification still depends only on preceding assistant/tool behavior:
+    # retained task history cannot turn a fresh request into a correction.
+    classification = _classification(human, behavior)
+    earlier_humans = [i for i in interactions[:index]
+                      if not i.sidechain and i.actor == "user" and i.origin in _HUMAN
+                      and i.session_id == human.session_id
+                      and not any(pattern.search(i.text.strip())
+                                  for pattern in (_WORKER, _HARNESS, _QUOTED, _UNCERTAIN))][-8:]
+    previous = behavior + earlier_humans
     # Keep actual question provenance even if tools between it and its answer fill the window.
     if human.question_ordinal is not None:
         question = next((i for i in interactions if i.ordinal == human.question_ordinal), None)
         if question is not None and question not in previous:
-            previous = [question] + previous[-5:]
+            previous.append(question)
+    previous = sorted({i.ordinal: i for i in previous}.values(), key=lambda i: i.ordinal)
     following = []
     for item in interactions[index + 1:]:
         if not item.sidechain and item.origin in _HUMAN:
@@ -285,7 +295,6 @@ def _episode(interactions, index, events, path, hashes, provider, file_hash, con
             following.append(item)
             if len(following) == 6:
                 break
-    classification = _classification(human, previous)
     native_identity = [provider, human.session_id or str(path), human.turn_id,
                        human.ordinal, human.event_index, human.locator, _digest(human.text)]
     ident = "IE-" + _digest(native_identity)[:24]
@@ -436,19 +445,39 @@ def discover(policy: dict, artifacts_root: Path) -> dict:
                         old_evidence = _digest({key: old.get(key) for key in
                             ("source_original", "source_copies", "context", "outcome", "source_provenance", "classification", "authority_updates")})
                         copies = old.get("source_copies", [old["source_original"]])
-                        if episode["source_original"] not in copies:
-                            copies.append(episode["source_original"])
+                        aliases = old.get("source_aliases", [])
+                        incoming = episode["source_original"]
+                        canonical = old["source_original"]
+                        same_generation = incoming["file_sha256"] == canonical["file_sha256"]
+                        known_hashes = {ref["file_sha256"] for ref in [canonical, *copies, *aliases]}
+                        older_alias = (not same_generation and incoming["source_path"] != canonical["source_path"]
+                                       and incoming["file_sha256"] in known_hashes)
+                        if incoming != canonical and incoming not in aliases:
+                            aliases.append(incoming)
+                        old["source_aliases"] = aliases
+                        if same_generation:
+                            # Byte-identical aliases are resolution metadata,
+                            # not a new historical source or interpretation.
+                            # Still refresh scanner-derived views, rebasing
+                            # them onto the existing canonical locator.
+                            episode["source_original"] = dict(incoming, source_path=canonical["source_path"])
+                            for ref in [*episode["context"]["previous"], episode["context"]["intervention"],
+                                        *episode["context"]["following"], *episode["authority_updates"]]:
+                                ref["source_path"] = canonical["source_path"]
+                        elif not older_alias and incoming not in copies:
+                            copies.append(incoming)
                         # Keep lifecycle state and interpretation decisions when copies/append snapshots arrive.
-                        old.update(source_copies=copies, source_original=episode["source_original"],
-                                   context=episode["context"], flags=episode["flags"], outcome=episode["outcome"],
-                                   classification=episode["classification"], scanner_version=SCANNER_VERSION,
-                                   authority_updates=episode["authority_updates"])
-                        if episode["classification"]["signal"] == "negative":
-                            old["state"] = "negative_sample"
-                        elif old.get("state") == "negative_sample":
-                            old["state"] = "pending_interpretation"
-                        if provenance:
-                            old["source_provenance"] = episode["source_provenance"]
+                        if not older_alias:
+                            old.update(source_copies=copies, source_original=episode["source_original"],
+                                       context=episode["context"], flags=episode["flags"], outcome=episode["outcome"],
+                                       classification=episode["classification"], scanner_version=SCANNER_VERSION,
+                                       authority_updates=episode["authority_updates"])
+                            if episode["classification"]["signal"] == "negative":
+                                old["state"] = "negative_sample"
+                            elif old.get("state") == "negative_sample":
+                                old["state"] = "pending_interpretation"
+                            if provenance and not same_generation:
+                                old["source_provenance"] = episode["source_provenance"]
                         new_evidence = _digest({key: old.get(key) for key in
                             ("source_original", "source_copies", "context", "outcome", "source_provenance", "classification", "authority_updates")})
                         if old_evidence != new_evidence and old.get("state") in {"interpreted", "needs_review", "pending_retry"}:
@@ -460,6 +489,15 @@ def discover(policy: dict, artifacts_root: Path) -> dict:
                         summary["updated"] += 1
                     else:
                         summary["discovered"] += 1
+                    if episode.get("privacy_hold"):
+                        # An operator quarantine survives new native snapshots
+                        # and scanner generations. Keep the native references,
+                        # but never repopulate prose or queue lesson inference.
+                        episode.update(privacy_hold=True, state="needs_review")
+                        context = episode["context"]
+                        for view in [*context["previous"], context["intervention"], *context["following"]]:
+                            view.update(text="", truncated=True)
+                        episode["flags"] = sorted(set(episode["flags"] + ["context_truncated"]))
                     _private_json(target, episode)
                     queue.add_output(target.name)
                     if episode["id"] not in ids:
@@ -490,7 +528,7 @@ def discover(policy: dict, artifacts_root: Path) -> dict:
     return summary
 
 
-def verify_episode(path: Path) -> dict:
+def verify_episode(path: Path, *, enrolled_sources: list[str] | None = None) -> dict:
     """Reparse native evidence and verify original roles, hashes, spans and text.
 
     Replayed graph links prove interactive answers came from their actual tool
@@ -503,6 +541,8 @@ def verify_episode(path: Path) -> dict:
         raise ValueError("intervention episode requires current miner rescan")
     context = episode["context"]
     views = [*context["previous"], context["intervention"], *context["following"]]
+    if episode.get("privacy_hold") and any(ref.get("text") != "" or ref.get("truncated") is not True for ref in views):
+        raise ValueError("privacy-held evidence must have reference-only context")
     parsed = {}
     if episode["source_original"] != {k: v for k, v in context["intervention"].items()
                                       if k not in {"text", "truncated", "call_ordinal", "question_ordinal"}}:
@@ -518,17 +558,27 @@ def verify_episode(path: Path) -> dict:
     allowed_paths = {r["source_path"] for r in [episode["source_original"], *episode.get("source_copies", [])]}
     if any(ref["source_path"] not in allowed_paths for ref in views):
         raise ValueError("intervention context has unrelated source")
-    # Local and archived copies are interchangeable only when a full observed
-    # snapshot hash and every retained native record match. Rebuild locators
-    # in the returned value; never rewrite the persisted evidence here.
+    from twill_learning import enrolled_source
+    if Path(original_path).exists() and (enrolled_sources is None or enrolled_source(original_path, enrolled_sources)):
+        # A live canonical source moving to a different generation is drift,
+        # not a missing file that an older archived copy may substitute for.
+        parsed[original_path] = _parse(Path(original_path), time.monotonic() + 120)
+        if not parsed[original_path][6] or parsed[original_path][4] != episode["source_original"]["file_sha256"]:
+            raise ValueError("canonical intervention native generation changed")
+    # Resolve live storage separately from canonical historical locators.
+    # The complete current generation, native records and authority snapshot
+    # must match before any copy may stand in for the original.
     selected = None
-    for copy in [episode["source_original"], *episode.get("source_copies", [])][:64]:
+    for copy in [episode["source_original"], *episode.get("source_copies", []), *episode.get("source_aliases", [])][:64]:
         # An older append snapshot can share every local context record while
         # omitting a later withdrawal. Only copies of the current full captured
         # generation may substitute for the original authority snapshot.
         if copy.get("file_sha256") != episode["source_original"]["file_sha256"]:
             continue
         value = copy["source_path"]
+        if enrolled_sources is not None:
+            if not enrolled_source(value, enrolled_sources):
+                continue
         try:
             if value not in parsed:
                 parsed[value] = _parse(Path(value), time.monotonic() + 120)
@@ -548,25 +598,15 @@ def verify_episode(path: Path) -> dict:
     if selected is None:
         raise ValueError("intervention native source hash mismatch")
     selected_path, selected_hash, by_ordinal = selected
-    episode["authority_updates"] = _authority_updates(parsed[selected_path][0], context["intervention"]["ordinal"],
-                                                       Path(selected_path), parsed[selected_path][2], selected_hash)
+    interactions, _, hashes, _, file_hash, _, complete, _ = parsed[selected_path]
     for ref in views:
-        ref.update(source_path=selected_path, file_sha256=selected_hash,
-                   source_line=by_ordinal[ref["ordinal"]].source_line)
-    episode["source_original"] = {k: v for k, v in context["intervention"].items()
-                                  if k not in {"text", "truncated", "call_ordinal", "question_ordinal"}}
-    for ref in views:
-        value = ref["source_path"]
-        if value not in parsed:
-            parsed[value] = _parse(Path(value), time.monotonic() + 120)
-        interactions, _, hashes, _, file_hash, _, complete, _ = parsed[value]
         if not complete or ref["file_sha256"] != file_hash or hashes.get(ref["source_line"]) != ref["sha256"]:
             raise ValueError("intervention native source hash mismatch")
         native = next((i for i in interactions if i.ordinal == ref["ordinal"]), None)
         if native is None or any(ref[key] != actual for key, actual in (
                 ("role", native.actor), ("origin", native.origin), ("locator", native.locator),
                 ("event_index", native.event_index), ("turn_id", native.turn_id),
-                ("message_id", native.message_id), ("spans", [[0, len(native.text)]]))):
+                ("message_id", native.message_id), ("source_line", native.source_line), ("spans", [[0, len(native.text)]]))):
             raise ValueError("intervention native role or span mismatch")
         safe = redact_text(native.text)
         if ref["text"] != safe[:len(ref["text"])] or (not ref["truncated"] and ref["text"] != safe):
@@ -594,6 +634,7 @@ def verify_episode(path: Path) -> dict:
     if original != episode["source_original"]:
         raise ValueError("intervention original locator mismatch")
     episode["verified"] = True
+    episode["resolved_sources"] = [{"path": selected_path, "sha256": selected_hash}]
     episode["turns"] = [dict(ref, index=index) for index, ref in enumerate(views)]
     episode["intervention_index"] = len(context["previous"])
     return episode
@@ -635,8 +676,8 @@ def pinned_sources(root: Path) -> set[str]:
         terminal_nonlesson = (episode.get("state") == "interpreted" and
                               episode.get("interpretation_disposition") in
                               {"task_only", "non_intervention", "already_covered", "code_fix"})
-        if episode.get("state") not in {"archived", "rejected", "negative_sample"} and not terminal_nonlesson:
-            for ref in [episode["source_original"], *episode.get("source_copies", [])]:
+        if episode.get("privacy_hold") or (episode.get("state") not in {"archived", "rejected", "negative_sample"} and not terminal_nonlesson):
+            for ref in [episode["source_original"], *episode.get("source_copies", []), *episode.get("source_aliases", [])]:
                 value = ref.get("source_path")
                 if isinstance(value, str) and Path(value).is_absolute() and str(Path(value).resolve()) == value:
                     paths.add(value)

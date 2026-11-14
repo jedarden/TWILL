@@ -1,3 +1,4 @@
+import base64
 import tempfile
 import json
 import unittest
@@ -12,7 +13,127 @@ from twill_app import Store, SessionData, TranscriptEvent, redact  # noqa: E402
 from twill_redactor import CONTENT_FENCE_MARKER, MAX_EXCERPT_LENGTH, Redactor  # noqa: E402
 
 
+def _synthetic_jwt(*, padded=False):
+    """Construct inert credential shapes without token literals in source."""
+
+    parts = (
+        json.dumps({"alg": "HS256", "typ": "JWT"}, separators=(",", ":")).encode(),
+        json.dumps({"sub": "synthetic-user"}, separators=(",", ":")).encode(),
+        bytes(range(32)),
+    )
+    encoded = [base64.urlsafe_b64encode(part).decode("ascii") for part in parts]
+    return ".".join(encoded if padded else [part.rstrip("=") for part in encoded])
+
+
 class RedactorTests(unittest.TestCase):
+    def test_redacts_vault_and_openbao_token_families(self):
+        alphabet = "AbCdEf0123456789_-"
+        for prefix, lengths in (("hv" + "s.", (90, 120)), ("hv" + "b.", (138, 300)), ("s" + ".", (24,))):
+            for length in lengths:
+                payload = (alphabet * 20)[:length] if length != 24 else ("AbCdEf0123456789" * 2)[:length]
+                value = prefix + payload
+                for before, after in (("", ""), ('{"credential":"', '"}'), ("/synthetic/", "/record")):
+                    with self.subTest(prefix=prefix, length=length, before=before):
+                        safe = Redactor().redact_text(before + value + after)
+                        self.assertTrue(safe == before + "<redacted:vault-token>" + after,
+                                        "Vault-shaped value was not fully redacted")
+                        self.assertEqual(Redactor().redact_text(safe), safe)
+                text = "x" * 205 + " " + value + " tail"
+                self.assertTrue(Redactor().redact_excerpt(text) == "x" * 205 + " <redacted:vault-token> tail",
+                                "Vault-shaped value was truncated before redaction")
+                self.assertTrue(Redactor().redact_text("Bearer " + value) == "Bearer <redacted:bearer-token>")
+                self.assertTrue(Redactor().redact_text("token=" + value) == "token=<redacted:secret>")
+
+    def test_vault_pattern_preserves_ordinary_dotted_names_and_short_values(self):
+        for value in ("hvs.service.name", "hvb.module.attribute", "s.repository.module", "hvs." + "a" * 89,
+                      "hvb." + "a" * 137, "s." + "a" * 23, "s." + "a" * 25):
+            self.assertTrue(Redactor().redact_text(value) == value, "Ordinary text matched Vault token shape")
+
+    def test_redacts_forward_auth_csrf_cookie_and_json_assignments(self):
+        value = bytes(range(16)).hex()
+        for key in ("_forward_auth_csrf", "_FORWARD_AUTH_CSRF"):
+            for text, expected in (
+                (key + "=" + value + "; Path=/", key + "=<redacted:csrf-token>; Path=/"),
+                (json.dumps({key: value}), json.dumps({key: "<redacted:csrf-token>"})),
+            ):
+                safe = Redactor().redact_text(text)
+                self.assertTrue(safe == expected, "CSRF-shaped value was not fully redacted")
+                self.assertEqual(Redactor().redact_text(safe), safe)
+        text = "x" * 175 + " _forward_auth_csrf=" + value + " tail"
+        expected = "x" * 175 + " _forward_auth_csrf=<redacted:csrf-token> tail"
+        self.assertTrue(Redactor().redact_excerpt(text) == expected, "CSRF cookie was truncated before redaction")
+        ordinary = "_forward_auth_csrf_hint=" + value
+        self.assertTrue(Redactor().redact_text(ordinary) == ordinary)
+
+    def test_redacts_jwt_values_in_plain_quoted_and_encoded_contexts(self):
+        redactor = Redactor()
+        for padded in (False, True):
+            value = _synthetic_jwt(padded=padded)
+            for prefix, suffix in (
+                ("", ""),
+                ("before ", " after"),
+                ('{"credential":"', '"}'),
+                ("/synthetic/", "/record"),
+                ("record_", ""),
+                ("record-", ""),
+                (r"record\n", ""),
+                (r"record\r", ""),
+                (r"record\t", ""),
+                ("record%3D", ""),
+                ("(", ")."),
+            ):
+                with self.subTest(padded=padded, prefix=prefix):
+                    expected = prefix + "<redacted:jwt>" + suffix
+                    actual = redactor.redact_text(prefix + value + suffix)
+                    self.assertTrue(actual == expected, "JWT value was not fully redacted")
+                    self.assertEqual(redactor.redact_text(actual), actual)
+
+    def test_jwt_redaction_preserves_existing_canonical_markers(self):
+        redactor = Redactor()
+        value = _synthetic_jwt()
+        for text, expected in (
+            ("Bearer " + value, "Bearer <redacted:bearer-token>"),
+            ('token="' + value + '"', 'token="<redacted:secret>"'),
+            ("<redacted:jwt>", "<redacted:jwt>"),
+        ):
+            actual = redactor.redact_text(text)
+            self.assertTrue(actual == expected, "JWT canonical marker changed")
+            self.assertEqual(redactor.redact_text(actual), actual)
+
+    def test_ordinary_dotted_names_are_not_jwt_values(self):
+        for value in (
+            "module.package.attribute",
+            "long_module_name.long_package_name.long_attribute_name",
+            "example.invalid/path/to/file.json",
+            "version.1.2",
+            "eyJ.module.value",
+            "eyJlong_module_name.long_package_name.long_attribute_name.extra",
+        ):
+            with self.subTest(value=value):
+                self.assertEqual(Redactor().redact_text(value), value)
+
+    def test_jwt_structural_floor_counts_the_value_not_sentence_punctuation(self):
+        redactor = Redactor()
+        prefix = "ey" + "J" + "a" * 24 + ".b."
+        for length in (39, 40):
+            value = prefix + "c" * (length - len(prefix))
+            for punctuation in ("", ".", ","):
+                expected = value if length < 40 else "<redacted:jwt>"
+                self.assertTrue(
+                    redactor.redact_text(value + punctuation) == expected + punctuation,
+                    "JWT length boundary was not preserved",
+                )
+
+    def test_jwt_is_redacted_before_excerpt_truncation(self):
+        redactor = Redactor()
+        prefix = "x" * 210 + " "
+        value = _synthetic_jwt()
+        suffix = " tail"
+        self.assertGreater(len(prefix + value + suffix), MAX_EXCERPT_LENGTH)
+        expected = prefix + "<redacted:jwt>" + suffix
+        self.assertTrue(redactor.redact_excerpt(prefix + value + suffix) == expected,
+                        "JWT was truncated before it was redacted")
+
     def test_redacts_extended_secret_assignments_and_quoted_json_keys(self):
         # Construct synthetic values at runtime; no captured credential belongs
         # in the test suite, its failure output, or a fixture file.

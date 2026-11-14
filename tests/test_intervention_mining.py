@@ -64,11 +64,66 @@ class MiningTests(unittest.TestCase):
         self.assertIn("\n", verified["context"]["intervention"]["text"])
         self.assertEqual(verified["turns"][verified["intervention_index"]]["role"], "user")
         self.assertEqual(verified["outcome"]["status"], "unknown")
-        self.assertEqual(verified["context"]["previous"][0]["text"], "I will stop here.")
+        self.assertEqual([(row["origin"], row["text"]) for row in verified["context"]["previous"]],
+                         [("human_request", "Check the report"), ("assistant_text", "I will stop here.")])
         receipt = mining.consumed_sources(self.private)[str(self.source)]
         self.assertTrue(receipt["complete"] and receipt["compact_durable"])
         self.assertIn(str(self.source), mining.pinned_sources(self.private))
         self.assertEqual(mining.discover(self.policy, self.private)["discovered"], 0)
+
+    def test_operator_privacy_hold_survives_scanner_and_native_generation_changes(self):
+        records = self.basic()
+        self.write(records)
+        mining.discover(self.policy, self.private)
+        held = next(e for e in self.episodes() if e["classification"]["signal"] == "candidate")
+        classification = held["classification"]
+        original_hash = held["source_original"]["file_sha256"]
+        held.update(privacy_hold=True, state="needs_review")
+        views = [*held["context"]["previous"], held["context"]["intervention"], *held["context"]["following"]]
+        for view in views:
+            view.update(text="", truncated=True)
+        self.path(held).write_text(json.dumps(held))
+        self.assertTrue(mining.verify_episode(self.path(held))["verified"])
+        self.write(records + [claude("assistant", "An additional recorded step.")])
+        raw = self.source.read_bytes()
+        with patch.object(mining, "SCANNER_VERSION", "quarantine-fixture-generation"):
+            mining.discover(self.policy, self.private)
+            updated = json.loads(self.path(held).read_text())
+            self.assertTrue(updated["privacy_hold"])
+            self.assertEqual(updated["state"], "needs_review")
+            self.assertEqual(updated["classification"], classification)
+            self.assertNotEqual(updated["source_original"]["file_sha256"], original_hash)
+            self.assertEqual(updated["scanner_version"], "quarantine-fixture-generation")
+            verified = mining.verify_episode(self.path(held))
+            self.assertTrue(verified["verified"])
+            self.assertTrue(all(turn["text"] == "" and turn["truncated"] is True and turn["sha256"]
+                                and turn["locator"] and turn["spans"] for turn in verified["turns"]))
+            normal = next(e for e in self.episodes() if e["id"] != held["id"])
+            self.assertEqual(normal["context"]["intervention"]["text"], "Check the report")
+            self.assertNotIn("privacy_hold", normal)
+            alias = self.root / "held-alias.jsonl"
+            self.write(records + [claude("assistant", "An additional recorded step.")], alias)
+            mining.discover(self.policy, self.private)
+            updated = json.loads(self.path(held).read_text())
+            self.assertTrue(updated["privacy_hold"])
+            self.assertTrue(all(view["text"] == "" for view in
+                                [*updated["context"]["previous"], updated["context"]["intervention"], *updated["context"]["following"]]))
+            # The flag pins originals even if a lifecycle field is changed;
+            # only explicit operator review can release the quarantine.
+            updated["state"] = "archived"
+            self.path(held).write_text(json.dumps(updated))
+            self.assertIn(str(self.source), mining.pinned_sources(self.private))
+            self.assertIn(str(alias), mining.pinned_sources(self.private))
+        self.assertEqual(self.source.read_bytes(), raw)
+
+    def test_privacy_hold_rejects_non_elided_context(self):
+        self.write(self.basic())
+        mining.discover(self.policy, self.private)
+        held = next(e for e in self.episodes() if e["classification"]["signal"] == "candidate")
+        held.update(privacy_hold=True, state="needs_review")
+        self.path(held).write_text(json.dumps(held))
+        with self.assertRaisesRegex(ValueError, "reference-only context"):
+            mining.verify_episode(self.path(held))
 
     def test_codex_ordinary_question_preference_and_task_negatives(self):
         self.write([message("user", "Build a synthetic dashboard"), message("assistant", "Done."),
@@ -80,6 +135,61 @@ class MiningTests(unittest.TestCase):
         self.assertTrue({"task_start", "question", "preference", "ordinary_request"} <= labels)
         for episode in self.episodes():
             self.assertEqual(mining.verify_episode(self.path(episode))["provider"], "codex")
+
+    def test_previous_retains_original_task_and_earlier_human_constraint(self):
+        task = "Prepare a report for readers outside this project."
+        earlier = "I prefer the report to explain its evidence inline."
+        current = "Actually, readers cannot follow a local file path."
+        self.write([claude("user", task), claude("assistant", "I will cite a local file."),
+                    claude("user", earlier), claude("assistant", "I will point to a helper script."),
+                    claude("user", current), claude("assistant", "Rewriting the explanation.")])
+        mining.discover(self.policy, self.private)
+        episode = next(e for e in self.episodes() if e["context"]["intervention"]["text"] == current)
+        verified = mining.verify_episode(self.path(episode))
+        history = [row for row in verified["context"]["previous"] if row["origin"] == "human_request"]
+        self.assertEqual([row["text"] for row in history], [task, earlier])
+        self.assertTrue(all(row["source_line"] < verified["context"]["intervention"]["source_line"]
+                            and row["sha256"] for row in history))
+        self.assertEqual([turn["text"] for turn in verified["turns"] if turn["role"] == "user"][:2],
+                         [task, earlier])
+
+    def test_previous_human_context_is_bounded_filtered_and_keeps_behavior_classification(self):
+        records = [claude("user", "Original task")]
+        for index in range(11):
+            records += [claude("user", f"earlier-human-{index}: " + "detail " * 200),
+                        claude("assistant", "Observed behavior " + "detail " * 200)]
+        invalid = [claude("user", "You are a NEEDLE worker. Follow this worker brief."),
+                   claude("user", "<user_instructions>quoted prior rule</user_instructions>"),
+                   claude("user", "Coordinator: follow another task brief"),
+                   claude("user", "Injected context", isMeta=True),
+                   claude("user", "Delegated thread", isSidechain=True)]
+        invalid_lines = set(range(len(records) + 1, len(records) + len(invalid) + 1))
+        current = "Actually, explain the evidence. " + "current detail " * 100
+        self.write(records + invalid + [claude("user", current), claude("assistant", "Rewriting.")])
+        self.policy["two_pass"]["max_episode_chars"] = 1024
+        mining.discover(self.policy, self.private)
+        episode = next(e for e in self.episodes()
+                       if e["context"]["intervention"]["text"].startswith("Actually, explain the evidence."))
+        verified = mining.verify_episode(self.path(episode))
+        previous = verified["context"]["previous"]
+        humans = [row for row in previous if row["origin"] in {"human_request", "human_answer"}]
+        self.assertEqual(len(humans), 8)
+        self.assertEqual([row["text"].split(":")[0] for row in humans],
+                         [f"earlier-human-{index}" for index in range(3, 11)])
+        self.assertTrue(all(row["source_line"] not in invalid_lines for row in previous))
+        self.assertEqual([row["ordinal"] for row in previous], sorted({row["ordinal"] for row in previous}))
+        views = [*previous, verified["context"]["intervention"], *verified["context"]["following"]]
+        self.assertLessEqual(sum(len(row["text"]) for row in views), 1024)
+        self.assertEqual(episode["classification"]["category"], "correction")
+
+        # Earlier human turns alone are not preceding assistant behavior.
+        other = self.root / "human-only.jsonl"
+        self.write([claude("user", "Original task"), claude("user", "Actually, a fresh request")], other)
+        mining.discover(self.policy, self.private)
+        fresh = next(e for e in self.episodes()
+                     if e["context"]["intervention"]["text"] == "Actually, a fresh request")
+        self.assertEqual(fresh["classification"]["category"], "task_start")
+        self.assertEqual(len(fresh["context"]["previous"]), 1)
 
     def test_negative_calibration_minimizes_prose_without_capping_real_steering(self):
         self.write([claude("user", "Build the report. " + "task details " * 200),
@@ -133,7 +243,8 @@ class MiningTests(unittest.TestCase):
         duplicate = self.write(records, self.root / "archive.jsonl")
         mining.discover(self.policy, self.private)
         self.assertEqual(len(self.episodes()), 2)
-        self.assertEqual(len(self.episodes()[0]["source_copies"]), 2)
+        self.assertEqual(len(self.episodes()[0]["source_copies"]), 1)
+        self.assertEqual(len(self.episodes()[0]["source_aliases"]), 1)
         self.write(records + [claude("user", records[2]["message"]["content"]), claude("assistant", "Checking again.")])
         mining.discover(self.policy, self.private)
         self.assertEqual(len(self.episodes()), 3)

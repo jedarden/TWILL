@@ -1479,3 +1479,19 @@ Consumed archive generation signatures prevent repeated export of reclaimed inpu
 new generations remain eligible. Calibration reviews and stage metrics stay in the
 private artifacts repository. Completion of discovery or interpretation does not
 claim a lesson was validated or applied.
+
+### Useful production learning iteration (2026-11-14)
+
+Owner `twill-b6e5818b` carries authentic hypotheses through independent dual-agent
+experiments and fresh validation before claiming successful learning. Recover
+native queued human steering, exclude injected goal wrappers, and preserve bounded
+earlier human context. Explicitly selected reviews obey the ordinary evidence and
+invocation budgets. One critique-driven revision is permitted with an independent
+fresh critic. Medium-confidence inferred repository hypotheses are eligible for
+trials, never direct application; the existing measured-improvement, holdout and
+guardrail gates decide promotion. Explicit preferences retain their original
+authority checks. New instruction scopes require actual repository provenance.
+Other verified owned additions preserve source identity but still change the
+evaluation context and require retesting. Credential redaction and persistent
+reference-only privacy holds precede publication; neither privacy scanner is
+bypassed. Independent suites remain separate from candidate-author suggestions.

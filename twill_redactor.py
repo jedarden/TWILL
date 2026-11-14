@@ -37,12 +37,40 @@ CREDENTIAL_PATTERNS = (
         "Bearer <redacted:bearer-token>",
     ),
     (
+        # Compact JWTs normally begin with base64url-encoded JSON (eyJ).
+        # Keep the scanner's structural floor, including tokens in escaped
+        # JSON or percent-encoded contexts, without matching ordinary dotted
+        # names. Accept padding as well as the usual unpadded form.
+        re.compile(
+            r"(?:(?<![A-Za-z0-9])|(?<=\\[nrt])|(?<=%[0-9A-Fa-f]{2}))"
+            r"(?=[A-Za-z0-9_.=-]{40,}(?<!\.)(?![A-Za-z0-9_=-]))"
+            r"eyJ[A-Za-z0-9_-]*={0,2}\."
+            r"[A-Za-z0-9_-]+={0,2}\.[A-Za-z0-9_-]+={0,2}"
+            r"(?![A-Za-z0-9_-]|\.[A-Za-z0-9_-])"
+        ),
+        "<redacted:jwt>",
+    ),
+    (
         re.compile(r"(?i)\bsk-[A-Za-z0-9_-]{12,}"),
         "<redacted:api-key>",
     ),
     (
         re.compile(r"\bxox[baprs]-[A-Za-z0-9-]{10,}"),
         "<redacted:slack-token>",
+    ),
+    (
+        re.compile(
+            r"\b(?:hvs\.[A-Za-z0-9_-]{90,120}|hvb\.[A-Za-z0-9_-]{138,300}|"
+            r"s\.[A-Za-z0-9]{24})(?![A-Za-z0-9_-])"
+        ),
+        "<redacted:vault-token>",
+    ),
+    (
+        re.compile(
+            r"(?i)(\b_forward_auth_csrf['\"]?\s*[:=]\s*)(['\"]?)"
+            r"[a-f0-9]{32}(?![A-Za-z0-9_-])"
+        ),
+        r"\1\2<redacted:csrf-token>",
     ),
     (
         re.compile(

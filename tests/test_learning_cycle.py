@@ -144,6 +144,44 @@ class LearningCycleTests(unittest.TestCase):
         self.controller.apply(self.id)
         self.assertEqual(self.targets[0].read_text().count(self.record["instruction"]), 1)
 
+    def test_interrupted_two_target_removal_recovers_without_reapplying(self):
+        from twill_learning import atomic
+
+        prefixes = [b"Human instructions for Claude.\n\n", b"Human instructions for Codex.\n\n"]
+        suffixes = ["Later human guidance: café.\n".encode(), b"Later human guidance, no final newline."]
+        for path, prefix in zip(self.targets, prefixes):
+            path.write_bytes(prefix)
+        self.active()
+        for path, suffix in zip(self.targets, suffixes):
+            path.write_bytes(path.read_bytes() + suffix)
+        expected = [prefix + suffix for prefix, suffix in zip(prefixes, suffixes)]
+        block = self.controller.block(self.controller.load(self.id)).encode()
+
+        def crash(path, content, mode=0o600):
+            if path == self.targets[1]:
+                raise OSError("power failure during removal")
+            atomic(path, content, mode)
+
+        with mock.patch("twill_learning.atomic", side_effect=crash):
+            with self.assertRaisesRegex(OSError, "power failure during removal"):
+                self.controller.invalidate(self.id, "Synthetic counterexample")
+        self.assertEqual(self.controller.load(self.id)["state"], "removing")
+        self.assertEqual(self.targets[0].read_bytes(), expected[0])
+        self.assertIn(block, self.targets[1].read_bytes())
+
+        # A new process has only the durable removal intent, not in-memory progress.
+        restarted = Controller(copy.deepcopy(self.policy))
+        self.assertEqual(restarted.recover(self.id)["state"], "invalidated")
+        self.assertEqual(restarted.load(self.id)["state"], "invalidated")
+        self.assertEqual(restarted.recover(self.id)["state"], "invalidated")
+        restarted.cycle()
+        with self.assertRaises(LearningError):
+            restarted.apply(self.id)
+        self.assertEqual(restarted.load(self.id)["state"], "invalidated")
+        for path, content in zip(self.targets, expected):
+            self.assertEqual(path.read_bytes(), content)
+            self.assertNotIn(block, path.read_bytes())
+
     def test_modified_or_duplicated_managed_block_stops_all_removal(self):
         self.active()
         self.targets[1].write_text(self.targets[1].read_text().replace("authorized task", "other task"))

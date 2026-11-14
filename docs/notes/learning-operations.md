@@ -323,3 +323,29 @@ The archive timer runs three minutes after each discovery tick. Both use
 one-second calendar accuracy so routine discovery does not repeatedly occupy the
 learning lock when the producer needs to reclaim cache. A long model cycle may
 still defer reclamation to a later tick; busy retention never deletes evidence.
+
+## Reviewed hypotheses and independent trials
+
+Use `twill-learning interpret --episode IE-ID --limit 1` to review a selected
+native episode; repeat `--episode` for a bounded set. Selection preserves source,
+scope, cooldown and call-budget checks. A rejected candidate may receive one
+bounded author revision using the prior critique; its fresh critic sees only the
+new proposal and original evidence. Every attempted pair remains in the receipt.
+
+Grounded medium-confidence inferred repository hypotheses may enter isolated
+trials. They require an independently authored, hash-bound suite and measured
+improvement on both providers before application. Explicit human authority keeps
+its high-confidence, verbatim-intent checks. Advisory validation suggestions are
+not trusted test expectations. Empty optional fields do not need affirmative
+critic support; every substantive factual claim does.
+
+Repository scopes must enroll their actual launch directories and maintained
+instruction targets. Include inherited instructions in each provider's context
+manifest. Exact verified additions from other learned rules preserve source
+provenance, while changed evaluation context still requires fresh testing.
+
+An explicit `privacy_hold` keeps an input out of interpretation and candidate
+admission. It retains native locators and pins originals, elides context prose,
+and survives rediscovery until reviewed. JWT, Vault and CSRF credential values
+are redacted before excerpts are persisted. Independent suites under
+`learning/evaluations/` are included in private evidence publication.
