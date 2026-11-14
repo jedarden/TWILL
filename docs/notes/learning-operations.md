@@ -367,3 +367,16 @@ admission. It retains native locators and pins originals, elides context prose,
 and survives rediscovery until reviewed. JWT, Vault and CSRF credential values
 are redacted before excerpts are persisted. Independent suites under
 `learning/evaluations/` are included in private evidence publication.
+
+For prose that cannot be graded reliably with literal assertions, an independent
+suite can supply `semantic_oracle` rubrics and known valid/invalid controls.
+Use tasks from before the human intervention; supplying the repair in the task
+does not test autonomous behavior. Calibrate the two native judges against the
+frozen controls before a full trial. During experiments the same controls are
+mixed with opaque, shuffled trial identities. Judges see neither the candidate
+instruction nor arms, providers or control answers. Both must pass every control
+and agree on each trial. Uncertainty, malformed output, transport errors or
+disagreement remain inconclusive and block admission. Concrete assertions, when
+present, must pass too. Judge calls count toward the experiment budget, and
+semantic harness changes invalidate prior evidence. These checks establish only
+the tested behavior; track production impact separately.

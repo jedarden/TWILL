@@ -29,6 +29,7 @@ from pathlib import Path
 
 from twill_redactor import redact_text
 import twill_execution_oracle as execution
+import twill_semantic_oracle as semantic
 
 
 MAX_CAPTURE = 128 * 1024
@@ -105,10 +106,14 @@ def _validate(spec: dict, providers: dict, repetitions: int, max_calls: int, tim
             raise ValueError("case split must be train or holdout")
         splits.add(case["split"])
         if "oracle" in case:
-            if "expect" in case:
+            if "expect" in case or "semantic_oracle" in case:
                 raise ValueError("execution cases cannot also supply text assertions")
             execution.validate_oracle(case["oracle"])
             continue
+        if "semantic_oracle" in case:
+            semantic.validate_oracle(case["semantic_oracle"])
+            if "expect" not in case:
+                continue
         expect = case.get("expect")
         if not isinstance(expect, dict) or set(expect) - {"contains", "excludes", "exact"}:
             raise ValueError("expect supports contains, excludes and exact only")
@@ -122,8 +127,9 @@ def _validate(spec: dict, providers: dict, repetitions: int, max_calls: int, tim
             raise ValueError("exact assertion must be a nonempty string")
     if splits != {"train", "holdout"}:
         raise ValueError("train and holdout cases are both required")
-    if 2 + len(cases) * repetitions * 4 > max_calls:
-        raise ValueError("experiment exceeds max_calls (including two version probes)")
+    semantic_cases = any("semantic_oracle" in case for case in cases)
+    if 2 + len(cases) * repetitions * 4 + (2 if semantic_cases else 0) > max_calls:
+        raise ValueError("experiment exceeds max_calls (including probes and semantic judges)")
     files = spec.get("files", {})
     if not isinstance(files, dict):
         raise ValueError("files must be a relative-path/text mapping")
@@ -140,6 +146,8 @@ def _validate(spec: dict, providers: dict, repetitions: int, max_calls: int, tim
             raise ValueError("invalid provider model identifier")
         if config.get("executable") and not isinstance(config["executable"], str):
             raise ValueError("provider executable must be a string")
+        if semantic_cases and not config.get("model"):
+            raise ValueError("semantic assessment requires explicitly pinned judge models")
 
 
 def _environment(root: Path, provider: str) -> dict:
@@ -427,6 +435,8 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
     started = time.monotonic()
     runtime_evidence = execution.preflight_oracles(spec["cases"], work_root=work_root)
     execution_cases = any("oracle" in case for case in spec["cases"])
+    semantic_cases = any("semantic_oracle" in case for case in spec["cases"])
+    semantic_sha = hashlib.sha256(Path(semantic.__file__).read_bytes()).hexdigest() if semantic_cases else None
     suite = {"cases": spec["cases"], "files": spec.get("files", {})}
     if execution_cases:
         suite["execution_harness"] = execution.suite_binding()
@@ -513,7 +523,15 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
                                 trial["context_verified"], output = _verified_answer(output, marker)
                                 if not trial["context_verified"]:
                                     error = error or "instruction_context_unverified"
-                                trial["output"] = _safe(output)
+                                if "semantic_oracle" in case:
+                                    trial["native_output_sha"] = hashlib.sha256(output.encode()).hexdigest()
+                                    safe_output = redact_text(output)
+                                    trial["output"] = safe_output
+                                    trial["output_sha"] = hashlib.sha256(safe_output.encode()).hexdigest()
+                                    if len(output.encode()) > semantic.MAX_TEXT_BYTES or len(safe_output.encode()) > semantic.MAX_TEXT_BYTES:
+                                        error = error or "semantic_output_limit"
+                                else:
+                                    trial["output"] = _safe(output)
                                 trial["returncode"] = invocation["returncode"]
                                 if error:
                                     trial["error"] = error
@@ -525,6 +543,8 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
                                     trial["status"] = outcome["status"]
                                     if outcome.get("error"):
                                         trial["error"] = outcome["error"]
+                                elif "semantic_oracle" in case:
+                                    trial["concrete_passed"] = _check(output, case["expect"]) if "expect" in case else True
                                 else:
                                     trial["status"] = "pass" if _check(output, case["expect"]) else "fail"
             report.update(_verdict(report["trials"]))
@@ -544,6 +564,65 @@ def run_experiment(spec: dict, *, work_root: Path, providers: dict,
                 report["metadata_error"] = "missing_or_changed_actual_model"
                 report["verdict"] = "inconclusive"
             report["model_fingerprint"] = _fingerprint(model, report["version"])
+    if semantic_cases:
+        selected = {case["id"] for case in spec["cases"] if "semantic_oracle" in case}
+        entries = [{"provider": name, "trial": trial} for name, report in result["providers"].items()
+                   for trial in report["trials"] if trial["case_id"] in selected]
+        metadata = {name: {"model": report["actual_model"], "version": report["version"],
+                    "fingerprint": report["model_fingerprint"],
+                    **({"error": "provider_metadata_failed"} if report.get("version_error") or report.get("metadata_error")
+                       or report["actual_model"] != providers[name].get("model") else {})}
+                    for name, report in result["providers"].items()}
+        judge_calls, judge_reports = 0, {}
+        def judge(prompt, **kwargs):
+            nonlocal judge_calls
+            if judge_calls >= 2 or result["calls"] + judge_calls >= max_calls:
+                raise ValueError("semantic native call budget exhausted")
+            judge_calls += 1
+            try:
+                report = run_analysis(prompt, **kwargs)
+            except Exception as exc:
+                report = {"status": "error", "provider": kwargs["provider"], "calls": 1,
+                          "error": _safe(str(exc), 500)}
+            judge_reports[kwargs["provider"]] = semantic._redacted(report)
+            return report
+        try:
+            assessment = semantic.grade(spec["cases"], entries, work_root=work_root, providers=providers,
+                metadata=metadata, timeout_seconds=timeout_seconds, deadline=deadline,
+                max_calls=max_calls - result["calls"], run_analysis=judge)
+        except Exception as exc:
+            # Grading cannot erase expensive native outputs or turn a setup
+            # exception into behavioral failure evidence.
+            assessment = {"schema": semantic.SCHEMA, "calibrated": False, "error": _safe(str(exc), 500),
+                          "trial_results": []}
+        assessment["calls"] = judge_calls
+        for provider, report in judge_reports.items():
+            assessment.setdefault("judges", {}).setdefault(provider, report)
+        if (assessment.get("module_sha") != semantic_sha
+                or hashlib.sha256(Path(semantic.__file__).read_bytes()).hexdigest() != semantic_sha):
+            assessment.update(calibrated=False, binding_error="semantic_grader_binding_changed")
+            assessment.setdefault("error", "semantic_grader_binding_changed")
+        result["calls"] += judge_calls
+        result["semantic_evidence"] = assessment
+        outcomes = {row["index"]: row for row in assessment.get("trial_results", [])}
+        for index, entry in enumerate(entries):
+            trial = entry["trial"]
+            outcome = outcomes.get(index, {"status": "error", "error": "semantic_assessment_inconclusive"})
+            trial["semantic"] = outcome
+            if trial.get("error"):
+                continue
+            if assessment.get("calibrated") is not True or outcome["status"] == "error":
+                trial.update(status="error", error="semantic_assessment_inconclusive")
+            elif outcome["status"] == "pass" and trial.get("concrete_passed"):
+                trial["status"] = "pass"
+            else:
+                trial["status"] = "fail"
+        for report in result["providers"].values():
+            report.update(_verdict(report["trials"]))
+            for field in ("version_error", "metadata_error"):
+                if report.get(field):
+                    report["errors"] += 1
+                    report["verdict"] = "inconclusive"
     result["verdict"] = "promote" if all(p["verdict"] == "improved" for p in result["providers"].values()) else "hold"
     result["seconds"] = round(time.monotonic() - started, 4)
     return result

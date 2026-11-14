@@ -529,6 +529,10 @@ class Controller:
             import twill_execution_oracle
             if receipt.get("execution_sha") != digest(Path(twill_execution_oracle.__file__).read_bytes()):
                 raise LearningError("execution grader changed since experiment")
+        if any("semantic_oracle" in case for case in suite["cases"]):
+            import twill_semantic_oracle
+            if receipt.get("semantic_sha") != digest(Path(twill_semantic_oracle.__file__).read_bytes()):
+                raise LearningError("semantic grader changed since experiment")
         import twill_experiments
         adapter_file = getattr(twill_experiments, "__file__", None)
         adapter_sha = digest(Path(adapter_file).read_bytes()) if adapter_file else "test-adapter"
@@ -565,6 +569,11 @@ class Controller:
         import twill_experiments
         from twill_experiments import run_experiment
         adapter_file = getattr(twill_experiments, "__file__", None)
+        semantic_sha = None
+        if any("semantic_oracle" in case for case in suite["cases"]):
+            import twill_semantic_oracle
+            semantic_path = Path(twill_semantic_oracle.__file__)
+            semantic_sha = digest(semantic_path.read_bytes())
         try:
             result = run_experiment({"id": lesson_id, "instruction": record["instruction"],
                                      "context": frozen_context, "cases": suite["cases"],
@@ -579,6 +588,17 @@ class Controller:
                 record["state"] = "unvalidated"
             self.save(record, "experiment_setup_error")
             return self.suspend(lesson_id, record["reason"]) if validation else record
+        semantic_error = False
+        if semantic_sha is not None:
+            evidence = result.get("semantic_evidence")
+            try:
+                semantic_error = digest(semantic_path.read_bytes()) != semantic_sha
+            except OSError:
+                semantic_error = True
+            semantic_error = (semantic_error or not isinstance(evidence, dict)
+                              or evidence.get("module_sha") != semantic_sha)
+            if semantic_error:
+                result["verdict"] = "inconclusive"
         result_id = digest(result)
         report_path = self.store / "experiments" / f"{result_id}.json"
         atomic(report_path, canonical(result))
@@ -601,6 +621,8 @@ class Controller:
         if any("oracle" in case for case in suite["cases"]):
             import twill_execution_oracle
             record["experiments"][-1]["execution_sha"] = digest(Path(twill_execution_oracle.__file__).read_bytes())
+        if semantic_sha is not None:
+            record["experiments"][-1]["semantic_sha"] = semantic_sha
         # A runtime error is unknown; only a complete candidate failure can invalidate.
         reports = result.get("providers", {})
         record["assessment"] = {"verdict": result.get("verdict"), "at": stamp(),
@@ -609,7 +631,7 @@ class Controller:
                                               ("verdict", "errors", "counts", "actual_model", "model_fingerprint")}
                                               for name, r in reports.items()}}
         complete = set(reports) == {"claude", "codex"}
-        errors = (not complete or result.get("candidate_sha") != record["instruction_sha"]
+        errors = (not complete or semantic_error or result.get("candidate_sha") != record["instruction_sha"]
                   or self.context(record) != frozen_context or not self.source_current(record)
                   or any(r.get("errors", 0) for r in reports.values()))
         record["assessment"]["unknown"] = bool(errors)

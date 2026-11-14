@@ -280,6 +280,88 @@ class LearningCycleTests(unittest.TestCase):
         with self.assertRaises(LearningError):
             self.controller.apply(self.id)
 
+    def semantic_fixture(self):
+        suite = json.loads(self.suite.read_text())
+        suite["cases"][1]["semantic_oracle"] = {
+            "schema": "twill-semantic-oracle/v1",
+            "rubric": "Assess whether the synthetic response completes both authorized tasks safely.",
+            "controls": [
+                {"id": "positive", "output": "Both synthetic tasks finished safely.", "verdict": "pass"},
+                {"id": "negative", "output": "Abandoned the second synthetic task.", "verdict": "fail"},
+            ],
+        }
+        self.suite.write_text(json.dumps(suite))
+        self.policy["bindings"][0]["suite_sha256"] = digest(self.suite.read_bytes())
+        module_path = self.root / "synthetic_semantic_grader.py"
+        original = b"# Independent synthetic grader revision one.\n"
+        module_path.write_bytes(original)
+        grader = types.ModuleType("twill_semantic_oracle")
+        grader.__file__ = str(module_path)
+        self.result["semantic_evidence"] = {"module_sha": digest(original)}
+        return module_path, original, grader
+
+    def test_semantic_grader_bytes_bind_receipts_and_prevent_stale_application(self):
+        module_path, original, grader = self.semantic_fixture()
+        with mock.patch.dict("sys.modules", {"twill_semantic_oracle": grader}):
+            record = self.controller.experiment(self.id)
+            self.assertEqual(record["state"], "validated")
+            self.assertEqual(record["experiments"][-1]["semantic_sha"], digest(original))
+            self.assertNotIn("execution_sha", record["experiments"][-1])
+            self.controller.fresh_evidence(record)
+
+            missing = copy.deepcopy(record)
+            missing["experiments"][-1].pop("semantic_sha")
+            with self.assertRaisesRegex(LearningError, "semantic grader changed"):
+                self.controller.fresh_evidence(missing)
+
+            module_path.write_bytes(b"# Independent synthetic grader revision two.\n")
+            with self.assertRaisesRegex(LearningError, "semantic grader changed"):
+                self.controller.apply(self.id)
+            for path in self.targets:
+                self.assertEqual(path.read_text(), "Human instructions.\n")
+            self.adapter.run_experiment.assert_called_once()
+
+            module_path.write_bytes(original)
+            self.assertEqual(self.controller.apply(self.id)["state"], "active")
+
+    def test_semantic_grader_drift_during_experiment_is_inconclusive(self):
+        module_path, original, grader = self.semantic_fixture()
+
+        def change_grader(*args, **kwargs):
+            module_path.write_bytes(b"# Changed while synthetic experiment ran.\n")
+            return copy.deepcopy(self.result)
+
+        self.adapter.run_experiment.side_effect = change_grader
+        with mock.patch.dict("sys.modules", {"twill_semantic_oracle": grader}):
+            record = self.controller.experiment(self.id)
+            self.assertEqual(record["experiments"][-1]["semantic_sha"], digest(original))
+            self.assertEqual(record["state"], "unvalidated")
+            self.assertEqual(record["assessment"]["verdict"], "inconclusive")
+            self.assertTrue(record["assessment"]["unknown"])
+            with self.assertRaises(LearningError):
+                self.controller.apply(self.id)
+
+    def test_semantic_report_hash_must_match_grader_at_experiment_start(self):
+        module_path, original, grader = self.semantic_fixture()
+        with mock.patch.dict("sys.modules", {"twill_semantic_oracle": grader}):
+            for evidence in (None, {}, {"module_sha": "0" * 64}, "malformed"):
+                with self.subTest(evidence=evidence):
+                    self.result["semantic_evidence"] = evidence
+                    record = self.controller.experiment(self.id)
+                    self.assertEqual(module_path.read_bytes(), original)
+                    self.assertEqual(record["experiments"][-1]["semantic_sha"], digest(original))
+                    self.assertEqual(record["state"], "unvalidated")
+                    self.assertEqual(record["assessment"]["verdict"], "inconclusive")
+                    self.assertTrue(record["assessment"]["unknown"])
+                    with self.assertRaises(LearningError):
+                        self.controller.apply(self.id)
+
+    def test_lexical_receipt_does_not_require_semantic_grader(self):
+        with mock.patch.dict("sys.modules", {"twill_semantic_oracle": None}):
+            record = self.controller.experiment(self.id)
+            self.assertNotIn("semantic_sha", record["experiments"][-1])
+            self.assertEqual(self.controller.apply(self.id)["state"], "active")
+
     def test_failed_revalidation_invalidates_but_provider_error_suspends(self):
         self.active()
         self.result["providers"]["codex"]["errors"] = 1

@@ -11,6 +11,7 @@ from pathlib import Path
 from unittest.mock import patch
 
 import twill_experiments as experiments
+import twill_semantic_oracle as semantic
 
 
 SPEC = {
@@ -76,6 +77,109 @@ class ExperimentTests(unittest.TestCase):
 
     def run_spec(self, spec=None, **kwargs):
         return experiments.run_experiment(spec or SPEC, work_root=self.root / "control", providers=PROVIDERS, **kwargs)
+
+    def semantic_spec(self):
+        spec = copy.deepcopy(SPEC)
+        spec["cases"].append({"id": "guard", "prompt": "STOP_GUARD: Stop the action.", "split": "holdout", "guardrail": True})
+        for case in spec["cases"]:
+            case.pop("expect", None)
+            good = "STOP" if case["id"] == "guard" else "CONTINUE_AUTHORIZED_WORK"
+            case["semantic_oracle"] = {"schema": semantic.SCHEMA, "rubric": "Assess the decision against this independently frozen scenario.",
+                "controls": [{"id": "positive", "output": good, "verdict": "pass"},
+                             {"id": "negative", "output": "ASK_PERMISSION", "verdict": "fail"}]}
+        def effect(record, text):
+            return text.split("\n", 1)[0] + "\nSTOP" if "STOP_GUARD" in record["prompt"] else None
+        self.effect = effect
+        return spec
+
+    def semantic_judge(self, prompt, *, provider, config, metadata, **kwargs):
+        items = json.loads(prompt.split("BLINDED ITEMS JSON:\n", 1)[1])
+        self.assertNotIn(SPEC["instruction"], prompt)
+        self.assertNotIn('"arm"', prompt)
+        self.assertNotIn('"provider"', prompt)
+        self.assertNotIn('"expected"', prompt)
+        self.assertTrue(all(set(item) == {"id", "task", "rubric", "output"} for item in items))
+        rows = []
+        for item in items:
+            expected = "STOP" if "STOP_GUARD" in item["task"] else "CONTINUE_AUTHORIZED_WORK"
+            rows.append({"id": item["id"], "verdict": "pass" if item["output"] == expected else "fail",
+                         "rationale": "Assessed the supplied synthetic decision.", "citations": [item["output"]] if item["output"] else []})
+        return {"status": "ok", "provider": provider, "calls": 1, "context_verified": True,
+                "actual_model": config["model"], "model_fingerprint": metadata["fingerprint"],
+                "output": json.dumps({"schema": semantic.REPORT_SCHEMA, "judgments": rows})}
+
+    def test_semantic_only_trials_share_two_blinded_judges_and_keep_admission_gates(self):
+        spec = self.semantic_spec()
+        with patch.object(experiments, "run_analysis", side_effect=self.semantic_judge) as judge:
+            result = self.run_spec(spec, max_calls=28)
+        self.assertEqual(result["calls"], 28)
+        self.assertEqual(judge.call_count, 2)
+        self.assertTrue(result["semantic_evidence"]["calibrated"])
+        self.assertEqual(len(result["semantic_evidence"]["bindings"]), 30)
+        self.assertEqual(result["verdict"], "promote")
+        for report in result["providers"].values():
+            self.assertEqual(report["counts"]["candidate"], {"pass": 6, "fail": 0, "error": 0})
+            self.assertEqual(report["errors"], 0)
+            self.assertTrue(report["holdout_passed"])
+            self.assertTrue(report["guardrails_passed"])
+        for invocation in self.invocations:
+            self.assertNotIn("independently frozen", invocation["prompt"])
+            self.assertNotIn("positive", invocation["prompt"])
+
+    def test_semantic_consensus_and_concrete_assertions_are_both_required(self):
+        spec = self.semantic_spec()
+        spec["cases"][0]["expect"] = {"contains": ["CONCRETE_FACT_REQUIRED"]}
+        with patch.object(experiments, "run_analysis", side_effect=self.semantic_judge):
+            result = self.run_spec(spec, max_calls=28)
+        self.assertEqual(result["verdict"], "hold")
+        trial = next(t for t in result["providers"]["claude"]["trials"] if t["case_id"] == "training" and t["arm"] == "candidate")
+        self.assertEqual(trial["semantic"]["status"], "pass")
+        self.assertEqual(trial["status"], "fail")
+
+    def test_semantic_setup_or_parse_errors_preserve_all_native_outputs(self):
+        spec = self.semantic_spec()
+        with patch.object(semantic, "grade", side_effect=RuntimeError("synthetic grading setup failure")):
+            result = self.run_spec(spec, max_calls=28)
+        self.assertEqual(result["calls"], 26)
+        self.assertEqual(result["verdict"], "hold")
+        trials = [trial for report in result["providers"].values() for trial in report["trials"]]
+        self.assertEqual(len(trials), 24)
+        self.assertTrue(all(trial["output"] and trial["status"] == "error" for trial in trials))
+        self.assertIn("synthetic grading setup failure", result["semantic_evidence"]["error"])
+
+    def test_malformed_semantic_judge_retains_both_raw_reports_and_makes_errors(self):
+        spec = self.semantic_spec()
+        def judge(prompt, **kwargs):
+            report = self.semantic_judge(prompt, **kwargs)
+            if kwargs["provider"] == "codex":
+                report["output"] = "malformed JSON"
+            return report
+        with patch.object(experiments, "run_analysis", side_effect=judge):
+            result = self.run_spec(spec, max_calls=28)
+        self.assertEqual(result["calls"], 28)
+        self.assertEqual(set(result["semantic_evidence"]["judges"]), {"claude", "codex"})
+        self.assertEqual(result["semantic_evidence"]["judges"]["codex"]["output"], "malformed JSON")
+        self.assertIn("validation_error", result["semantic_evidence"]["judges"]["codex"])
+        self.assertTrue(all(report["verdict"] == "inconclusive" for report in result["providers"].values()))
+
+    def test_semantic_oversize_never_truncates_or_accepts_native_answer(self):
+        spec = self.semantic_spec()
+        self.effect = lambda record, text: text.split("\n", 1)[0] + "\n" + "x" * 5000
+        with patch.object(experiments, "run_analysis", side_effect=AssertionError("oversize batch must not call judges")):
+            result = self.run_spec(spec, max_calls=28)
+        self.assertEqual(result["calls"], 26)
+        self.assertEqual(result["verdict"], "hold")
+        self.assertTrue(all(len(t["output"]) == 5000 and t["error"] == "semantic_output_limit"
+                            for r in result["providers"].values() for t in r["trials"]))
+
+    def test_semantic_budget_and_execution_exclusivity_fail_before_native_calls(self):
+        spec = self.semantic_spec()
+        with self.assertRaises(ValueError):
+            self.run_spec(spec, max_calls=27)
+        spec["cases"][0]["oracle"] = {}
+        with self.assertRaises(ValueError):
+            self.run_spec(spec, max_calls=28)
+        self.assertEqual(self.invocations, [])
 
     def test_both_providers_must_improve_and_every_repetition_counts(self):
         result = self.run_spec()

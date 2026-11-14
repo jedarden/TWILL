@@ -1503,3 +1503,15 @@ rejected parent and every prior report; copy only the unchanged source-backed
 instruction and provenance. The child inherits no experiments, admission or
 application and requires fresh dual-provider trials. An unchanged suite cannot
 reopen a rejection, and routine cycles never invoke reconsideration.
+
+Prose evaluations may require semantic judgment beyond literal assertions.
+Freeze their source-grounded rubric and known valid/invalid controls independently
+of candidate authors, and use tasks from before the human correction rather than
+supplying the repair in the task. Two isolated native judges receive shuffled,
+opaque output identities without candidate instructions, arm/provider labels or
+control answers. Both must classify every control correctly and agree on each
+trial; missing, malformed, uncertain or disagreeing assessments are errors that
+block admission. Concrete assertions remain additional gates where appropriate.
+Count both judge calls and bind the semantic harness in evidence freshness checks.
+Exercise controls-only native calibration before spending the full trial budget.
+This establishes behavior on the supplied tasks, not general production benefit.
