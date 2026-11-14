@@ -16,7 +16,7 @@ short entry cannot expose the suffix of a longer fenced name.
 | `Bearer` followed by a token-like value | `Bearer <redacted:bearer-token>` |
 | OpenAI-style `sk-` token-shaped value | `<redacted:api-key>` |
 | Slack `xoxb-`, `xoxa-`, `xoxp-`, `xoxr-`, or `xoxs-` token | `<redacted:slack-token>` |
-| A value assigned to `api_key`, `access_token`, `auth_token`, `password`, `secret`, or `token` | `<redacted:secret>` |
+| A value assigned to `api_key`, `access_token`, `auth_token`, `client_secret`, `secret_key`, `access_key`, `private_key`, `refresh_token`, `password`, `secret`, or `token` (including quoted JSON keys and underscore/hyphen variants) | `<redacted:secret>` |
 | PEM private-key block | `<redacted:private-key>` |
 
 Patterns are deliberately applied to all transcript-derived strings that are

@@ -685,6 +685,14 @@ class DetectCommandGateGapTests(unittest.TestCase):
     """The detect verb's catalog wiring end to end."""
 
     def setUp(self):
+        # Matcher and detector must use the same fixed clock as the seeded
+        # observations; wall time must not age this CLI wiring fixture out.
+        detector_clock = mock.patch.object(twill_detectors, "_clock", return_value=NOW)
+        detector_clock.start()
+        self.addCleanup(detector_clock.stop)
+        catalog_clock = mock.patch.object(twill_catalog, "datetime", wraps=datetime)
+        catalog_clock.start().now.return_value = NOW
+        self.addCleanup(catalog_clock.stop)
         self._temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary.cleanup)
         self.state_dir = Path(self._temporary.name) / "state"

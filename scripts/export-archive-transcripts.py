@@ -7,17 +7,18 @@ sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 import argparse
 import json
 
-from twill_archive_feed import InvalidPolicy, _policy, _private_read, run
+from twill_archive_feed import InvalidPolicy, _policy, _private_read, reap, run
 
 
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", required=True, type=Path)
+    parser.add_argument("--reap", action="store_true", help="reclaim verified consumed local cache without network access")
     args = parser.parse_args(argv)
     client = None
     try:
         policy = _policy(_private_read(args.policy))
-        if policy["enabled"]:
+        if policy["enabled"] and not args.reap:
             import boto3
             from botocore.config import Config
 
@@ -41,9 +42,9 @@ def main(argv=None):
             )
     except Exception:
         policy = None
-    report = run(policy, client=client)
+    report = reap(policy) if args.reap else run(policy, client=client)
     print(json.dumps(report, sort_keys=True))
-    return 1 if report["errors"] else 0
+    return 1 if report.get("errors") or report.get("retention_unresolved") else 0
 
 if __name__ == "__main__":
     raise SystemExit(main())

@@ -132,6 +132,21 @@ def _policy(value):
     if type(cache_cap) is not int or cache_cap <= 0:
         raise InvalidPolicy()
     result["max_cache_bytes"] = cache_cap
+    retention = value.get("retention", {"enabled": False})
+    if not isinstance(retention, dict) or type(retention.get("enabled")) is not bool:
+        raise InvalidPolicy()
+    result["retention"] = dict(retention)
+    if retention["enabled"]:
+        root = _private_path(retention.get("learning_root"))
+        if any(_contained(root, result[k]) or _contained(result[k], root)
+               for k in ("feed_root", "state_root")):
+            raise InvalidPolicy()
+        result["retention"]["learning_root"] = root
+        for key, default in (("max_files", 128), ("max_bytes", 256 * 1024 ** 2), ("max_seconds", 10)):
+            number = retention.get(key, default)
+            if type(number) is not int or number <= 0:
+                raise InvalidPolicy()
+            result["retention"][key] = number
     for field in ("max_refs", "max_pages", "max_sessions", "max_bytes", "max_seconds"):
         if type(value.get(field)) is not int or value[field] <= 0:
             raise InvalidPolicy()
@@ -437,6 +452,10 @@ def _withdraw(connection, policy, group, report):
 
 def _emit(connection, client, policy, rows, group, budget, report):
     selected = _selection(rows, policy, time.time())
+    version = _source_version(policy, rows)
+    if _already_consumed(connection, policy, group, version):
+        report["consumed_unchanged"] += 1
+        return
     manifest = selected[-1][1]
     agent = _AGENT_NAMES[manifest["source"]]
     declared_bytes = sum(m["blob"]["raw_bytes"] + m["blob"]["stored_bytes"] for _, m in selected)
@@ -464,6 +483,7 @@ def _emit(connection, client, policy, rows, group, budget, report):
         "completeness_basis": "immutable_snapshot" if manifest["cursor"]["kind"] == "snapshot"
         else "settled_contiguous_archived_offsets",
         "observed_end": len(raw), "session_ended": "unknown",
+        "source_version": version,
     }
     sidecar_bytes = (json.dumps(sidecar, sort_keys=True) + "\n").encode()
     cached = connection.execute("SELECT bytes FROM cache WHERE agent=? AND digest=?", (agent, digest)).fetchone()
@@ -471,6 +491,12 @@ def _emit(connection, client, policy, rows, group, budget, report):
     used += connection.execute("SELECT coalesce(sum(metadata_bytes),0) FROM current_groups").fetchone()[0]
     previous = connection.execute("SELECT metadata_bytes FROM current_groups WHERE group_id=?", (group,)).fetchone()
     required = (0 if cached else len(raw)) + len(sidecar_bytes) - (previous[0] if previous else 0)
+    if used + required > policy["max_cache_bytes"]:
+        _reap(connection, policy, report)
+        used = _cache_bytes(connection)
+        cached = connection.execute("SELECT bytes FROM cache WHERE agent=? AND digest=?", (agent, digest)).fetchone()
+        previous = connection.execute("SELECT metadata_bytes FROM current_groups WHERE group_id=?", (group,)).fetchone()
+        required = (0 if cached else len(raw)) + len(sidecar_bytes) - (previous[0] if previous else 0)
     if used + required > policy["max_cache_bytes"]:
         report["cache_limit"] = True
         raise BudgetExceeded()
@@ -511,6 +537,255 @@ def _emit(connection, client, policy, rows, group, budget, report):
     _atomic(current.with_suffix(".manifest.json"), sidecar_bytes)
 
 
+def _source_version(policy, rows):
+    namespace = {name: str(policy[name]) for name in
+                 ("endpoint_url", "bucket", "refs_prefix", "blobs_prefix")}
+    return hashlib.sha256(json.dumps([namespace, sorted(rows)], sort_keys=True,
+                                    separators=(",", ":")).encode()).hexdigest()
+
+
+def _cache_bytes(connection):
+    return (connection.execute("SELECT coalesce(sum(bytes),0) FROM cache").fetchone()[0]
+            + connection.execute("SELECT coalesce(sum(metadata_bytes),0) FROM current_groups").fetchone()[0])
+
+
+def _retention_state(policy):
+    from twill_learning_retention import consumed_sources, pinned_sources
+    root = policy["retention"]["learning_root"]
+    return root, consumed_sources(root), pinned_sources(root)
+
+
+def _already_consumed(connection, policy, group, version):
+    if not policy["retention"]["enabled"]:
+        return False
+    row = connection.execute("SELECT path,receipt FROM consumed WHERE group_id=? AND version=?",
+                             (group, version)).fetchone()
+    if not row:
+        return False
+    try:
+        from twill_learning_retention import verified_receipt
+        root, receipts, pins = _retention_state(policy)
+        receipt = receipts.get(row[0])
+        return (row[0] not in pins and receipt == json.loads(row[1])
+                and verified_receipt(root, Path(row[0]), receipt))
+    except Exception:
+        return False
+
+
+def _owned_regular(path):
+    if path != path.resolve():
+        raise InvalidPolicy()
+    info = path.lstat()
+    if (not stat.S_ISREG(info.st_mode) or info.st_uid != os.getuid()
+            or stat.S_IMODE(info.st_mode) != 0o600):
+        raise InvalidPolicy()
+    return info
+
+
+def _raw_digest(path, deadline):
+    digest = hashlib.sha256()
+    with path.open("rb") as stream:
+        while True:
+            if time.monotonic() >= deadline:
+                raise BudgetExceeded()
+            block = stream.read(1024 * 1024)
+            if not block:
+                return digest.hexdigest()
+            digest.update(block)
+
+
+def _reap(connection, policy, report):
+    """Lock producer first, then the same learning store as the controller."""
+    if not policy["retention"]["enabled"]:
+        return
+    from twill_lock import StateLock
+    from twill_contract import LockHeldError
+    directory = policy["retention"]["learning_root"] / "learning"
+    try:
+        _private_directory(directory)
+        if (directory / "lock").is_symlink():
+            raise InvalidPolicy()
+        with StateLock(directory):
+            _reap_locked(connection, policy, report)
+    except LockHeldError:
+        report["retention_busy"] = True
+    except Exception:
+        report["retention_unresolved"] = True
+
+
+def _reap_locked(connection, policy, report):
+    """Reclaim only producer-owned, exactly consumed and unpinned local bytes."""
+    retention = policy["retention"]
+    if not retention["enabled"]:
+        return
+    if "_retention_budget" not in policy:
+        policy["_retention_budget"] = [retention["max_files"], retention["max_bytes"],
+                                       time.monotonic() + retention["max_seconds"]]
+    allowance = policy["_retention_budget"]
+    if allowance[0] <= 0 or time.monotonic() >= allowance[2]:
+        return
+    try:
+        from twill_learning_retention import verified_receipt
+        # The caller holds the controller's StateLock for this entire pass.
+        # Learning owners and scan receipts therefore form one stable snapshot;
+        # rereading every episode per unlink would make reclamation quadratic.
+        root, receipts, pins = _retention_state(policy)
+        cursor = connection.execute("SELECT value FROM progress WHERE name='reap_after'").fetchone()
+        after = cursor[0] if cursor else ""
+        groups = connection.execute("SELECT group_id FROM current_groups WHERE group_id>? ORDER BY group_id LIMIT ?",
+                                    (after, allowance[0])).fetchall()
+        if not groups:
+            _set(connection, "reap_after", "")
+            connection.commit()
+            groups = connection.execute("SELECT group_id FROM current_groups ORDER BY group_id LIMIT ?",
+                                        (allowance[0],)).fetchall()
+        for (group,) in groups:
+            if allowance[0] <= 0 or time.monotonic() >= allowance[2]:
+                break
+            allowance[0] -= 1
+            _set(connection, "reap_after", group)
+            connection.commit()
+            path = _current(policy, group)
+            receipt = receipts.get(str(path))
+            if str(path) in pins or not receipt or not verified_receipt(root, path, receipt):
+                continue
+            info = _owned_regular(path)
+            if [info.st_size, info.st_mtime_ns, info.st_ino] != receipt["fingerprint"]:
+                continue
+            sidecar_path = path.with_suffix(".manifest.json")
+            metadata = _private_read(sidecar_path)
+            if (metadata.get("schema_version") != "twill-archive-native/v1"
+                    or metadata.get("complete_observed_generation") is not True
+                    or metadata.get("raw_bytes") != info.st_size
+                    or metadata.get("provider") != path.parent.name
+                    or metadata.get("raw_sha256") != receipt.get("sha256")
+                    or metadata.get("source_version") != receipt.get("source_version")):
+                continue
+            keys = metadata.get("reference_keys")
+            if (not isinstance(keys, list) or not keys
+                    or any("/".join(_key_parts(key, policy["refs_prefix"])[:4]) != group for key in keys)):
+                continue
+            rows = [(key, json.loads(m) if m else None) for key, m in connection.execute(
+                "SELECT key,manifest FROM refs WHERE group_id=? ORDER BY key", (group,))]
+            selected = _selection(rows, policy, time.time())
+            version = _source_version(policy, rows)
+            if (keys != [key for key, _ in selected]
+                    or metadata.get("source_key") != selected[-1][1]["source_key"]
+                    or metadata.get("file_identity") != selected[-1][1]["cursor"]
+                    or (metadata.get("source_version") is not None and metadata["source_version"] != version)):
+                continue
+            digest = metadata["raw_sha256"]
+            if not isinstance(digest, str) or not _SHA.fullmatch(digest):
+                continue
+            obj = policy["feed_root"] / "objects" / path.parent.name / (digest + ".jsonl")
+            obj_info = _owned_regular(obj)
+            if str(obj) in pins or (info.st_dev, info.st_ino) != (obj_info.st_dev, obj_info.st_ino):
+                continue
+            if info.st_size + sidecar_path.stat().st_size > allowance[1]:
+                continue
+            if _raw_digest(path, allowance[2]) != digest:
+                continue
+            # Receipt and complete archive retrieval metadata survive outside
+            # all enrolled raw globs before either hardlink is removed.
+            durable = {"schema": "twill-archive-consumed/v1", "version": version,
+                       "path": str(path), "receipt": receipt, "metadata": metadata,
+                       "namespace": {k: str(policy[k]) for k in
+                                     ("endpoint_url", "bucket", "refs_prefix", "blobs_prefix")},
+                       "references": rows}
+            directory = policy["state_root"] / "consumed"
+            _private_directory(directory)
+            _atomic(directory / (hashlib.sha256((group + version).encode()).hexdigest() + ".json"),
+                    (json.dumps(durable, sort_keys=True) + "\n").encode())
+            connection.execute("INSERT OR REPLACE INTO consumed VALUES (?,?,?,?,?,?,?)",
+                               (group, version, path.parent.name, digest, str(path),
+                                json.dumps(receipt, sort_keys=True), json.dumps(metadata, sort_keys=True)))
+            connection.commit()
+            # Recheck exact inode and metadata just before unlinking. A reader
+            # changing the source or ownership state cannot grant deletion.
+            check = path.lstat()
+            if ((check.st_dev, check.st_ino, check.st_size, check.st_mtime_ns, check.st_mode) !=
+                    (info.st_dev, info.st_ino, info.st_size, info.st_mtime_ns, info.st_mode)
+                    or _private_read(sidecar_path) != metadata):
+                continue
+            metadata_bytes = sidecar_path.stat().st_size
+            path.unlink()
+            sidecar_path.unlink()
+            connection.execute("DELETE FROM current_groups WHERE group_id=?", (group,))
+            connection.commit()
+            allowance[1] -= metadata_bytes
+            report["reaped_current"] += 1
+            report["reclaimed_bytes"] += metadata_bytes
+        # An immutable inode remains accounted until every current link and
+        # every explicit source owner is gone. Never prune unproven history.
+        for agent, digest, size in connection.execute(
+                "SELECT DISTINCT c.agent,c.digest,c.bytes FROM cache c JOIN consumed x "
+                "ON c.agent=x.agent AND c.digest=x.digest LIMIT ?", (allowance[0],)).fetchall():
+            if allowance[0] <= 0 or time.monotonic() >= allowance[2]:
+                break
+            allowance[0] -= 1
+            if agent not in _AGENTS or not _SHA.fullmatch(digest):
+                raise InvalidPolicy()
+            if size > allowance[1]:
+                continue
+            proofs = connection.execute("SELECT path,receipt FROM consumed WHERE agent=? AND digest=?",
+                                        (agent, digest)).fetchall()
+            if not proofs or any(receipts.get(path) != json.loads(proof)
+                                 or not verified_receipt(root, Path(path), json.loads(proof))
+                                 for path, proof in proofs):
+                continue
+            obj = policy["feed_root"] / "objects" / agent / (digest + ".jsonl")
+            if str(obj) in pins or any(path in pins for (path,) in connection.execute(
+                    "SELECT path FROM consumed WHERE agent=? AND digest=?", (agent, digest))):
+                continue
+            if not obj.exists():
+                continue
+            info = _owned_regular(obj)
+            if info.st_nlink != 1 or info.st_size != size or _raw_digest(obj, allowance[2]) != digest:
+                continue
+            obj.unlink()
+            connection.execute("DELETE FROM cache WHERE agent=? AND digest=?", (agent, digest))
+            connection.commit()
+            report["reaped_objects"] += 1
+            report["reclaimed_bytes"] += size
+            allowance[1] -= size
+    except BudgetExceeded:
+        report["retention_bounded"] = True
+    except Exception:
+        # This includes malformed owners, missing adapters and unavailable
+        # parser state. No ownership guess is a deletion authorization.
+        report["retention_unresolved"] = True
+
+
+def reap(policy):
+    """Bounded manual local-only recovery; never contacts archive storage."""
+    report = {"reaped_current": 0, "reaped_objects": 0, "reclaimed_bytes": 0,
+              "retention_unresolved": False, "retention_bounded": False, "retention_busy": False}
+    connection = None
+    lock = None
+    try:
+        policy = _policy(policy)
+        if not policy["enabled"] or not policy["retention"]["enabled"]:
+            return report
+        _private_directory(policy["feed_root"])
+        _private_directory(policy["state_root"])
+        lock = os.open(policy["state_root"] / "cycle.lock", os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
+        fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        connection = _database(policy["state_root"] / "progress.sqlite3")
+        budget = _Budget(policy, {"bytes": 0})
+        _cache_inventory(connection, policy, budget)
+        _current_inventory(connection, policy, budget)
+        _reap(connection, policy, report)
+        report["cache_bytes"] = _cache_bytes(connection)
+    except Exception:
+        report["retention_unresolved"] = True
+    finally:
+        if connection is not None:
+            connection.close()
+        if lock is not None:
+            os.close(lock)
+    return report
+
+
 def _database(path):
     fd = os.open(path, os.O_RDWR | os.O_CREAT | os.O_NOFOLLOW, 0o600)
     info = os.fstat(fd)
@@ -530,6 +805,10 @@ def _database(path):
             PRIMARY KEY(agent,digest));
         CREATE TABLE IF NOT EXISTS current_groups (
             group_id TEXT PRIMARY KEY, metadata_bytes INTEGER NOT NULL DEFAULT 0);
+        CREATE TABLE IF NOT EXISTS consumed (
+            group_id TEXT NOT NULL, version TEXT NOT NULL, agent TEXT NOT NULL,
+            digest TEXT NOT NULL, path TEXT NOT NULL, receipt TEXT NOT NULL,
+            metadata TEXT NOT NULL, PRIMARY KEY(group_id,version));
     """)
     if "metadata_bytes" not in {row[1] for row in connection.execute("PRAGMA table_info(current_groups)")}:
         connection.execute("ALTER TABLE current_groups ADD COLUMN metadata_bytes INTEGER NOT NULL DEFAULT 0")
@@ -857,7 +1136,9 @@ def run(policy, client=None):
     report = {"schema_version": "twill-archive-feed-report/v1", "enabled": False,
               "pages": 0, "refs": 0, "manifest_gets": 0, "sessions": 0, "bytes": 0, "emitted": 0,
               "unchanged": 0, "excluded": 0, "unknown": 0,
-              "withdrawn": 0,
+              "withdrawn": 0, "consumed_unchanged": 0,
+              "reaped_current": 0, "reaped_objects": 0, "reclaimed_bytes": 0,
+              "retention_unresolved": False, "retention_bounded": False, "retention_busy": False, "cache_bytes": 0,
               "cache_limit": False,
               "oversized": 0,
               "reconciled": 0, "inventory_failed": False,
@@ -961,6 +1242,7 @@ def run(policy, client=None):
                 report["inventory_refs"] = connection.execute("SELECT count(*) FROM refs").fetchone()[0]
                 report["inventory_artifacts"] = connection.execute("SELECT count(DISTINCT group_id) FROM refs").fetchone()[0]
                 report["current_artifacts"] = connection.execute("SELECT count(*) FROM current_groups").fetchone()[0]
+                report["cache_bytes"] = _cache_bytes(connection)
             except sqlite3.Error:
                 pass
             connection.close()
@@ -989,14 +1271,15 @@ def run(policy, client=None):
 def main(argv=None):
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--policy", required=True, type=Path)
+    parser.add_argument("--reap", action="store_true", help="reclaim verified consumed local cache without network access")
     args = parser.parse_args(argv)
     try:
         policy = _private_read(args.policy)
     except Exception:
         policy = None
-    report = run(policy)
+    report = reap(policy) if args.reap else run(policy)
     print(json.dumps(report, sort_keys=True))
-    return 1 if report["errors"] else 0
+    return 1 if report.get("errors") or report.get("retention_unresolved") else 0
 
 
 if __name__ == "__main__":

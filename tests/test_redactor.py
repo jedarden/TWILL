@@ -1,4 +1,5 @@
 import tempfile
+import json
 import unittest
 from pathlib import Path
 import sys
@@ -12,6 +13,39 @@ from twill_redactor import CONTENT_FENCE_MARKER, MAX_EXCERPT_LENGTH, Redactor  #
 
 
 class RedactorTests(unittest.TestCase):
+    def test_redacts_extended_secret_assignments_and_quoted_json_keys(self):
+        # Construct synthetic values at runtime; no captured credential belongs
+        # in the test suite, its failure output, or a fixture file.
+        value = "ab" * 64
+        names = ("client_secret", "secret_key", "access_key", "private_key", "refresh_token",
+                 "api_key", "access_token", "auth_token", "password", "secret", "token")
+        redactor = Redactor()
+        for name in names:
+            for key in (name, name.replace("_", "-"), name.upper()):
+                for quote in ("", "'", '"'):
+                    with self.subTest(key=key, quote=quote):
+                        text = f"{quote}{key}{quote} = {quote}{value}{quote}, next=ordinary"
+                        self.assertEqual(redactor.redact_text(text),
+                                         f"{quote}{key}{quote} = {quote}<redacted:secret>{quote}, next=ordinary")
+                with self.subTest(json_key=key):
+                    encoded = json.dumps({key: value, "ordinary": "preserved"})
+                    self.assertEqual(json.loads(redactor.redact_text(encoded)),
+                                     {key: "<redacted:secret>", "ordinary": "preserved"})
+
+    def test_long_client_secret_is_redacted_before_excerpt_truncation(self):
+        value = "ab" * 64
+        text = "context " * 20 + json.dumps({"client_secret": value})
+        redactor = Redactor()
+        safe = redactor.redact_text(text)
+        self.assertNotIn(value, safe)
+        self.assertIn("<redacted:secret>", safe)
+        self.assertEqual(redactor.redact_excerpt(text), safe[:MAX_EXCERPT_LENGTH])
+        self.assertEqual(redactor.redact_text(safe), safe)
+
+    def test_credential_field_suffixes_are_not_assignments(self):
+        text = 'client_secret_hint="ordinary" private_key_path="/synthetic/example"'
+        self.assertEqual(Redactor().redact_text(text), text)
+
     def test_redacts_the_documented_credential_inventory(self):
         cases = (
             ("GitHub classic ghp token", "gh" + "p_0123456789ab", "<redacted:github-token>"),
@@ -67,6 +101,11 @@ class RedactorTests(unittest.TestCase):
         for name, value, expected in cases:
             with self.subTest(name=name):
                 self.assertEqual(redactor.redact_text(f"prefix {value} suffix"), f"prefix {expected} suffix")
+                if name == "PEM private-key block":
+                    block = value.removeprefix("before\n").removesuffix("\nafter")
+                    field = "private" + "_key"
+                    self.assertEqual(redactor.redact_text(field + "=" + block),
+                                     field + "=<redacted:secret>")
 
     def test_documented_case_insensitive_patterns(self):
         cases = (

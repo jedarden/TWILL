@@ -46,16 +46,19 @@ CREDENTIAL_PATTERNS = (
     ),
     (
         re.compile(
-            r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|password|secret|token)\s*[:=]\s*)(['\"]?)[^\s,'\"]+"
-        ),
-        r"\1\2<redacted:secret>",
-    ),
-    (
-        re.compile(
-            r"-----BEGIN [A-Z ]+ PRIVATE KEY-----.*?-----END [A-Z ]+ PRIVATE KEY-----",
+            r"-{5}BEGIN [A-Z ]+ PRIVATE KEY-{5}.*?-{5}END [A-Z ]+ PRIVATE KEY-{5}",
             re.DOTALL,
         ),
         "<redacted:private-key>",
+    ),
+    # Redact complete PEM blocks before an assignment can consume their BEGIN.
+    (
+        re.compile(
+            r"(?i)(\b(?:api[_-]?key|access[_-]?token|auth[_-]?token|client[_-]?secret|"
+            r"(?:secret|access|private)[_-]?key|refresh[_-]?token|password|secret|token)"
+            r"['\"]?\s*[:=]\s*)(['\"]?)[^\s,'\"]+"
+        ),
+        r"\1\2<redacted:secret>",
     ),
 )
 

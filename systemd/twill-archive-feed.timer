@@ -2,7 +2,8 @@
 Description=Refresh the optional TWILL raw archive input feed every five minutes
 
 [Timer]
-OnCalendar=*-*-* *:00/5:00
+OnCalendar=*-*-* *:03/5:00
+AccuracySec=1s
 RandomizedDelaySec=30s
 Persistent=true
 Unit=twill-archive-feed.service

@@ -265,6 +265,31 @@ both native formats, supplies the external feed and observes both providers in
 the scheduled no-model backfill. Full repository gates and deployment receipts
 remain required; complete corpus backfill is measured separately from deployment.
 
+## Contextual interpretation and consumed-source retention
+
+Owner `twill-9c77e50b` adds a high-recall native intervention pass and a separate
+contextual author/critic pass. The decision in the parent plan fixes scope,
+source authority, strict citations, frozen guidance and independent evaluation.
+Detection remains model-free; interpretation reserves a separate durable call
+budget and cannot select its own oracle. Exact human preferences retain adherence
+admission, inferred rules retain measured improvement, and unsupported candidates
+remain available for independent evaluation. Private compact episodes, reviews
+and interpretations preserve the evidence chain. Source withdrawal or verifier
+drift cannot leave a learned rule silently active.
+
+The producer may reclaim completed, byte-verified, unreferenced local snapshots
+after compact evidence is durable. Pending and active evidence stays pinned.
+Ownership errors fail closed, generation signatures prevent download loops, and
+the learning lock serializes ownership changes with deletion. Remote originals
+and live local sessions are outside deletion authority.
+
+Acceptance covers native multiline/contextual corrections and interactive answers
+for both providers, copied-session deduplication, ordinary-task/worker negatives,
+strict author/critic citations and source/context drift, durable call quotas,
+candidate lifecycle integration, and cap recovery without deleting pinned evidence.
+Real corpus calibration labels identify the reviewer and retain unknown outcomes;
+pipeline-stage counts never substitute for applied/validated lesson counts.
+
 ## 16. Open Questions
 
 None requiring a human decision. Native CLI constraints are a Phase 0 empirical gate owned by the implementer; failure invokes Plan B rather than relaxing safety. N/A: HTTP API and

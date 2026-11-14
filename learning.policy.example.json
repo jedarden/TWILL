@@ -19,6 +19,19 @@
   "intervention_sources": [],
   "intervention_settle_seconds": 7200,
   "human_steering": {"enabled": false, "scopes": []},
+  "two_pass": {
+    "enabled": false,
+    "scopes": [],
+    "max_episode_chars": 32768,
+    "max_episodes_per_file": 32,
+    "max_episodes_per_cycle": 4,
+    "max_calls_per_cycle": 8,
+    "max_calls_per_day": 32,
+    "timeout_seconds": 90,
+    "retry_cooldown_seconds": 3600,
+    "author_provider": "claude",
+    "critic_provider": "codex"
+  },
   "discovery_limits": {"max_files_per_cycle": 128, "scan_seconds": 30, "inventory_per_glob": 512},
   "archive_feed": {"enabled": false},
   "bindings": []

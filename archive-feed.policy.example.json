@@ -15,5 +15,12 @@
   "max_sessions": 64,
   "max_bytes": 268435456,
   "max_seconds": 120,
-  "max_cache_bytes": 4294967296
+  "max_cache_bytes": 4294967296,
+  "retention": {
+    "enabled": false,
+    "learning_root": "/SET_PRIVATE_CANONICAL_PATH/artifacts",
+    "max_files": 1024,
+    "max_bytes": 1073741824,
+    "max_seconds": 20
+  }
 }

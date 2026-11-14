@@ -6,6 +6,7 @@ import tempfile
 import unittest
 import argparse
 from contextlib import redirect_stdout
+from datetime import datetime, timezone
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -250,6 +251,12 @@ class DetectCommandHookDenialTests(unittest.TestCase):
     """The detect verb's denial-log wiring end to end."""
 
     def setUp(self):
+        # Keep the fixed October evidence inside its intended trailing window
+        # regardless of the calendar date on which the CLI wiring is tested.
+        clock = patch.object(twill_detectors, "_clock", return_value=datetime(
+            2026, 10, 16, 12, tzinfo=timezone.utc))
+        clock.start()
+        self.addCleanup(clock.stop)
         self._temporary = tempfile.TemporaryDirectory()
         self.addCleanup(self._temporary.cleanup)
         self.state_dir = Path(self._temporary.name) / "state"

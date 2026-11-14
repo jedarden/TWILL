@@ -1450,3 +1450,32 @@ and provenance remain private and bounded. Core parsing and learning keep
 working with local sources when this optional feed is absent. Discovery has a
 separate no-model cadence and fair resumable native-source queue. Concrete
 operation and limits are specified in [learning-operations.md](../notes/learning-operations.md).
+
+### Contextual learning and cache consumption decision (2026-11-14)
+
+The authorized lifecycle now includes two distinct extraction passes. With
+`two_pass.enabled`, normalized native Claude and Codex events produce bounded
+intervention episodes, including multiline steering and interactive human answers.
+This replaces narrow raw directive scans; existing extracted sources remain valid
+inputs. Episodes retain neighboring assistant/tool events, native identity, exact
+source hashes, and an explicitly unknown outcome when executor evidence is absent.
+Historical steering supplies evidence, never present authority.
+
+A native author and independent critic interpret episodes against frozen existing
+guidance. Their strict, cited dispositions distinguish task-only requests, existing
+coverage, code/configuration fixes, uncertain cases, and candidate lessons. An
+interpretation cannot supply its own trusted oracle. New candidates enter the
+existing independent experiment/apply/revalidate/remove lifecycle; unsupported
+evaluators remain visible as needing evaluation. Exact durable human instructions
+may use adherence plus guardrails; inferred generalizations require measured
+improvement. Both providers remain mandatory. Interpretation has separate durable
+daily and per-cycle native-call budgets, including version probes.
+
+Raw cache reclamation requires a full completed parser cursor, an exact hash and
+fingerprint receipt, durable compact evidence, and no live evidence owner. Missing
+or malformed ownership state fails closed. Only producer-owned local cache bytes
+can be reclaimed; remote originals and local interactive transcripts remain intact.
+Consumed archive generation signatures prevent repeated export of reclaimed inputs;
+new generations remain eligible. Calibration reviews and stage metrics stay in the
+private artifacts repository. Completion of discovery or interpretation does not
+claim a lesson was validated or applied.

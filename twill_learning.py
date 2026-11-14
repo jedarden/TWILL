@@ -118,6 +118,11 @@ class Controller:
         if policy.get("schema") != POLICY_SCHEMA or policy.get("enabled") is not True:
             raise LearningError("learning requires an enabled v1 policy")
         self.policy = policy
+        from twill_intervention_interpret import validate_policy as validate_two_pass
+        self.two_pass = validate_two_pass(policy)
+        if self.two_pass["enabled"]:
+            from twill_intervention_mining import validate_policy as validate_mining
+            validate_mining(policy)
         from twill_human_steering import validate_policy as validate_steering_policy
         validate_steering_policy(policy)
         from twill_source_discovery import validate_limits
@@ -233,7 +238,20 @@ class Controller:
             source_payload = json.loads(source_path.read_text())
         except ValueError:
             source_payload = None
-        if isinstance(source_payload, dict) and source_payload.get("schema") == "twill-human-steering/v1":
+        if isinstance(source_payload, dict) and source_payload.get("schema") == "twill-intervention-interpretation/v1":
+            from twill_intervention_interpret import verified_candidate
+            candidate = verified_candidate(source_path, self.policy)
+            if candidate is None or candidate["instruction"].strip() != instruction:
+                raise LearningError("interpreted lesson requires a verified exact candidate instruction")
+            expected_kind = "human_directed" if candidate["kind"] == "human_directed" else "inferred"
+            if scope != candidate["scope"] or spec.get("kind", expected_kind) != expected_kind:
+                raise LearningError("interpreted lesson scope and kind must match verified source")
+            kind = expected_kind
+            source_evidence = self.interpreted_source_evidence(candidate)
+            self.check_human_sources(source_evidence)
+            from twill_human_steering import classify
+            evaluator = classify(instruction) if kind == "human_directed" else None
+        elif isinstance(source_payload, dict) and source_payload.get("schema") == "twill-human-steering/v1":
             from twill_human_steering import verify, resolve_scope, classify
             source_evidence = verify(source_path, instruction)
             if not source_evidence.get("complete"):
@@ -274,6 +292,8 @@ class Controller:
         return self.save(record, "created")
 
     def suite(self, record: dict) -> dict:
+        if record.get("source_evidence", {}).get("type") == "interpreted-intervention":
+            self.interpreted_evidence(record)
         human = record.get("kind") == "human_directed"
         if human:
             self.human_evidence(record)
@@ -307,7 +327,38 @@ class Controller:
             raise LearningError("evaluation needs a training case")
         return suite
 
+    def interpreted_source_evidence(self, candidate: dict) -> dict:
+        """Derive provenance from reverified native sources, never supplied flags."""
+        from twill_intervention_mining import verify_episode
+        episode = verify_episode(Path(candidate["source_evidence"]["episode_path"]))
+        evidence = dict(candidate["source_evidence"])
+        sources = {ref["source_path"]: ref["file_sha256"] for ref in episode["turns"]}
+        evidence.update(complete=True, raw_sources=[{"path": path, "sha256": sha} for path, sha in sorted(sources.items())],
+                        instruction=candidate["instruction"], scope=candidate["scope"],
+                        durable_intent=candidate["durable_intent"], explicit_authority=candidate["explicit_authority"])
+        return evidence
+
+    def interpreted_evidence(self, record: dict) -> dict:
+        from twill_intervention_interpret import verified_candidate
+        owned_blocks = {entry["path"]: entry["addition"] for entry in (record.get("application") or {}).get("files", [])
+                        if self.block(record) in entry.get("addition", "")}
+        candidate = verified_candidate(Path(record["source"]["path"]), self.policy, owned_blocks=owned_blocks)
+        if candidate is None:
+            raise LearningError("interpreted source no longer verifies")
+        kind = "human_directed" if candidate["kind"] == "human_directed" else "inferred"
+        from twill_human_steering import classify
+        evaluator = classify(candidate["instruction"]) if kind == "human_directed" else None
+        evidence = self.interpreted_source_evidence(candidate)
+        self.check_human_sources(evidence)
+        if (record["instruction"] != candidate["instruction"].strip() or record["scope"] != candidate["scope"]
+                or record.get("kind") != kind or record.get("source_evidence") != evidence
+                or record.get("evaluator") != evaluator):
+            raise LearningError("interpreted instruction, scope, intent or enrollment changed")
+        return evidence
+
     def human_evidence(self, record: dict) -> dict:
+        if record.get("source_evidence", {}).get("type") == "interpreted-intervention":
+            return self.interpreted_evidence(record)
         from twill_human_steering import verify, resolve_scope, classify
         evidence = verify(Path(record["source"]["path"]), record["instruction"])
         self.check_human_sources(evidence)
@@ -327,9 +378,12 @@ class Controller:
     def source_current(self, record: dict) -> bool:
         path = Path(record["source"]["path"])
         current = path.is_file() and not path.is_symlink() and digest(path.read_bytes()) == record["source"]["sha256"]
-        if current and record.get("kind") == "human_directed":
+        if current and (record.get("kind") == "human_directed" or record.get("source_evidence", {}).get("type") == "interpreted-intervention"):
             try:
-                self.human_evidence(record)
+                if record.get("source_evidence", {}).get("type") == "interpreted-intervention":
+                    self.interpreted_evidence(record)
+                else:
+                    self.human_evidence(record)
             except (LearningError, OSError, ValueError):
                 return False
         return current
@@ -374,6 +428,12 @@ class Controller:
             import twill_human_steering
             if receipt.get("steering_sha") != digest(Path(twill_human_steering.__file__).read_bytes()):
                 raise LearningError("human steering verifier changed since experiment")
+        if record.get("source_evidence", {}).get("type") == "interpreted-intervention":
+            import twill_intervention_mining
+            import twill_intervention_interpret
+            for name, module in (("miner_sha", twill_intervention_mining), ("interpreter_sha", twill_intervention_interpret)):
+                if receipt.get(name) != digest(Path(module.__file__).read_bytes()):
+                    raise LearningError("intervention evidence verifier changed since experiment")
         if any("oracle" in case for case in suite["cases"]):
             import twill_execution_oracle
             if receipt.get("execution_sha") != digest(Path(twill_execution_oracle.__file__).read_bytes()):
@@ -442,6 +502,11 @@ class Controller:
         if record.get("kind") == "human_directed":
             import twill_human_steering
             record["experiments"][-1]["steering_sha"] = digest(Path(twill_human_steering.__file__).read_bytes())
+        if record.get("source_evidence", {}).get("type") == "interpreted-intervention":
+            import twill_intervention_mining
+            import twill_intervention_interpret
+            record["experiments"][-1]["miner_sha"] = digest(Path(twill_intervention_mining.__file__).read_bytes())
+            record["experiments"][-1]["interpreter_sha"] = digest(Path(twill_intervention_interpret.__file__).read_bytes())
         if any("oracle" in case for case in suite["cases"]):
             import twill_execution_oracle
             record["experiments"][-1]["execution_sha"] = digest(Path(twill_execution_oracle.__file__).read_bytes())
@@ -664,7 +729,7 @@ class Controller:
     def publish(self) -> dict:
         """Publish only this controller's durable private evidence files."""
         inventory = []
-        for namespace in ("records", "history", "experiments", "sources"):
+        for namespace in ("records", "history", "experiments", "sources", "interventions", "interpretations", "intervention-reviews"):
             for path in sorted((self.store / namespace).rglob("*.json")):
                 if path.is_symlink() or path.absolute() != path.resolve():
                     raise LearningError("private evidence path cannot be redirected")
@@ -728,11 +793,12 @@ class Controller:
     def import_sources(self) -> int:
         """Route verified role-bearing intervention extractions without a hand binding."""
         from twill_learning_intake import resolve, catalog_instruction, discover_sources
-        if self.policy.get("auto_evaluators"):
+        if not self.two_pass["enabled"] and self.policy.get("auto_evaluators"):
             discover_sources(self.policy, self.root)
         from twill_human_steering import discover as discover_steering, verify, resolve_scope
-        discover_steering(self.policy, self.root)
-        count = 0
+        if not self.two_pass["enabled"]:
+            discover_steering(self.policy, self.root)
+        count = self.import_interpretations() if self.two_pass["enabled"] else 0
         for path in sorted((self.store / "sources").glob("*.json")):
             if path.name.startswith("."):
                 continue
@@ -783,8 +849,41 @@ class Controller:
                 self.save(record, "intake_disposition", evaluator=evaluator)
         return count
 
+    def import_interpretations(self) -> int:
+        from twill_intervention_interpret import verified_candidates
+        count = 0
+        for candidate in verified_candidates(self.policy, self.root):
+            before = {r["id"] for r in self.records()}
+            kind = "human_directed" if candidate["kind"] == "human_directed" else "inferred"
+            record = self.create({"instruction": candidate["instruction"], "scope": candidate["scope"], "kind": kind,
+                                  "source": {"path": candidate["source"], "detector": "contextual-intervention"}})
+            count += record["id"] not in before
+            if record["state"] == "draft":
+                try:
+                    self.suite(record)
+                except LearningError as exc:
+                    record.update(state="needs_evaluation", reason=redact_text(str(exc))[:500])
+                    self.save(record, "evaluation_unavailable")
+        return count
+
+    def interpret(self, limit: int | None = None) -> dict:
+        """Run the explicitly enrolled contextual pass; no delivery side effects."""
+        from twill_intervention_interpret import interpret
+        result = interpret(self.policy, self.root, self.work, self.providers, limit=limit)
+        result["imported"] = self.import_interpretations() if self.two_pass["enabled"] else 0
+        atomic(self.store / "interpretation-status.json", canonical(result))
+        # CLI summaries contain state/references, never private instruction prose.
+        result["candidates"] = [{key: candidate[key] for key in ("interpretation_id", "episode_id", "scope", "kind", "assessment")}
+                                for candidate in result["candidates"]]
+        return result
+
     def cycle(self) -> dict:
         started_at = stamp()
+        interpretation = None
+        if self.two_pass["enabled"]:
+            from twill_intervention_mining import discover
+            discover(self.policy, self.root)
+            interpretation = self.interpret()
         imported = self.import_sources() + self.import_drafts()
         results = []
         spent = 0
@@ -836,8 +935,8 @@ class Controller:
                     self.save(record, "evaluation_unavailable")
                 results.append({"id": record["id"], "state": record["state"],
                                 "attention": redact_text(str(exc))[:500]})
-        summary = {"schema": SCHEMA, "started_at": started_at, "at": stamp(), "imported": imported,
-                   "attempted": spent,
+        summary = {"schema": SCHEMA, "started_at": started_at, "at": stamp(), "imported": imported + (interpretation.get("imported", 0) if interpretation else 0),
+                   "interpretation": interpretation, "attempted": spent,
                    "experimented": sum(len(r["experiments"]) for r in self.records()) - before_experiments,
                    "results": results}
         summary["input_coverage"] = self.input_coverage()
@@ -852,6 +951,9 @@ class Controller:
 
     def discover(self) -> dict:
         """Advance input backfill without making native model requests."""
+        if self.two_pass["enabled"]:
+            from twill_intervention_mining import discover
+            discover(self.policy, self.root)
         imported = self.import_sources() + self.import_drafts()
         summary = {"schema": SCHEMA, "at": stamp(), "imported": imported,
                    "experimented": 0, "input_coverage": self.input_coverage(),
@@ -862,6 +964,15 @@ class Controller:
     def input_coverage(self) -> dict:
         from twill_source_discovery import discovery_coverage
         coverage = {"discovery": discovery_coverage(self.root)}
+        if self.two_pass["enabled"]:
+            from twill_intervention_mining import metrics
+            coverage["interventions"] = metrics(self.root)
+            interpretation_status = self.store / "interpretation-status.json"
+            if interpretation_status.exists():
+                status = read_json(interpretation_status)
+                coverage["interpretation"] = {key: status.get(key) for key in ("enabled", "processed", "calls", "daily_calls", "dispositions", "errors")}
+            else:
+                coverage["interpretation"] = {"enabled": True, "processed": 0, "calls": 0}
         feed = self.policy.get("archive_feed", {})
         if feed.get("enabled") is True:
             path = safe_path(feed["status_path"])
@@ -915,6 +1026,8 @@ def main(argv: list[str] | None = None) -> int:
             command.add_argument("--reason", required=True)
     sub.add_parser("cycle")
     sub.add_parser("discover")
+    interpret_command = sub.add_parser("interpret")
+    interpret_command.add_argument("--limit", type=int)
     sub.add_parser("status")
     sub.add_parser("doctor")
     # Accept --json in the familiar post-subcommand position too.
@@ -944,6 +1057,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = controller.cycle()
             elif args.command == "discover":
                 result = controller.discover()
+            elif args.command == "interpret":
+                result = controller.interpret(args.limit)
             else:
                 result = getattr(controller, args.command)(args.id)
             if args.command not in {"status", "doctor"}:

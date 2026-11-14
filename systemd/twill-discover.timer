@@ -3,6 +3,7 @@ Description=Advance bounded TWILL transcript discovery every five minutes
 
 [Timer]
 OnCalendar=*-*-* *:00/5:00
+AccuracySec=1s
 RandomizedDelaySec=15s
 Persistent=true
 Unit=twill-discover.service

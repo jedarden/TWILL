@@ -226,8 +226,8 @@ within one generation. A complete observed archived generation is not a claim
 that the original session ended. Unsettled, gapped, corrupt or unsupported input
 is unknown and cannot become a complete native transcript. Seeded pilot scopes
 are reported as partial rather than a full corpus sweep. Total cache size and
-per-run page/reference/session/byte/time budgets bound work; a storage limit
-requires explicit capacity management and never deletes archive data.
+per-run page/reference/session/byte/time budgets bound work. Optional consumption
+retention reclaims verified local cache snapshots and never deletes archive data.
 
 Enroll only `FEED_ROOT/current/claude-code/**/*.jsonl` and
 `FEED_ROOT/current/codex/**/*.jsonl` in `intervention_sources`, alongside local
@@ -257,8 +257,9 @@ files; legacy JSON cursors migrate. It is rebuildable derived state, never the
 source of human authority. The five-minute discovery timer makes no model calls;
 the hourly learning timer retains experiment limits. `input_coverage` reports
 known/completed/pending/visited/error counts and backfill progress. Completed
-means the native scan finished, including unsupported or malformed input; it
-does not mean a lesson was accepted. An empty
+means that consumer finished its scan; it does not mean a lesson was accepted.
+The contextual consumer withholds consumption receipts for malformed or partial
+input. An empty
 candidate queue never establishes an empty transcript corpus.
 
 Installation preserves existing policy files and does not enable optional timers
@@ -268,3 +269,57 @@ needed by active lessons; deleting or replacing current raw sources withdraws
 human exposures during reconciliation. Credential recovery uses the operator's
 original secret reference. Rebuilding queue metadata from enrolled originals
 does not require restoring a learned rule or weakening an audit guard.
+
+## Contextual two-pass learning
+
+Enable `two_pass` in the private learning policy and enroll exact `scopes` and
+native `intervention_sources`. The example lists all supported budgets. Discovery
+uses the original Claude/Codex readers and collects compact surrounding episodes,
+including interactive human answers. Multiline steering does not need a directive
+prefix. Native identities deduplicate copied/snapshotted exchanges. Automatic
+worker prompts, quoted history and ordinary task starts are tracked separately;
+sampled negatives support calibration. Truncation, parser errors and ambiguous
+origin remain visible and never prove completed consumption or human authority.
+Negative calibration uses short excerpts with native locators; only possible
+interventions retain the larger context window. Redacted instructions cannot
+become candidate rules.
+
+`twill-learning discover` performs pass one without model calls. The hourly
+`cycle` performs pass two and imports verified candidates; `twill-learning
+interpret` explicitly runs the interpretation stage. The author and independent
+critic use different native providers, without host tools, against frozen guidance.
+Strict JSON and exact transcript citations bind each disposition to its source.
+Daily calls are reserved durably before invocation; version probes also consume
+quota. Timeout/error results wait for the configured retry cooldown. Interpretation
+budgets are separate from paired lesson experiment budgets.
+
+Inspect `input_coverage` and private `learning/interventions/` and
+`learning/interpretations/`. Distinguish detected, interpreted, candidate,
+experimented, validated and applied counts. A code/configuration fix is a useful
+disposition without manufacturing a prompt rule. Unknown observed outcomes can
+produce hypotheses; they cannot supply successful execution evidence. An explicit
+preference still needs adherence and counterexamples; inferred rules still need
+improvement. Missing trusted evaluators leave candidates needing evaluation.
+
+Keep calibration annotations separately in `learning/intervention-reviews/` with
+episode ID, reviewer, expected signal/disposition, rationale and whether a human
+actually reviewed them. Agent labels must not be reported as human-reviewed.
+Review both native formats and ordinary-task negatives, and inspect surrounding
+turns and interactive answers. Repeated worker prompts and copied sessions are
+not independent incidents. No real calibration text belongs in this public tree.
+
+Enable producer `retention` with an exact private `learning_root` and bounded
+file/byte/time budgets. Manual reclamation is available through the producer's
+`--reap` option. It also runs before a cache-cap hold. Reclamation requires
+matching full-source hash/fingerprint, completed parser cursor and durable compact
+evidence. Pending/active evidence stays pinned; missing ownership or a busy
+learning lock skips deletion. Only producer-owned current snapshots and unlinked
+immutable objects qualify. Consumed generation signatures prevent re-downloading
+the same snapshot, while a changed generation remains eligible. Inspect retention
+counts and bytes alongside the archive cache limit; a cap blocked by pins requires
+processing those owners rather than increasing capacity blindly.
+
+The archive timer runs three minutes after each discovery tick. Both use
+one-second calendar accuracy so routine discovery does not repeatedly occupy the
+learning lock when the producer needs to reclaim cache. A long model cycle may
+still defer reclamation to a later tick; busy retention never deletes evidence.
