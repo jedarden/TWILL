@@ -1,10 +1,13 @@
 [Unit]
 Description=Experiment, validate and reconcile policy-scoped TWILL lessons
 ConditionPathExists=%h/.config/twill/learning.json
+After=twill-discover.service
 
 [Service]
 Type=oneshot
 ExecStart=/usr/bin/env %h/.local/bin/twill-learning cycle
+# A busy state lock defers this tick; health and publication failures still fail.
+SuccessExitStatus=3
 MemoryMax=2G
 CPUQuota=100%
 TimeoutStartSec=35min

@@ -10,7 +10,8 @@ ExecStart=/usr/bin/env %h/.local/bin/twill-learning discover
 SuccessExitStatus=3
 MemoryMax=2G
 CPUQuota=100%
-TimeoutStartSec=3min
+# Bounded intake passes and private evidence publication share this budget.
+TimeoutStartSec=8min
 TimeoutStopSec=15s
 KillMode=control-group
 UMask=0077

@@ -385,3 +385,9 @@ Full semantic trials use one case per judge batch. Judges cite supplied output
 line IDs, which the controller resolves to exact text and content hashes; invalid
 line IDs fail closed. This keeps batches bounded and preserves exact grounding
 without depending on a model reproducing punctuation or whitespace.
+
+The learning service waits for an already queued discovery service before
+starting. Exit code 3 means the shared state lock is held and defers a timer
+tick; other health and publication failures remain failures. Discovery has an
+eight-minute service budget for its bounded intake passes and private evidence
+publication during historical backfill.
