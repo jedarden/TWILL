@@ -1,6 +1,8 @@
 """Adverse delivery/recovery cases for the opt-in learning controller."""
 
 import copy
+import contextlib
+import io
 import json
 import tempfile
 import types
@@ -8,7 +10,7 @@ import unittest
 from pathlib import Path
 from unittest import mock
 
-from twill_learning import Controller, LearningError, POLICY_SCHEMA, digest
+from twill_learning import Controller, LearningError, POLICY_SCHEMA, digest, main
 
 
 class LearningCycleTests(unittest.TestCase):
@@ -54,6 +56,170 @@ class LearningCycleTests(unittest.TestCase):
     def active(self):
         self.controller.experiment(self.id)
         return self.controller.apply(self.id)
+
+    def rejected(self):
+        result = copy.deepcopy(self.result)
+        result["verdict"] = "hold"
+        for provider in result["providers"].values():
+            provider.update(candidate_passed=False, holdout_passed=False, verdict="regressed",
+                            counts={"baseline": {"pass": 0, "fail": 6, "error": 0},
+                                    "candidate": {"pass": 0, "fail": 6, "error": 0}})
+        self.adapter.run_experiment.side_effect = lambda *a, **k: copy.deepcopy(result)
+        record = self.controller.experiment(self.id)
+        self.assertEqual(record["state"], "rejected")
+        self.adapter.run_experiment.side_effect = lambda *a, **k: copy.deepcopy(self.result)
+        return record
+
+    def revised_suite(self):
+        suite = json.loads(self.suite.read_text())
+        suite["cases"].append({"id": "fresh-holdout", "split": "holdout",
+                               "prompt": "Complete the remaining authorized review",
+                               "expect": {"contains": ["finish"]}})
+        self.suite = self.root / "revised-suite.json"
+        self.suite.write_text(json.dumps(suite))
+        self.policy["bindings"] = [{"scope": "repo", "lesson_id": self.id,
+                                    "suite": str(self.suite), "suite_sha256": digest(self.suite.read_bytes())}]
+        return suite
+
+    def test_reconsider_creates_fresh_draft_and_preserves_terminal_history(self):
+        parent = self.rejected()
+        protected = [self.controller.path(self.id), self.suite,
+                     *list((self.controller.store / "history" / self.id).glob("*.json")),
+                     self.controller.store / parent["experiments"][-1]["path"]]
+        before = {path: path.read_bytes() for path in protected}
+        revised = self.revised_suite()
+        self.adapter.run_experiment.reset_mock()
+        child = self.controller.reconsider(self.id, "  Independently revised holdout coverage.  ")
+        expected = "LC-" + digest({"reevaluation_of": self.id, "source_sha": parent["source"]["sha256"],
+                                   "instruction_sha": parent["instruction_sha"], "suite_sha": digest(revised)})[:16]
+        self.assertEqual(child["id"], expected)
+        self.assertEqual(child["state"], "draft")
+        self.assertEqual(child["evaluation_parent"], self.id)
+        self.assertEqual(child["evaluation_suite_sha"], digest(revised))
+        self.assertEqual(child["reconsideration_reason"], "Independently revised holdout coverage.")
+        for field in ("instruction", "instruction_sha", "source", "scope", "kind", "evaluator", "source_evidence"):
+            self.assertEqual(child[field], parent[field])
+        self.assertEqual(child["experiments"], [])
+        self.assertIsNone(child["application"])
+        self.assertNotIn("assessment", child)
+        self.assertNotIn("validated_policy_sha", child)
+        self.adapter.run_experiment.assert_not_called()
+        self.assertEqual({path: path.read_bytes() for path in protected}, before)
+        self.assertEqual(self.controller.suite(child), revised)
+        with self.assertRaises(LearningError):
+            self.controller.apply(child["id"])
+
+        # Neither an old receipt nor one provider's new result can admit the child.
+        incomplete = copy.deepcopy(self.result)
+        incomplete["providers"].pop("claude")
+        self.adapter.run_experiment.side_effect = lambda *a, **k: incomplete
+        self.assertEqual(self.controller.experiment(child["id"])["state"], "unvalidated")
+        with self.assertRaises(LearningError):
+            self.controller.apply(child["id"])
+        self.adapter.run_experiment.side_effect = lambda *a, **k: copy.deepcopy(self.result)
+        evaluated = self.controller.experiment(child["id"])
+        self.assertEqual(evaluated["state"], "validated")
+        self.assertEqual(len(evaluated["experiments"]), 2)
+        self.assertEqual(evaluated["experiments"][-1]["suite_sha"], digest(revised))
+        self.assertEqual(set(self.adapter.run_experiment.call_args.kwargs["providers"]), {"claude", "codex"})
+        self.assertEqual(self.controller.apply(child["id"])["state"], "active")
+        self.assertEqual({path: path.read_bytes() for path in protected}, before)
+
+    def test_reconsider_refuses_unchanged_or_unapproved_or_ambiguous_oracles(self):
+        self.rejected()
+        with self.assertRaisesRegex(LearningError, "revised independent suite"):
+            self.controller.reconsider(self.id, "Review the oracle")
+        # A new serialized file hash alone does not make a revised oracle.
+        unchanged = json.loads(self.suite.read_text())
+        self.suite = self.root / "reformatted-suite.json"
+        self.suite.write_text(json.dumps(unchanged, indent=2))
+        self.policy["bindings"][0]["suite"] = str(self.suite)
+        self.policy["bindings"][0]["suite_sha256"] = digest(self.suite.read_bytes())
+        with self.assertRaisesRegex(LearningError, "revised independent suite"):
+            self.controller.reconsider(self.id, "Formatting changed")
+        self.revised_suite()
+        self.policy["bindings"][0]["suite_sha256"] = "0" * 64
+        with self.assertRaisesRegex(LearningError, "update policy explicitly"):
+            self.controller.reconsider(self.id, "Unapproved suite drift")
+        self.policy["bindings"][0]["suite_sha256"] = digest(self.suite.read_bytes())
+        self.policy["bindings"].append(copy.deepcopy(self.policy["bindings"][0]))
+        with self.assertRaisesRegex(LearningError, "exactly one"):
+            self.controller.reconsider(self.id, "Ambiguous binding")
+        self.assertEqual(len(self.controller.records()), 1)
+
+    def test_reconsider_refuses_nonterminal_applied_untested_and_changed_sources(self):
+        parent = self.rejected()
+        self.revised_suite()
+        for state in ("draft", "validated", "active", "invalidated", "superseded", "conflict"):
+            self.controller.save({**parent, "state": state}, "synthetic-state")
+            with self.assertRaisesRegex(LearningError, "rejected, unapplied"):
+                self.controller.reconsider(self.id, "Revised independent suite")
+        self.controller.save({**parent, "application": {"files": []}}, "synthetic-exposure")
+        with self.assertRaisesRegex(LearningError, "rejected, unapplied"):
+            self.controller.reconsider(self.id, "Revised independent suite")
+        self.controller.save({**parent, "experiments": []}, "synthetic-no-evidence")
+        with self.assertRaisesRegex(LearningError, "prior experiment suite evidence"):
+            self.controller.reconsider(self.id, "Revised independent suite")
+        self.controller.save(parent, "restore-synthetic-parent")
+        self.source.write_text("Changed source")
+        with self.assertRaisesRegex(LearningError, "no longer current"):
+            self.controller.reconsider(self.id, "Revised independent suite")
+        self.assertEqual(len(self.controller.records()), 1)
+
+    def test_reconsider_is_idempotent_without_resetting_terminal_child(self):
+        self.rejected()
+        self.revised_suite()
+        child = self.controller.reconsider(self.id, "Revised independent suite")
+        failed = copy.deepcopy(self.result)
+        failed["verdict"] = "hold"
+        for provider in failed["providers"].values():
+            provider.update(candidate_passed=False, holdout_passed=False,
+                            counts={"baseline": {"pass": 0, "fail": 8, "error": 0},
+                                    "candidate": {"pass": 0, "fail": 8, "error": 0}})
+        self.adapter.run_experiment.side_effect = lambda *a, **k: failed
+        terminal = self.controller.experiment(child["id"])
+        self.assertEqual(terminal["state"], "rejected")
+        before = self.controller.path(child["id"]).read_bytes()
+        again = self.controller.reconsider(self.id, "A repeated operator request")
+        self.assertEqual((again["id"], again["state"], again["revision"]),
+                         (child["id"], "rejected", terminal["revision"]))
+        self.assertEqual(self.controller.path(child["id"]).read_bytes(), before)
+
+    def test_reconsider_child_stays_bound_to_its_exact_suite_and_parent(self):
+        self.rejected()
+        self.revised_suite()
+        child = self.controller.reconsider(self.id, "Revised independent suite")
+        forged = copy.deepcopy(child)
+        forged["source"]["detector"] = "D-99"
+        with self.assertRaisesRegex(LearningError, "exact parent"):
+            self.controller.suite(forged)
+        suite = json.loads(self.suite.read_text())
+        suite["cases"][-1]["prompt"] = "A later distinct holdout"
+        self.suite.write_text(json.dumps(suite))
+        self.policy["bindings"][0]["suite_sha256"] = digest(self.suite.read_bytes())
+        with self.assertRaisesRegex(LearningError, "reconsideration suite changed"):
+            self.controller.experiment(child["id"])
+        self.assertEqual(self.controller.load(child["id"])["experiments"], [])
+
+    def test_reconsider_cli_requires_precise_nonblank_safe_reason(self):
+        self.rejected()
+        self.revised_suite()
+        policy_path = self.root / "policy.json"
+        policy_path.write_text(json.dumps(self.policy))
+        args = ["--policy", str(policy_path), "reconsider", self.id]
+        with contextlib.redirect_stderr(io.StringIO()), self.assertRaises(SystemExit) as raised:
+            main(args)
+        self.assertEqual(raised.exception.code, 2)
+        for reason, message in [(" ", "1..1000"), ("x" * 1001, "1..1000"),
+                                ("credential sk-" + "a" * 30, "credential-shaped")]:
+            output = io.StringIO()
+            with contextlib.redirect_stdout(output), contextlib.redirect_stderr(output):
+                self.assertEqual(main(args + ["--reason", reason]), 4)
+            self.assertIn(message, output.getvalue())
+        output = io.StringIO()
+        with contextlib.redirect_stdout(output), mock.patch.object(Controller, "publish", return_value={"published": False}):
+            self.assertEqual(main(args + ["--reason", "Reviewed independent oracle correction"]), 0)
+        self.assertEqual(json.loads(output.getvalue())["data"]["state"], "draft")
 
     def test_full_cycle_requires_both_agents_and_removes_only_owned_text(self):
         self.assertEqual(self.active()["state"], "active")

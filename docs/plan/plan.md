@@ -1495,3 +1495,11 @@ Other verified owned additions preserve source identity but still change the
 evaluation context and require retesting. Credential redaction and persistent
 reference-only privacy holds precede publication; neither privacy scanner is
 bypassed. Independent suites remain separate from candidate-author suggestions.
+
+A rejection remains terminal for its evaluated oracle. When independent review
+establishes an oracle defect, an explicit operator binding to a revised suite
+permits `reconsider` to create a separate, suite-pinned version. Preserve the
+rejected parent and every prior report; copy only the unchanged source-backed
+instruction and provenance. The child inherits no experiments, admission or
+application and requires fresh dual-provider trials. An unchanged suite cannot
+reopen a rejection, and routine cycles never invoke reconsideration.

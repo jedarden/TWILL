@@ -75,6 +75,24 @@ without accepting them; absent a trusted catalog admission or an approved
 binding, it records `needs_evaluation`. Inconclusive trials remain unvalidated. Complete redundant
 or harmful evidence produces a terminal rejection rather than repeated retries.
 
+When an independently reviewed oracle needs correction, preserve the rejected
+record, original suite and reports. Explicitly bind the revised suite and its
+hash in operator policy, then use `reconsider ID --reason REASON`. This creates
+a deterministic child draft pinned to the revised suite; it copies the exact
+source-backed instruction and provenance, with no previous experiment or
+passing assessment. The parent must be rejected, unapplied, previously tested
+and source-current. An unchanged suite, unapproved hash or ambiguous binding
+cannot create the child. Repeating the command for the same parent and suite
+returns that child without resetting its state. Normal cycles never reconsider
+a rejection. Both providers must complete fresh trials before the child can be
+applied, and subsequent suite drift requires another explicit version rather
+than reusing its evidence. A child may inherit its exact parent's policy lesson
+binding; all scope, source and binding checks still apply.
+
+```sh
+twill-learning reconsider LC-fedcba9876543210 --reason "Independent oracle revised"
+```
+
 Supported source types use `auto_evaluators`: enroll a catalog name and exact
 scope names once, with `global:true` or source `launchdirs` on each scope.
 The controller verifies evidence, routes the source and instantiates independent

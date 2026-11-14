@@ -8,6 +8,7 @@ transcripts, lesson text and model outputs cannot grant delivery authority.
 from __future__ import annotations
 
 import argparse
+import copy
 import fnmatch
 import hashlib
 import json
@@ -290,7 +291,31 @@ class Controller:
                   "application": None, "reason": "awaiting independent evaluation"}
         return self.save(record, "created")
 
-    def suite(self, record: dict) -> dict:
+    def _evaluation_parent(self, record: dict) -> str | None:
+        """Validate a reconsideration's lineage before inheriting a binding."""
+        parent_id = record.get("evaluation_parent")
+        suite_sha = record.get("evaluation_suite_sha")
+        if parent_id is None and suite_sha is None:
+            return None
+        if (not isinstance(parent_id, str) or not ID_RE.fullmatch(parent_id)
+                or not isinstance(suite_sha, str) or not re.fullmatch(r"[a-f0-9]{64}", suite_sha)):
+            raise LearningError("invalid reconsideration lineage")
+        parent = self.load(parent_id)
+        if parent.get("state") != "rejected" or parent.get("application") is not None or not parent.get("experiments"):
+            raise LearningError("reconsideration parent must remain rejected and unapplied with prior evidence")
+        for field in ("instruction", "instruction_sha", "source", "scope", "kind", "evaluator", "source_evidence"):
+            if record.get(field) != parent.get(field):
+                raise LearningError("reconsideration must preserve the exact parent instruction and source")
+        expected = "LC-" + digest({"reevaluation_of": parent_id,
+                                    "source_sha": parent["source"]["sha256"],
+                                    "instruction_sha": parent["instruction_sha"],
+                                    "suite_sha": suite_sha})[:16]
+        if record["id"] != expected:
+            raise LearningError("reconsideration identity does not match its parent and suite")
+        return parent_id
+
+    def _select_suite(self, record: dict, *, require_binding: bool = False) -> dict:
+        parent_id = self._evaluation_parent(record)
         if record.get("source_evidence", {}).get("type") == "interpreted-intervention":
             self.interpreted_evidence(record)
         human = record.get("kind") == "human_directed"
@@ -299,8 +324,11 @@ class Controller:
         matches = [b for b in self.policy.get("bindings", [])
                    if b.get("scope") == record["scope"] and
                    (b.get("lesson_id") == record["id"] or
+                    (parent_id is not None and b.get("lesson_id") == parent_id) or
                     (human and b.get("instruction_sha256") == record["instruction_sha"]) or
                     (not human and b.get("detector") and b["detector"] == record["source"].get("detector")))]
+        if (require_binding or parent_id is not None) and len(matches) != 1:
+            raise LearningError("reconsideration requires exactly one explicit policy-bound independent suite")
         if not matches and human and record.get("evaluator"):
             from twill_learning_intake import catalog_suite
             suite = catalog_suite(record["evaluator"])
@@ -325,6 +353,55 @@ class Controller:
         if not any(c.get("split") == "train" for c in cases):
             raise LearningError("evaluation needs a training case")
         return suite
+
+    def suite(self, record: dict) -> dict:
+        suite = self._select_suite(record)
+        if record.get("evaluation_parent") is not None and digest(suite) != record["evaluation_suite_sha"]:
+            raise LearningError("reconsideration suite changed; create a new explicitly reconsidered version")
+        return suite
+
+    def reconsider(self, lesson_id: str, reason: str) -> dict:
+        """Start a fresh, suite-pinned draft without reopening terminal history."""
+        if not isinstance(reason, str) or not reason.strip() or len(reason.strip()) > 1000:
+            raise LearningError("reconsideration reason must contain 1..1000 nonblank characters")
+        reason = reason.strip()
+        if redact_text(reason) != reason:
+            raise LearningError("reconsideration reason contains credential-shaped content")
+        parent = self.load(lesson_id)
+        if parent.get("state") != "rejected" or parent.get("application") is not None:
+            raise LearningError("reconsideration requires a rejected, unapplied lesson")
+        experiments = parent.get("experiments")
+        if (not isinstance(experiments, list) or not experiments or not isinstance(experiments[-1], dict)
+                or not isinstance(experiments[-1].get("suite_sha"), str)
+                or not re.fullmatch(r"[a-f0-9]{64}", experiments[-1]["suite_sha"])):
+            raise LearningError("reconsideration requires prior experiment suite evidence")
+        if not self.source_current(parent):
+            raise LearningError("reconsideration source evidence is no longer current")
+        # Explicit operator policy selects the revised oracle. Ordinary suite()
+        # always enforces an existing child's pin, including during later trials.
+        suite_sha = digest(self._select_suite(parent, require_binding=True))
+        if suite_sha == experiments[-1]["suite_sha"]:
+            raise LearningError("reconsideration requires a revised independent suite")
+        child_id = "LC-" + digest({"reevaluation_of": lesson_id,
+                                   "source_sha": parent["source"]["sha256"],
+                                   "instruction_sha": parent["instruction_sha"],
+                                   "suite_sha": suite_sha})[:16]
+        if self.path(child_id).exists():
+            child = self.load(child_id)
+            if child.get("evaluation_parent") != lesson_id or child.get("evaluation_suite_sha") != suite_sha:
+                raise LearningError("reconsideration child identity conflicts with existing history")
+            self.suite(child)
+            return child
+        child = {field: copy.deepcopy(parent[field]) for field in
+                 ("instruction", "instruction_sha", "source", "scope", "kind", "evaluator", "source_evidence")
+                 if field in parent}
+        child.update(schema=SCHEMA, id=child_id, state="draft", created_at=stamp(),
+                     experiments=[], application=None, evaluation_parent=lesson_id,
+                     evaluation_suite_sha=suite_sha, reconsideration_reason=reason,
+                     reason="awaiting fresh independent evaluation under a revised suite")
+        self.suite(child)
+        return self.save(child, "reconsidered", evaluation_parent=lesson_id,
+                         suite_sha=suite_sha, reason=reason)
 
     def interpreted_source_evidence(self, candidate: dict) -> dict:
         """Derive provenance from reverified native sources, never supplied flags."""
@@ -1038,10 +1115,10 @@ def main(argv: list[str] | None = None) -> int:
     sub = parser.add_subparsers(dest="command", required=True)
     create = sub.add_parser("create")
     create.add_argument("--spec", type=Path, required=True)
-    for name in ("experiment", "apply", "validate", "invalidate"):
+    for name in ("experiment", "apply", "validate", "invalidate", "reconsider"):
         command = sub.add_parser(name)
         command.add_argument("id")
-        if name == "invalidate":
+        if name in {"invalidate", "reconsider"}:
             command.add_argument("--reason", required=True)
     sub.add_parser("cycle")
     sub.add_parser("discover")
@@ -1065,6 +1142,8 @@ def main(argv: list[str] | None = None) -> int:
                 result = controller.experiment(args.id, validation=True)
             elif args.command == "invalidate":
                 result = controller.invalidate(args.id, args.reason)
+            elif args.command == "reconsider":
+                result = controller.reconsider(args.id, args.reason)
             elif args.command in {"status", "doctor"}:
                 result = {"schema": SCHEMA, "lessons": [
                     {k: r.get(k) for k in ("id", "state", "scope", "kind", "reason", "revision", "evaluator", "assessment")}

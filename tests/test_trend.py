@@ -50,6 +50,42 @@ class WeeklyClusterTests(unittest.TestCase):
         self.connection = twill_schema.connect(Path(temporary.name) / "state")
         self.addCleanup(self.connection.close)
 
+    def test_filtered_replay_uses_sqlite_dependencies_and_preserves_results(self):
+        seed_observation(self.connection, "s1", NOW - timedelta(days=1))
+        self.connection.execute("INSERT INTO rule_doc(path, layer, sha, indexed_at) VALUES ('fixture', 'skill', 'sha', ?)", (NOW.isoformat(),))
+        self.connection.execute("INSERT INTO session_usage(session_id, cost_usd) VALUES ('s1', 1.0)")
+        self.connection.commit()
+        queries = (
+            "SELECT program AS key, count(*) AS sessions, count(*) AS events, min(ts_utc) AS first_seen, max(ts_utc) AS last_seen FROM observation GROUP BY program",
+            "WITH docs AS (SELECT path FROM \"RuLe_DoC\") SELECT 'docs' AS key, count(*) AS sessions, count(*) AS events, :window_start_utc AS first_seen, :window_start_utc AS last_seen FROM docs",
+            "SELECT 'all' AS key, total_changes() AS sessions, total_changes() AS events, :window_start_utc AS first_seen, :window_start_utc AS last_seen",
+        )
+        start, end = (NOW - timedelta(days=7)).isoformat(), NOW.isoformat()
+        for query in queries:
+            detector = twill_detectors.Detector("D-97", 1, "dependency fixture", query)
+            full = twill_trend._filtered_connection(self.connection, start, end)
+            filtered = twill_trend._filtered_connection(self.connection, start, end, detector=detector)
+            try:
+                args = {"window_start_utc": start, "window_days": 7}
+                self.assertEqual(full.execute(query, args).fetchall(), filtered.execute(query, args).fetchall())
+                if "GROUP BY program" in query:
+                    self.assertEqual(filtered.execute("SELECT count(*) FROM rule_doc").fetchone()[0], 0)
+                if "total_changes" in query:
+                    self.assertEqual(filtered.execute("SELECT count(*) FROM rule_doc").fetchone()[0], 1)
+            finally:
+                full.close()
+                filtered.close()
+
+    def test_uninspectable_replay_query_keeps_all_reference_rows(self):
+        self.connection.execute("INSERT INTO rule_doc(path, layer, sha, indexed_at) VALUES ('fixture', 'skill', 'sha', ?)", (NOW.isoformat(),))
+        self.connection.commit()
+        detector = twill_detectors.Detector("D-97", 1, "uninspectable fixture", "SELECT :unbound AS key")
+        filtered = twill_trend._filtered_connection(self.connection, (NOW - timedelta(days=7)).isoformat(), NOW.isoformat(), detector=detector)
+        try:
+            self.assertEqual(filtered.execute("SELECT count(*) FROM rule_doc").fetchone()[0], 1)
+        finally:
+            filtered.close()
+
     def test_gate_gap_replays_into_weekly_series_and_trend(self):
         for session_id, day, kind, command in (
             ("a", 14, "run_succeeded", "protected command"),

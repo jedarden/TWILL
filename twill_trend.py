@@ -18,6 +18,7 @@ from __future__ import annotations
 import sqlite3
 from dataclasses import dataclass
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from math import isfinite, sqrt
 from typing import Iterable, Sequence
 
@@ -107,6 +108,8 @@ def _copy_reference_table(
     *,
     start: str | None = None,
     end: str | None = None,
+    copy_rows: bool = True,
+    create_table: bool = True,
 ) -> None:
     columns = tuple(source.execute(f"PRAGMA table_info({_quote_identifier(table)})"))
     if not columns:
@@ -116,7 +119,10 @@ def _copy_reference_table(
         f"{_quote_identifier(str(row[1]))} {str(row[2] or 'TEXT')}"
         for row in columns
     )
-    target.execute(f"CREATE TABLE {_quote_identifier(table)} ({declarations})")
+    if create_table:
+        target.execute(f"CREATE TABLE {_quote_identifier(table)} ({declarations})")
+    if not copy_rows:
+        return
     quoted = ", ".join(_quote_identifier(name) for name in names)
     if table == "observation" and start is not None and end is not None:
         rows = source.execute(
@@ -147,11 +153,40 @@ def _filtered_connection(
     source: sqlite3.Connection,
     start: str,
     end: str,
+    detector: Detector | None = None,
 ) -> sqlite3.Connection:
     target = sqlite3.connect(":memory:")
     try:
         for table in _REFERENCE_TABLES + _EVIDENCE_TABLES:
-            _copy_reference_table(source, target, table, start=start, end=end)
+            _copy_reference_table(source, target, table, copy_rows=False)
+        needed = None
+        if detector is not None:
+            reads: set[str] = set()
+            stateful = False
+            def authorize(action, first, second, database, trigger):
+                nonlocal stateful
+                if action == sqlite3.SQLITE_READ:
+                    reads.add(str(first))
+                elif action == sqlite3.SQLITE_FUNCTION and second in {"changes", "total_changes", "last_insert_rowid"}:
+                    stateful = True
+                return sqlite3.SQLITE_OK
+            target.set_authorizer(authorize)
+            try:
+                # Compile without executing: SQLite itself identifies every
+                # table dependency, including quoted names and nested CTEs.
+                target.execute("EXPLAIN " + detector.cluster_sql,
+                               {"window_start_utc": start, "window_days": 7}).fetchall()
+                if not stateful:
+                    needed = reads | {"observation"}
+            except sqlite3.Error:
+                # An uninspectable future query retains the full replay;
+                # dependency discovery must never soften its contract.
+                pass
+            finally:
+                target.set_authorizer(None)
+        for table in _REFERENCE_TABLES + _EVIDENCE_TABLES:
+            if needed is None or table in needed:
+                _copy_reference_table(source, target, table, start=start, end=end, create_table=False)
         target.execute("PRAGMA query_only = ON")
         return target
     except BaseException:
@@ -225,6 +260,7 @@ def _replay_by_week(
             connection,
             week_start.isoformat(),
             (week_end + timedelta(microseconds=1)).isoformat(),
+            detector=detector,
         )
         try:
             if not _filtered_has_detector_data(filtered, detector):
@@ -388,10 +424,12 @@ def _week_hits(
         )
     key_column = columns.index("key")
     session_column = columns.index("session_id")
+    normalize_key = lru_cache(maxsize=4096)(lambda raw: _emitted_key(detector, raw))
+    normalize_session = lru_cache(maxsize=4096)(lambda raw: _emitted_session(detector, raw))
     return {
         (
-            _emitted_key(detector, row[key_column]),
-            _emitted_session(detector, row[session_column]),
+            normalize_key(row[key_column]),
+            normalize_session(row[session_column]),
         )
         for row in cursor.fetchall()
     }

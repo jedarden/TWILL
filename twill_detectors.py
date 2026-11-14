@@ -65,6 +65,7 @@ import hashlib
 import re
 import sqlite3
 from datetime import date, datetime, timedelta, timezone
+from functools import lru_cache
 from typing import Mapping, Sequence
 
 from twill_contract import (
@@ -1905,10 +1906,15 @@ def _collect_session_hits(
         )
     hits: set[tuple[str, str]] = set()
     counts: dict[str, int] = {}
+    # SQL groups often repeat one key across many sessions and one session
+    # across many keys. Keep redaction identical while reusing these pure
+    # normalizations only within this bounded result collection.
+    normalize_key = lru_cache(maxsize=4096)(lambda raw: _emitted_key(detector, raw))
+    normalize_session = lru_cache(maxsize=4096)(lambda raw: _emitted_session(detector, raw))
     for row in cursor.fetchall():
         value = dict(zip(columns, row))
-        key = _emitted_key(detector, value["key"])
-        session_id = _emitted_session(detector, value["session_id"])
+        key = normalize_key(value["key"])
+        session_id = normalize_session(value["session_id"])
         hit = (key, session_id)
         # Session-hit SQL commonly reads event-level observations, so one
         # session can contribute several rows to the same key.  Attribution
@@ -2091,6 +2097,7 @@ def read_weekly_counts(
             f"(got {', '.join(columns)})"
         )
     counts: dict[tuple[str, str], tuple[int, int]] = {}
+    normalize_key = lru_cache(maxsize=4096)(lambda raw: _emitted_key(detector, raw))
     for row in cursor.fetchall():
         value = dict(zip(columns, row))
         week = value["week"]
@@ -2098,7 +2105,7 @@ def read_weekly_counts(
             raise DetectorContractError(
                 f"{detector.full_id} emitted a non-ISO week from weekly-hit SQL"
             )
-        key = _emitted_key(detector, value["key"])
+        key = normalize_key(value["key"])
         identity = (key, str(week))
         if identity in counts:
             raise DetectorContractError(
